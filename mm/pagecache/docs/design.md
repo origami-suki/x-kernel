@@ -80,7 +80,7 @@ inner-lock 临界区内同步 dirty tag，不能依赖 folio access 的 reconcil
 
 `writeback_until` 和 `write_cache_pages` 接收 owner 传入的
 `visible_len`，据此裁剪最后一个 folio 的有效字节。成功后清 dirty；失败时恢复
-dirty 并结束 under-writeback 状态。
+仍属于当前 mapping 的 folio 为 dirty，并结束 under-writeback 状态。
 
 writeback 从独立的 dirty folio index 枚举目标范围，不扫描全部 resident folio。
 dirty tag 只产生候选 `(index, Arc<Folio>)`。真正开始写回前，writeback 在
@@ -92,9 +92,11 @@ PageCache inner lock → folio lock 的同一临界区内重新确认：
 
 缺失、已替换或 clean 的候选不会写回，并会根据当前 resident folio 修正 dirty tag。
 通过校验后，writeback 在同一临界区内清 dirty、设置 under-writeback 并删除 dirty
-tag。I/O 期间发生 redirty 时，folio access 会重新插入 tag；I/O 失败也会恢复 dirty
-并重新插入 tag。batch writeback 完成阶段会再次核对最终 dirty 状态；单页同步
-writeback 在持有 folio lock 的 callback 成功后保持 clean，后续 writer 会在
+tag。I/O 期间发生 redirty 时，folio access 会重新插入 tag；I/O 失败时，当前 resident
+folio 会恢复 dirty 并重新插入 tag。完成阶段在 PageCache inner lock → folio lock 的同一临界区再次核对
+mapping identity；只有仍是当前 resident folio 的失败写回才能重新标脏并修改 dirty tag，
+已移除或替换的 folio 只结束 under-writeback。batch writeback 同时核对最终 dirty 状态；
+单页同步 writeback 在持有 folio lock 的 callback 成功后保持 clean，后续 writer 会在
 clean → dirty 状态变化时重新插入 tag。
 
 `with_folio` 和 `with_folio_or_create` 只在 closure 前后的最终 dirty 状态不同时执行
@@ -114,9 +116,9 @@ reconciliation。dirty → dirty 和 clean → clean 不改变 tag，避免只�
   backend callback；该 callback 不得重入同一个 `PageCache`；
 - `write_cache_pages` 在锁内完成状态过渡和数据复制，释放 folio lock 后才调用 batch
   backend callback；
-- 当前没有 Linux 完整的 wait-on-writeback/invalidate 协调。候选收集到开始写回之间
-  的 stale-folio 窗口由本 crate 自身关闭；batch I/O 启动后的 resize/invalidate 仍须由
-  owner 串行化。
+- 当前没有 Linux 完整的 wait-on-writeback/invalidate 协调。候选收集、开始写回和完成
+  阶段的 stale-folio 窗口由本 crate 自身关闭；I/O 期间的 resize/invalidate 仍须由 owner
+  在完整 writeback operation 外串行化。
 
 ## 设计决策
 

@@ -319,6 +319,11 @@ pub trait AddressSpaceOperations: Send + Sync + 'static {
     }
 
     /// Writes all dirty pages known to this address space.
+    ///
+    /// [`AddressSpace`] holds its invalidate lock for reading across this
+    /// callback, including backing-store I/O. Implementations may block, but
+    /// must not call [`AddressSpace::set_len`] or otherwise require the
+    /// invalidate lock exclusively.
     fn writepages(&self, mapping: &AddressSpace, control: &mut WritebackControl) -> VfsResult<()> {
         mapping.writeback_cached_folios(control, |index, data, valid_len| {
             if valid_len == 0 {
@@ -786,6 +791,7 @@ impl AddressSpace {
 
     /// Writes dirty pages according to an explicit control object.
     pub fn writepages_control(&self, control: &mut WritebackControl) -> VfsResult<()> {
+        let _invalidate_guard = self.invalidate_lock.read();
         self.ops.writepages(self, control)
     }
 

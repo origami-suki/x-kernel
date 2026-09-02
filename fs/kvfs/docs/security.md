@@ -189,9 +189,10 @@ membership TOCTOU。递归 detach 把 child mountpoint 的 overmount stack 一�
 可变状态。
 
 regular-file inode 的 data lock 覆盖 generic buffered write 和整个 set-length callback。
-address-space invalidate lock 的 shared 侧保护 `page_mkwrite`，exclusive 侧保护 truncate、
-mapped-view invalidation 与 page-cache truncate；目标 folio lock 串行化 fault preparation、
-dirty 与 PTE publish。具体文件系统的 mapping/reservation lock 在这些边界内获取。
+address-space invalidate lock 的 shared 侧保护 `page_mkwrite` 和完整 writeback，exclusive
+侧保护 truncate、mapped-view invalidation 与 page-cache truncate；目标 folio lock 串行化
+fault preparation、dirty 与 PTE publish。具体文件系统的 mapping/reservation lock 在这些
+边界内获取。writeback callback 不得升级为 invalidate exclusive lock。
 
 所有 namespace lock 都是 sleepable lock。mount tree 操作先取 mount-namespace registry
 mutex；其后全局顺序为 superblock topology、父目录、子目录、非目录 inode，最后才是

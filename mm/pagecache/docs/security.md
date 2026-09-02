@@ -27,6 +27,8 @@ visible `i_size`。它不执行访问控制，也不拥有文件长度或 VM 生
   已从 resident tree 移除的 index 不得残留在 dirty index；
 - dirty tag 命中不构成写回许可；开始 I/O 前必须在 PageCache inner lock → folio lock
   的同一临界区重新校验 mapping identity、dirty 和 writeback 状态；
+- writeback 完成时必须按相同锁序重新校验 mapping identity；失败只重新标脏当前
+  resident folio，已脱离 mapping 的 folio 只结束 writeback；
 - `PageCache` 中不存在可与 inode `i_size` 分歧的 length 字段；
 - VM object-id、views 和 notifier 不进入本 crate。
 
@@ -45,12 +47,12 @@ callback，该 callback 不得重入同一个 `PageCache`；batch writeback 则�
 |------|------|------|
 | T-01 | 页内 offset/length 越界 | checked arithmetic 和 page-size boundary 检查 |
 | T-02 | truncate 后尾页泄露旧数据 | shrink 清零 surviving tail |
-| T-03 | writeback 失败却清除 dirty | 失败路径恢复 dirty 并结束 writeback |
+| T-03 | writeback 失败却清除当前 folio 的 dirty | 失败路径在 identity 校验后恢复 dirty 并结束 writeback |
 | T-04 | readahead 覆盖前台 dirty folio | insert-if-absent，已缓存 folio 获胜 |
 | T-05 | 缓存层形成第二个 EOF/object owner | 不保存 length、object-id、views 或 notifier |
 | T-06 | dirty index 漏项导致 fsync 漏写 | folio dirty 状态转换时 reconciliation，resize/writeback 显式同步索引 |
 | T-07 | writeback 完成覆盖并发 redirty | batch 完成阶段重新读取最终状态；单页写回后的 clean → dirty writer 重新设置 tag |
-| T-08 | truncate/replace 后写回已脱离 mapping 的旧 folio | dirty tag 只用于枚举；开始写回前在固定锁序下重新校验当前 `Arc` identity |
+| T-08 | truncate/replace 后写回已脱离 mapping 的旧 folio | 开始与完成写回时均在固定锁序下校验当前 `Arc` identity；失败不重新标脏旧 folio |
 | T-09 | 文件增长后 cached tail 的清零结果未进入 writeback | growth 在 inner lock → folio lock 下同时设置 dirty bit 和 dirty tag |
 
 ## 故障模式与影响分析（FMEA）
@@ -68,8 +70,8 @@ callback，该 callback 不得重入同一个 `PageCache`；batch writeback 则�
 
 - resident folio tree 和 dirty index 分别使用 `BTreeMap`/`BTreeSet`；已消除 writeback
   对全部 resident folio 的扫描，但尚未实现 Linux XArray tag/reclaim；
-- 尚未实现 Linux 完整的 wait-on-writeback/invalidate 协调；本 crate 保证候选在开始
-  I/O 前仍属于当前 mapping，batch I/O 启动后的 resize/invalidate 仍依赖 owner 串行化；
+- 尚未实现 Linux 完整的 wait-on-writeback/invalidate 协调；本 crate 在开始和完成 I/O
+  时校验 mapping identity，I/O 期间的 resize/invalidate 仍依赖 owner 串行化；
 - `writeback_until` 持 folio lock 调用 backend，callback 重入同一个 `PageCache` 会造成
   死锁；
 - 没有自适应 readahead、swap、memcg、NUMA 或 THP；

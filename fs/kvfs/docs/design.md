@@ -532,8 +532,10 @@ superblock publish 时继承该静态 table；已有 parent/superblock 的新 de
 `VfsInode` 的 data lock 串行化 buffered write 与 truncate。shared-file write fault 不取得
 该独占锁；`AddressSpace::page_mkwrite()` 取得 address-space invalidate shared lock，再在
 folio lock 内重新检查 EOF、调用文件系统 mapping-prepare callback、标脏 folio并完成 PTE
-更新。文件系统 `AddressSpaceOperations::set_len()` 在 address-space invalidate exclusive
-lock 下执行，并在 backing prepare 后、释放 block 前调用一次
+更新。`AddressSpace::writepages_control()` 同样在 address-space invalidate shared lock 下完成
+整次 writeback，包括 backing-store I/O；因此 set-length 不会在已选中的 folio 写回期间发布
+新 EOF 或移除该 folio。文件系统 `AddressSpaceOperations::set_len()` 在 address-space
+invalidate exclusive lock 下执行，并在 backing prepare 后、释放 block 前调用一次
 `AddressSpace::truncate_setsize()`。该入口按 Linux `truncate_setsize()` 顺序先发布唯一的
 `inode::i_size`，再执行第一次 mapped-view unmap、cached-folio truncate 和第二次 unmap；
 第二轮用于清理 cache truncate 窗口中产生的 private COW PTE。Backing filesystem 的 prepare

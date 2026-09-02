@@ -188,21 +188,24 @@ impl PageCache {
         }
     }
 
-    fn reconcile_batched_folios(&self, folios: &[BatchedFolio]) {
+    fn finish_writeback(&self, index: PageIndex, folio: &Arc<Mutex<Folio>>, is_complete: bool) {
         let mut inner = self.inner.lock();
-        for BatchedFolio { index, folio, .. } in folios {
-            let is_current = inner
-                .pages
-                .get(index)
-                .is_some_and(|current| Arc::ptr_eq(current, folio));
-            if !is_current {
-                continue;
-            }
-            if folio.lock().is_dirty() {
-                inner.dirty_pages.insert(*index);
-            } else {
-                inner.dirty_pages.remove(index);
-            }
+        let is_current = inner
+            .pages
+            .get(&index)
+            .is_some_and(|current| Arc::ptr_eq(current, folio));
+        let mut locked = folio.lock();
+        if is_current && !is_complete {
+            locked.mark_dirty();
+        }
+        locked.end_writeback();
+        if !is_current {
+            return;
+        }
+        if locked.is_dirty() {
+            inner.dirty_pages.insert(index);
+        } else {
+            inner.dirty_pages.remove(&index);
         }
     }
 
@@ -429,15 +432,13 @@ impl PageCache {
             else {
                 continue;
             };
-            if let Err(error) = write_folio_fn(index, &locked.data()[..valid_len], valid_len) {
-                locked.mark_dirty();
-                locked.end_writeback();
-                drop(locked);
-                self.reconcile_dirty_folio(index, &folio);
+            let result = write_folio_fn(index, &locked.data()[..valid_len], valid_len);
+            drop(locked);
+            if let Err(error) = result {
+                self.finish_writeback(index, &folio, false);
                 return Err(error);
             }
-            locked.end_writeback();
-            drop(locked);
+            self.finish_writeback(index, &folio, true);
             stats.wrote(1);
         }
         Ok(stats)
@@ -488,21 +489,19 @@ impl PageCache {
 
                 let mut batch_offset = 0usize;
                 for BatchedFolio {
-                    folio, byte_len, ..
+                    index,
+                    folio,
+                    byte_len,
                 } in batch_folios.iter()
                 {
                     let folio_end = batch_offset.saturating_add(*byte_len);
                     let is_complete = folio_end <= completed_bytes;
-                    let mut locked = folio.lock();
-                    if !is_complete {
-                        locked.mark_dirty();
-                    } else {
+                    self.finish_writeback(*index, folio, is_complete);
+                    if is_complete {
                         stats.wrote(1);
                     }
-                    locked.end_writeback();
                     batch_offset = folio_end;
                 }
-                self.reconcile_batched_folios(batch_folios);
                 batch_folios.clear();
                 batch_data.clear();
                 error
@@ -999,6 +998,42 @@ mod tests {
             });
         }
         assert!(dirty_indices(&cache).is_empty());
+    }
+
+    #[def_test]
+    fn failed_writeback_does_not_redirty_detached_folio() {
+        let cache = new_cache(PageCacheKind::FileBacked);
+        write_cached(&cache, 0, b"dirty").unwrap();
+        let detached = cache
+            .inner
+            .lock()
+            .pages
+            .get(&0)
+            .cloned()
+            .expect("cached folio");
+        let cache_during_io = cache.clone();
+
+        let outcome = cache
+            .write_cache_pages(
+                PAGE_SIZE_4K as u64,
+                0,
+                u64::MAX,
+                usize::MAX,
+                PAGE_SIZE_4K,
+                &mut |_, _| {
+                    cache_during_io.resize_cached_folios(PAGE_SIZE_4K as u64, 0);
+                    Ok(WritebackRangeOutcome::failed(0, KError::InvalidInput))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.error(), Some(KError::InvalidInput));
+        assert!(dirty_indices(&cache).is_empty());
+        let detached_state = {
+            let folio = detached.lock();
+            (folio.is_dirty(), folio.is_under_writeback())
+        };
+        assert_eq!(detached_state, (false, false));
     }
 
     #[def_test]
