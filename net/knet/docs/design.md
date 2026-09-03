@@ -331,7 +331,7 @@ IDLE ──notify──────────────> SCHEDULED
 并发布 `IDLE` 或 `SCHEDULED`，通知与完成并发时由同一原子修改序列保留事件。
 `SCHEDULED` 状态由 `knet-poller` dynamic kwork 或 socket assist 竞争批次执行权。
 Loopback UDP 独立于 poller 执行权，发送路径在 BH 窗口内完成 xmit 与 `NetRx` 交付。
-`Interface::poll_at` 返回的下一次协议 deadline 由 `Service` 注册为 timer，
+`Interface::poll_at` 与 TCP deferred close 共用协议 timer 源，IPv4 重组队列使用独立 timer 源，
 到期后调度 poller 并唤醒正在等待 socket readiness 的任务。
 
 ## 算法流程
@@ -351,15 +351,15 @@ Loopback UDP 独立于 poller 执行权，发送路径在 BH 窗口内完成 xmi
 
 1. `NetRx` softirq 在设备 RX pending 后调用 `NetworkPoller::notify(PollReason::Rx)`，调度 `knet-poller` work；socket recv 和 readiness 路径通过 `poller::assist_once` 尝试执行一次已有工作；TCP、UDP 和 raw TX 生产路径通过 `notify(PollReason::Tx)` 发布工作。TCP 从可编码为零窗口的低余量接收缓冲区消费数据时通过 `notify(PollReason::RxWindow)` 主动重开对端窗口。
 2. 普通 `notify` 在 `IDLE` 上发布 `SCHEDULED` 并 queue `knet-poller` work。执行期间的新工作进入 `RUNNING_PENDING`；kwork callback 和 assist 只有一个能够通过 `SCHEDULED` 到 `RUNNING` 的 CAS。
-3. `Service` 先按 TX budget dispatch 已排队的 control 和 data packet，使 loopback TCP/ICMP TX 在同一轮进入 `NET_RX_QUEUE`；本轮后续 TX dispatch 复用剩余预算。Loopback UDP 不依赖这一轮：`prepare_and_send_ipv4_packet` 对 loopback 目的地址直接 xmit，`send_ip_packet` 在关闭 BH 前盖戳并入 `NET_RX_QUEUE`，raise `NetRx` 后 BH 恢复时把完整 UDP 数据报送入 PCB。
+3. IPv4 重组 timer 到期后发布独立 pending 状态，`Service` 按 timer budget 消费到期队列，再按 TX budget dispatch 已排队的 control 和 data packet，使 loopback TCP/ICMP TX 在同一轮进入 `NET_RX_QUEUE`；本轮后续 TX dispatch 复用剩余预算。Loopback UDP 不依赖这一轮：`prepare_and_send_ipv4_packet` 对 loopback 目的地址直接 xmit，`send_ip_packet` 在关闭 BH 前盖戳并入 `NET_RX_QUEUE`，raise `NetRx` 后 BH 恢复时把完整 UDP 数据报送入 PCB。
 4. `Router::drain_rx_budgeted_into` 按 RX budget 从设备轮转拉取 `PacketBuf`，`next_rx_device` 在设备间保持公平并随设备删除修正。
 5. `IngressProcessor` 在 Router 和 smoltcp socket-set 锁外校验 IPv4 头、长度、校验和与本地目的地址，并完成 IPv4 分片重组。完整 UDP 数据报直接进入 crate 内 UDP PCB 分流，未命中 socket 的单播 UDP 触发 ICMPv4 Port Unreachable。
 6. TCP、raw IP、ICMP 和 IPv6 packet 保存在可复用 accepted batch 中。按 smoltcp socket-set、Router 的顺序取得两把锁后，`prepare_smoltcp_ingress` 更新 TCP listener 状态并将 batch 转入有界 smoltcp ingress queue；只有 control batch 时跳过 socket-set。锁竞争期间保留 raw、accepted 和 control batch，当前轮返回 `has_more`，后续轮次继续交接。
 7. `Service` 执行 `poll_maintenance`，按 RX budget 逐个调用 `poll_ingress_single`，并调用有界的 `poll_egress`。达到预算或时间边界后，剩余 ingress 保持 FIFO 顺序并进入后续轮次；`ListenTable::refresh_acceptors` 随后刷新收到新报文或仍有 SYN child 的 listener，并唤醒已经可接受连接的等待者。等待中的 SYN child 不进入 `PollProgress::has_more`，后续推进仍由 RX、已有 ingress 或协议 timer 调度。
 8. `Router::dispatch_budgeted` 使用本轮剩余 TX budget 发送协议阶段新增的 packet，随后使用剩余 RX budget 再拉取一次设备队列。该尾部 RX 阶段让 loopback TCP/ICMP 完成 TX 与 smoltcp 交接，同时维持 assist 的单轮边界。
-9. Router、IngressProcessor、smoltcp socket-set 或 Interface 的共享 mutex 发生竞争时，poller 通过 `try_lock` 直接退让。`Service` 返回带 `has_more` 的进度，唯一执行者按原状态机归还执行权并安排后续轮次。
-10. `Interface::poll_at` 与 orphan `FIN_WAIT_2` deadline 共同决定下一次网络 deadline，`Service` 将其写入原子 deadline；`register_timer_callback(TIMER_SAMPLE_PERIOD)` 周期采样该值，到期后通过 `notify(PollReason::Timer)` 发布工作。尚未到期的 deadline 不进入 `PollProgress::has_more`。
-11. `PollProgress::has_more` 只汇报当前可立即处理的 RX、ingress、TX、锁竞争重试或已到期 timer 工作。每轮 `Service::poll_budgeted` 使用 1 ms 软时间上限，并在设备 RX、stack ingress、stack egress 和 Router TX 每完成 32 个工作项后检查时间。协议 maintenance 和一次 smoltcp egress pass 始终执行，以维持 timer 与协议输出进度。kwork callback 或 assist 获得批次执行权后最多连续推进四轮，达到轮数上限或清空立即工作后归还执行权，剩余 backlog 通过 `SCHEDULED` 状态进入下一批。
+9. Router、smoltcp socket-set 或 Interface 的共享 mutex 发生竞争时，poller 通过 `try_lock` 直接退让并结束当前轮。已经到期的 IPv4 重组事件遇到 IngressProcessor 竞争时保持 pending 并设置 `has_more`，不中止本轮 TX 与协议推进；尚未到期或不存在重组队列时不获取该锁。RX 交接竞争仍结束当前轮并保留 batch。
+10. `Interface::poll_at` 与 orphan `FIN_WAIT_2` 共用协议 deadline 原子源，IPv4 重组队列通过独立原子源发布最早 deadline 和 pending 状态；`register_timer_callback(TIMER_SAMPLE_PERIOD)` 周期采样两个来源，到期后通过 `notify(PollReason::Timer)` 发布工作。协议 deadline 在轮次末尾使用新的单调时间判断，轮内已经跨过的 delayed-ACK 或重传期限立即进入 `PollProgress::has_more`。
+11. `PollProgress::has_more` 只汇报当前可立即处理的 RX、ingress、TX、锁竞争重试或已到期 timer 工作。每轮 `Service::poll_budgeted` 使用 1 ms 软时间上限，IPv4 重组队列按 timer budget 分批过期，设备 RX、stack ingress、stack egress 和 Router TX 每完成 32 个工作项后检查时间。协议 maintenance 和一次 smoltcp egress pass 始终执行，以维持 timer 与协议输出进度。kwork callback 或 assist 获得批次执行权后最多连续推进四轮，达到轮数上限或清空立即工作后归还执行权，剩余 backlog 通过 `SCHEDULED` 状态进入下一批。
 
 ### TX 路由
 
@@ -478,7 +478,7 @@ NetRx softirq、socket TX 生产路径、协议 timer 和 socket assist 共享�
 
 Loopback UDP 不经过 poller 所有权交接：发送路径对齐 Linux `dev_queue_xmit`（BH off）→ `loopback_xmit` → `__netif_rx` → `local_bh_enable` 跑 `NET_RX_SOFTIRQ`。完整 IPv4 UDP 在 BH 窗口内进入 PCB；TCP/ICMP/IPv6 仍由 poller 的 TX-then-RX 轮次交接。
 
-RX、TX 与 timer 使用独立预算。`Service` 使用 smoltcp 分阶段 API 约束 stack ingress 和 egress，并使用 1 ms 软时间上限控制单轮占用。TX budget 在协议推进前后共享，RX budget 在主 RX 和尾部 RX 之间共享；该顺序让 loopback TCP/ICMP 在一次 assist 内完成设备往返。Router、IngressProcessor、Interface 和 socket-set 竞争会结束当前轮并设置 `has_more`，执行者继续沿四态状态机释放推进权。control TX 优先于 data TX，避免 ICMP 错误和协议控制流量长期滞后。TCP send 可写快路径向 smoltcp socket buffer 写入数据并发布 TX 通知，连续发送由 poller owner 在有界批次内完成协议推进和 TX dispatch。TCP recv 在消费前接收缓冲区余量低于最大窗口缩放量子时发布 `RxWindow` 通知，释放 socket-set mutex 后由 poller 推进窗口更新；达到缩放量子后的接收窗口增长复用 RX 和已登记的 timer 推进。TCP 和 raw socket 直接向 smoltcp 注册聚合 send waker；Router data TX queue 的可用 packet slot 实际增加时，`PollProgress::tx_capacity_changed` 触发 poller TX waiter 唤醒。协议与 deferred-close deadline 写入原子值，周期采样回调到期后唤醒 socket waiter，并以 `PollReason::Timer` 通知 poller。
+RX、TX 与 timer 使用独立预算。`Service` 使用 smoltcp 分阶段 API 约束 stack ingress 和 egress，并使用 1 ms 软时间上限控制单轮占用。TX budget 在协议推进前后共享，RX budget 在主 RX 和尾部 RX 之间共享；该顺序让 loopback TCP/ICMP 在一次 assist 内完成设备往返。Router、Interface 和 socket-set 竞争会结束当前轮并设置 `has_more`；只有已经发布 pending 的 IPv4 过期事件才尝试 IngressProcessor 锁，竞争时保留 pending 且继续本轮 TX。到期队列按 timer budget 分批消费，剩余事件进入后续轮次。执行者继续沿四态状态机释放推进权。control TX 优先于 data TX，避免 ICMP 错误和协议控制流量长期滞后。TCP send 可写快路径向 smoltcp socket buffer 写入数据并发布 TX 通知，连续发送由 poller owner 在有界批次内完成协议推进和 TX dispatch。TCP recv 在消费前接收缓冲区余量低于最大窗口缩放量子时发布 `RxWindow` 通知，释放 socket-set mutex 后由 poller 推进窗口更新；达到缩放量子后的接收窗口增长复用 RX 和已登记的 timer 推进。TCP 和 raw socket 直接向 smoltcp 注册聚合 send waker；Router data TX queue 的可用 packet slot 实际增加时，`PollProgress::tx_capacity_changed` 触发 poller TX waiter 唤醒。协议与 deferred-close deadline、IPv4 重组 deadline 使用独立原子源，周期采样回调到期后唤醒 socket waiter，并以 `PollReason::Timer` 通知 poller。
 
 ### 控制面状态所有权
 

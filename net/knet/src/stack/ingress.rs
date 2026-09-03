@@ -41,6 +41,31 @@ impl IngressProcessor {
         self.local_ipv4_addrs.extend_from_slice(addrs);
     }
 
+    pub(crate) fn ipv4_reassembly_deadline(&self) -> Option<MonotonicInstant> {
+        self.ipv4_reassembler.expiration_deadline()
+    }
+
+    pub(crate) fn expire_ipv4_fragments(
+        &mut self,
+        timestamp: MonotonicInstant,
+        timer_budget: usize,
+        control_packets: &mut Vec<Vec<u8>>,
+    ) -> usize {
+        let expired = self
+            .ipv4_reassembler
+            .remove_expired(timestamp, timer_budget);
+        for fragment in expired.fragments {
+            queue_icmpv4_error(
+                control_packets,
+                Icmpv4Error::FragmentReassemblyTimeout,
+                fragment.packet_type,
+                fragment.header,
+                &fragment.packet,
+            );
+        }
+        expired.timer_events
+    }
+
     /// Consumes `packets` and appends work for the shared stack and control TX.
     ///
     /// The output batches may contain work retained from an earlier poll round
@@ -52,15 +77,6 @@ impl IngressProcessor {
         accepted_packets: &mut Vec<PacketBuf>,
         control_packets: &mut Vec<Vec<u8>>,
     ) {
-        for expired in self.ipv4_reassembler.remove_expired(timestamp) {
-            queue_icmpv4_error(
-                control_packets,
-                Icmpv4Error::FragmentReassemblyTimeout,
-                expired.packet_type,
-                expired.header,
-                &expired.packet,
-            );
-        }
         for packet in packets.drain(..) {
             self.handle_rx_packet(timestamp, packet, accepted_packets, control_packets);
         }

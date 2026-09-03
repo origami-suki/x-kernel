@@ -13,7 +13,10 @@
 //! Queue count, retained bytes, and lifetime are bounded. Expired queues retain
 //! enough of the first fragment to build an ICMPv4 reassembly-timeout response.
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    vec::Vec,
+};
 
 use ktime_types::{MonotonicInstant, TimeSpan};
 
@@ -35,23 +38,38 @@ struct Ipv4FragKey {
     ifindex: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Ipv4Expiration {
+    expires_at: MonotonicInstant,
+    key: Ipv4FragKey,
+}
+
+#[derive(Debug)]
+struct Ipv4FirstFragmentHeader {
+    bytes: Vec<u8>,
+    ecn: u8,
+}
+
 #[derive(Debug)]
 struct Ipv4ReassemblyQueue {
     packet_type: PacketType,
-    first_header: Option<Vec<u8>>,
-    first_ecn: Option<u8>,
+    first_header: Option<Ipv4FirstFragmentHeader>,
     fragments: BTreeMap<usize, Vec<u8>>,
     received_len: usize,
     total_payload_len: Option<usize>,
     ecn_mask: u8,
     expires_at: MonotonicInstant,
-    memory_bytes: usize,
 }
 
 pub(crate) struct ExpiredIpv4Fragment {
     pub(crate) packet_type: PacketType,
     pub(crate) header: Ipv4Header,
     pub(crate) packet: Vec<u8>,
+}
+
+pub(crate) struct Ipv4ExpirationBatch {
+    pub(crate) fragments: Vec<ExpiredIpv4Fragment>,
+    pub(crate) timer_events: usize,
 }
 
 pub(crate) enum Ipv4ReassemblyResult {
@@ -63,13 +81,13 @@ pub(crate) enum Ipv4ReassemblyResult {
 #[derive(Default)]
 pub(crate) struct Ipv4Reassembler {
     queues: BTreeMap<Ipv4FragKey, Ipv4ReassemblyQueue>,
+    expirations: BTreeSet<Ipv4Expiration>,
     memory_bytes: usize,
 }
 
 enum InsertResult {
     Inserted { memory_bytes: usize },
     Duplicate,
-    InvalidRange,
     Overlap,
 }
 
@@ -77,8 +95,15 @@ impl Ipv4Reassembler {
     pub(crate) fn new() -> Self {
         Self {
             queues: BTreeMap::new(),
+            expirations: BTreeSet::new(),
             memory_bytes: 0,
         }
+    }
+
+    pub(crate) fn expiration_deadline(&self) -> Option<MonotonicInstant> {
+        self.expirations
+            .first()
+            .map(|expiration| expiration.expires_at)
     }
 
     pub(crate) fn reassemble(
@@ -116,20 +141,22 @@ impl Ipv4Reassembler {
             }
         };
         let fragment_payload = payload[..payload_len].to_vec();
-        let queue = self
-            .queues
-            .entry(key)
-            .or_insert_with(|| Ipv4ReassemblyQueue {
-                packet_type: packet.packet_type(),
-                first_header: None,
-                first_ecn: None,
-                fragments: BTreeMap::new(),
-                received_len: 0,
-                total_payload_len: None,
-                ecn_mask: 0,
-                expires_at: now + IPV4_REASSEMBLY_TIMEOUT,
-                memory_bytes: 0,
-            });
+        let queue = match self.queues.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let expires_at = now + IPV4_REASSEMBLY_TIMEOUT;
+                self.expirations.insert(Ipv4Expiration { expires_at, key });
+                entry.insert(Ipv4ReassemblyQueue {
+                    packet_type: packet.packet_type(),
+                    first_header: None,
+                    fragments: BTreeMap::new(),
+                    received_len: 0,
+                    total_payload_len: None,
+                    ecn_mask: 0,
+                    expires_at,
+                })
+            }
+        };
 
         if !header.more_fragments() {
             if queue
@@ -151,24 +178,24 @@ impl Ipv4Reassembler {
             return Ipv4ReassemblyResult::Dropped;
         }
 
-        match queue.insert_fragment(offset, fragment_payload) {
+        match queue.insert_fragment(offset, end, fragment_payload) {
             InsertResult::Inserted { memory_bytes } => {
-                queue.memory_bytes = queue.memory_bytes.saturating_add(memory_bytes);
                 self.memory_bytes = self.memory_bytes.saturating_add(memory_bytes);
             }
             InsertResult::Duplicate => return Ipv4ReassemblyResult::Pending,
-            InsertResult::InvalidRange | InsertResult::Overlap => {
+            InsertResult::Overlap => {
                 self.remove_queue(&key);
                 return Ipv4ReassemblyResult::Dropped;
             }
         }
         queue.ecn_mask |= ecn_bit(header.ecn());
         if offset == 0 && queue.first_header.is_none() {
-            let first_header = ip_packet[..header.header_len()].to_vec();
-            queue.memory_bytes = queue.memory_bytes.saturating_add(first_header.len());
-            self.memory_bytes = self.memory_bytes.saturating_add(first_header.len());
+            let first_header = Ipv4FirstFragmentHeader {
+                bytes: ip_packet[..header.header_len()].to_vec(),
+                ecn: header.ecn(),
+            };
+            self.memory_bytes = self.memory_bytes.saturating_add(first_header.bytes.len());
             queue.first_header = Some(first_header);
-            queue.first_ecn = Some(header.ecn());
         }
 
         if queue.is_complete() {
@@ -180,24 +207,41 @@ impl Ipv4Reassembler {
         Ipv4ReassemblyResult::Pending
     }
 
-    pub(crate) fn remove_expired(&mut self, now: MonotonicInstant) -> Vec<ExpiredIpv4Fragment> {
-        let keys: Vec<_> = self
-            .queues
-            .iter()
-            .filter_map(|(key, queue)| (now >= queue.expires_at).then_some(*key))
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| {
-                let queue = self.remove_queue(&key)?;
-                let first_packet = queue.first_fragment_packet()?;
-                let header = Ipv4Header::parse_input(&first_packet).ok()?;
-                Some(ExpiredIpv4Fragment {
-                    packet_type: queue.packet_type,
-                    header,
-                    packet: first_packet,
-                })
-            })
-            .collect()
+    pub(crate) fn remove_expired(
+        &mut self,
+        now: MonotonicInstant,
+        timer_budget: usize,
+    ) -> Ipv4ExpirationBatch {
+        let mut fragments = Vec::new();
+        let mut timer_events = 0;
+        while timer_events < timer_budget {
+            let Some(expiration) = self.expirations.first().copied() else {
+                break;
+            };
+            if expiration.expires_at > now {
+                break;
+            }
+
+            let queue = self
+                .remove_queue(&expiration.key)
+                .expect("expiration references a live reassembly queue");
+            timer_events += 1;
+            let Some(first_packet) = queue.first_fragment_packet() else {
+                continue;
+            };
+            let Ok(header) = Ipv4Header::parse_input(&first_packet) else {
+                continue;
+            };
+            fragments.push(ExpiredIpv4Fragment {
+                packet_type: queue.packet_type,
+                header,
+                packet: first_packet,
+            });
+        }
+        Ipv4ExpirationBatch {
+            fragments,
+            timer_events,
+        }
     }
 
     fn enforce_limits(&mut self) {
@@ -220,24 +264,23 @@ impl Ipv4Reassembler {
     }
 
     fn oldest_queue_key(&self) -> Option<Ipv4FragKey> {
-        self.queues
-            .iter()
-            .min_by_key(|(_, queue)| queue.expires_at)
-            .map(|(key, _)| *key)
+        self.expirations.first().map(|expiration| expiration.key)
     }
 
     fn remove_queue(&mut self, key: &Ipv4FragKey) -> Option<Ipv4ReassemblyQueue> {
         let queue = self.queues.remove(key)?;
-        self.memory_bytes = self.memory_bytes.saturating_sub(queue.memory_bytes);
+        self.memory_bytes = self.memory_bytes.saturating_sub(queue.retained_bytes());
+        self.expirations.remove(&Ipv4Expiration {
+            expires_at: queue.expires_at,
+            key: *key,
+        });
         Some(queue)
     }
 }
 
 impl Ipv4ReassemblyQueue {
-    fn insert_fragment(&mut self, offset: usize, payload: Vec<u8>) -> InsertResult {
-        let Some(end) = offset.checked_add(payload.len()) else {
-            return InsertResult::InvalidRange;
-        };
+    fn insert_fragment(&mut self, offset: usize, end: usize, payload: Vec<u8>) -> InsertResult {
+        debug_assert_eq!(end.checked_sub(offset), Some(payload.len()));
 
         if let Some((&start, existing)) = self.fragments.range(..=offset).next_back() {
             let existing_end = start + existing.len();
@@ -266,13 +309,11 @@ impl Ipv4ReassemblyQueue {
         let Some(total_payload_len) = self.total_payload_len else {
             return false;
         };
-        self.first_header.is_some()
-            && self.first_ecn.is_some()
-            && self.received_len == total_payload_len
+        self.first_header.is_some() && self.received_len == total_payload_len
     }
 
     fn first_fragment_packet(&self) -> Option<Vec<u8>> {
-        let header = self.first_header.as_ref()?;
+        let header = &self.first_header.as_ref()?.bytes;
         let payload = self.fragments.get(&0)?;
         let mut packet = Vec::with_capacity(header.len().checked_add(payload.len())?);
         packet.extend_from_slice(header);
@@ -286,6 +327,14 @@ impl Ipv4ReassemblyQueue {
             .next_back()
             .map(|(offset, payload)| offset + payload.len())
     }
+
+    fn retained_bytes(&self) -> usize {
+        let header_len = self
+            .first_header
+            .as_ref()
+            .map_or(0, |first_header| first_header.bytes.len());
+        self.received_len.saturating_add(header_len)
+    }
 }
 
 fn build_reassembled_packet(ifindex: i32, queue: Ipv4ReassemblyQueue) -> Ipv4ReassemblyResult {
@@ -295,12 +344,10 @@ fn build_reassembled_packet(ifindex: i32, queue: Ipv4ReassemblyQueue) -> Ipv4Rea
     let Some(total_payload_len) = queue.total_payload_len else {
         return Ipv4ReassemblyResult::Dropped;
     };
-    let Some(first_ecn) = queue.first_ecn else {
+    let Some(ecn) = reassembled_ecn(queue.ecn_mask, first_header.ecn) else {
         return Ipv4ReassemblyResult::Dropped;
     };
-    let Some(ecn) = reassembled_ecn(queue.ecn_mask, first_ecn) else {
-        return Ipv4ReassemblyResult::Dropped;
-    };
+    let first_header = first_header.bytes;
     let packet_len = match first_header.len().checked_add(total_payload_len) {
         Some(packet_len) if packet_len <= u16::MAX as usize => packet_len,
         _ => return Ipv4ReassemblyResult::Dropped,
@@ -362,6 +409,15 @@ mod tests {
     use crate::{buf::PacketOwner, ipv4};
 
     fn fragment(offset: usize, more_fragments: bool, payload: &[u8]) -> (PacketBuf, Ipv4Header) {
+        fragment_with_id(0x1234, offset, more_fragments, payload)
+    }
+
+    fn fragment_with_id(
+        identification: u16,
+        offset: usize,
+        more_fragments: bool,
+        payload: &[u8],
+    ) -> (PacketBuf, Ipv4Header) {
         let offset_units = u16::try_from(offset / 8).unwrap();
         let mut header = EtherIpv4Header::new(
             payload.len() as u16,
@@ -371,7 +427,7 @@ mod tests {
             [192, 0, 2, 2],
         )
         .unwrap();
-        header.identification = 0x1234;
+        header.identification = identification;
         header.dont_fragment = false;
         header.more_fragments = more_fragments;
         header.fragment_offset = IpFragOffset::try_new(offset_units).unwrap();
@@ -432,20 +488,45 @@ mod tests {
         let mut reassembler = Ipv4Reassembler::new();
         let now = MonotonicInstant::from_span_since_origin(TimeSpan::from_secs(1));
         let (packet, header) = fragment(0, true, b"abcdefgh");
+        let retained_bytes = header.header_len() + b"abcdefgh".len();
         assert!(matches!(
             reassembler.reassemble(packet, header, now),
             Ipv4ReassemblyResult::Pending
         ));
+        assert_eq!(reassembler.memory_bytes, retained_bytes);
         let (packet, header) = fragment(0, true, b"abcdefgh");
         assert!(matches!(
             reassembler.reassemble(packet, header, now),
             Ipv4ReassemblyResult::Pending
         ));
+        assert_eq!(reassembler.memory_bytes, retained_bytes);
         let (packet, header) = fragment(8, false, b"ijkl");
         assert!(matches!(
             reassembler.reassemble(packet, header, now),
             Ipv4ReassemblyResult::Complete(_)
         ));
+        assert_eq!(reassembler.expiration_deadline(), None);
+        assert_eq!(reassembler.memory_bytes, 0);
+    }
+
+    #[def_test]
+    fn test_ipv4_reassembly_deadline_is_fixed_at_queue_creation() {
+        let mut reassembler = Ipv4Reassembler::new();
+        let now = MonotonicInstant::from_span_since_origin(TimeSpan::from_secs(1));
+        let (packet, header) = fragment(0, true, b"abcdefgh");
+        assert!(matches!(
+            reassembler.reassemble(packet, header, now),
+            Ipv4ReassemblyResult::Pending
+        ));
+        let expires_at = now + IPV4_REASSEMBLY_TIMEOUT;
+        assert_eq!(reassembler.expiration_deadline(), Some(expires_at));
+
+        let (packet, header) = fragment(0, true, b"abcdefgh");
+        assert!(matches!(
+            reassembler.reassemble(packet, header, now + TimeSpan::from_secs(1)),
+            Ipv4ReassemblyResult::Pending
+        ));
+        assert_eq!(reassembler.expiration_deadline(), Some(expires_at));
     }
 
     #[def_test]
@@ -458,13 +539,73 @@ mod tests {
             Ipv4ReassemblyResult::Pending
         ));
 
-        let expired = reassembler.remove_expired(now + IPV4_REASSEMBLY_TIMEOUT);
+        let expired = reassembler.remove_expired(now + IPV4_REASSEMBLY_TIMEOUT, usize::MAX);
 
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].header.fragment_offset(), 0);
+        assert_eq!(expired.timer_events, 1);
+        assert_eq!(expired.fragments.len(), 1);
+        assert_eq!(reassembler.expiration_deadline(), None);
+        assert_eq!(expired.fragments[0].header.fragment_offset(), 0);
         assert_eq!(
-            ipv4::payload(&expired[0].packet, &expired[0].header).unwrap(),
+            ipv4::payload(&expired.fragments[0].packet, &expired.fragments[0].header).unwrap(),
             b"abcdefgh"
         );
+    }
+
+    #[def_test]
+    fn test_ipv4_reassembly_expire_advances_to_the_next_queue_deadline() {
+        let mut reassembler = Ipv4Reassembler::new();
+        let now = MonotonicInstant::from_span_since_origin(TimeSpan::from_secs(1));
+        let (packet, header) = fragment_with_id(0x1234, 0, true, b"abcdefgh");
+        assert!(matches!(
+            reassembler.reassemble(packet, header, now),
+            Ipv4ReassemblyResult::Pending
+        ));
+        let later = now + TimeSpan::from_secs(5);
+        let (packet, header) = fragment_with_id(0x1235, 0, true, b"ijklmnop");
+        assert!(matches!(
+            reassembler.reassemble(packet, header, later),
+            Ipv4ReassemblyResult::Pending
+        ));
+
+        let expired = reassembler.remove_expired(now + IPV4_REASSEMBLY_TIMEOUT, usize::MAX);
+
+        assert_eq!(expired.timer_events, 1);
+        assert_eq!(expired.fragments.len(), 1);
+        assert_eq!(expired.fragments[0].header.identification(), 0x1234);
+        assert_eq!(
+            reassembler.expiration_deadline(),
+            Some(later + IPV4_REASSEMBLY_TIMEOUT)
+        );
+    }
+
+    #[def_test]
+    fn test_ipv4_reassembly_expiration_respects_timer_budget() {
+        let mut reassembler = Ipv4Reassembler::new();
+        let now = MonotonicInstant::from_span_since_origin(TimeSpan::from_secs(1));
+        let (packet, header) = fragment_with_id(0x1234, 0, true, b"abcdefgh");
+        assert!(matches!(
+            reassembler.reassemble(packet, header, now),
+            Ipv4ReassemblyResult::Pending
+        ));
+        let (packet, header) = fragment_with_id(0x1235, 0, true, b"ijklmnop");
+        assert!(matches!(
+            reassembler.reassemble(packet, header, now),
+            Ipv4ReassemblyResult::Pending
+        ));
+
+        let first = reassembler.remove_expired(now + IPV4_REASSEMBLY_TIMEOUT, 1);
+
+        assert_eq!(first.timer_events, 1);
+        assert_eq!(first.fragments.len(), 1);
+        assert_eq!(
+            reassembler.expiration_deadline(),
+            Some(now + IPV4_REASSEMBLY_TIMEOUT)
+        );
+
+        let second = reassembler.remove_expired(now + IPV4_REASSEMBLY_TIMEOUT, 1);
+
+        assert_eq!(second.timer_events, 1);
+        assert_eq!(second.fragments.len(), 1);
+        assert_eq!(reassembler.expiration_deadline(), None);
     }
 }

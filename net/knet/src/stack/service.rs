@@ -40,6 +40,8 @@ const IPV4_HEADER_LEN: usize = 20;
 const RX_INGRESS_BATCH_PACKETS: usize = 64;
 const POLL_ROUND_TIME_LIMIT: TimeSpan = TimeSpan::from_millis(1);
 const POLL_TIME_CHECK_INTERVAL_WORK_ITEMS: usize = 32;
+const IPV4_REASSEMBLY_TIMER_PENDING: u64 = 1;
+const IPV4_REASSEMBLY_DEADLINE_OFFSET: u64 = 2;
 
 #[derive(Default)]
 struct SmoltcpIngressProgress {
@@ -53,6 +55,12 @@ struct DeviceRxProgress {
     packets: usize,
     has_reached_time_limit: bool,
     has_lock_contention: bool,
+}
+
+#[derive(Default)]
+struct Ipv4ExpirationProgress {
+    timer_events: usize,
+    has_more: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +85,18 @@ pub(crate) fn now() -> SmoltcpInstant {
     to_smoltcp_instant(monotonic_time())
 }
 
+fn ipv4_reassembly_timer_state(next: Option<MonotonicInstant>) -> u64 {
+    let Some(next) = next else {
+        return 0;
+    };
+    if next <= monotonic_time() {
+        return IPV4_REASSEMBLY_TIMER_PENDING;
+    }
+    u64::try_from(next.span_since_origin().as_micros())
+        .unwrap_or(u64::MAX)
+        .saturating_add(IPV4_REASSEMBLY_DEADLINE_OFFSET)
+}
+
 pub struct Service {
     pub(crate) iface: Mutex<Interface>,
     router: Mutex<Router>,
@@ -85,6 +105,7 @@ pub struct Service {
     accepted_batch: Mutex<Vec<PacketBuf>>,
     control_batch: Mutex<Vec<Vec<u8>>>,
     timeout_deadline_micros: AtomicU64,
+    ipv4_reassembly_deadline_micros: AtomicU64,
     timeout_poll: Arc<PollSet>,
     #[cfg(unittest)]
     rebuild_count: AtomicUsize,
@@ -103,6 +124,7 @@ impl Service {
             accepted_batch: Mutex::new(Vec::with_capacity(RX_INGRESS_BATCH_PACKETS)),
             control_batch: Mutex::new(Vec::new()),
             timeout_deadline_micros: AtomicU64::new(0),
+            ipv4_reassembly_deadline_micros: AtomicU64::new(0),
             timeout_poll: Arc::new(PollSet::new()),
             #[cfg(unittest)]
             rebuild_count: AtomicUsize::new(0),
@@ -117,6 +139,8 @@ impl Service {
     /// transport and device handlers may acquire sleepable mutexes. Shared
     /// progression locks are acquired with `try_lock`; contention leaves the
     /// pending batches intact and reports immediate work for a later round.
+    /// A due IPv4 reassembly timer remains pending across ingress-lock
+    /// contention without aborting TX or protocol progress in the current round.
     pub fn poll_budgeted(&self, budget: PollBudget) -> PollProgress {
         let round_started_at = monotonic_time();
         let device_timestamp = round_started_at;
@@ -124,12 +148,18 @@ impl Service {
         let mut rx_batch = self.rx_batch.lock();
         let mut accepted_packets = self.accepted_batch.lock();
 
+        let ipv4_expiration = self.try_expire_ipv4_fragments(
+            device_timestamp,
+            budget.timer_events,
+            &mut control_packets,
+        );
+        let mut timer_events = ipv4_expiration.timer_events;
         if !self.try_flush_ingress_batches(&mut accepted_packets, &mut control_packets) {
-            return deferred_poll_progress(0, 0, 0, false);
+            return deferred_poll_progress(0, 0, timer_events, false);
         }
 
         let Some(mut router) = self.router.try_lock() else {
-            return deferred_poll_progress(0, 0, 0, false);
+            return deferred_poll_progress(0, 0, timer_events, false);
         };
         let tx_capacity_before = router.available_tx_packet_slots();
         let (mut tx_packets, mut has_reached_time_limit) = dispatch_tx_budgeted(
@@ -157,18 +187,38 @@ impl Service {
         let mut rx_packets = rx_progress.packets;
         has_reached_time_limit |= rx_progress.has_reached_time_limit;
         if rx_progress.has_lock_contention {
-            return deferred_poll_progress(rx_packets, tx_packets, 0, tx_capacity_changed);
+            return deferred_poll_progress(
+                rx_packets,
+                tx_packets,
+                timer_events,
+                tx_capacity_changed,
+            );
         }
 
         let Some(mut sockets) = SOCKET_SET.inner.try_lock() else {
-            return deferred_poll_progress(rx_packets, tx_packets, 0, tx_capacity_changed);
+            return deferred_poll_progress(
+                rx_packets,
+                tx_packets,
+                timer_events,
+                tx_capacity_changed,
+            );
         };
         let Some(mut router) = self.router.try_lock() else {
-            return deferred_poll_progress(rx_packets, tx_packets, 0, tx_capacity_changed);
+            return deferred_poll_progress(
+                rx_packets,
+                tx_packets,
+                timer_events,
+                tx_capacity_changed,
+            );
         };
         let current = now();
         let Some(mut iface) = self.iface.try_lock() else {
-            return deferred_poll_progress(rx_packets, tx_packets, 0, tx_capacity_changed);
+            return deferred_poll_progress(
+                rx_packets,
+                tx_packets,
+                timer_events,
+                tx_capacity_changed,
+            );
         };
         // Maintenance and one egress pass remain bounded and preserve protocol
         // progress after bulk RX or TX reaches the round time limit.
@@ -216,13 +266,11 @@ impl Service {
         }
 
         let deferred_close_deadline = sockets.reap_deferred_tcp_closes(current);
-        let next_poll =
-            earliest_poll_deadline(iface.poll_at(current, &sockets), deferred_close_deadline);
+        let protocol_deadline = iface.poll_at(current, &sockets);
         drop(iface);
-        let timer_has_more = has_immediate_timer_work(current, next_poll);
-        self.update_poll_timeout(current, next_poll);
         LISTEN_TABLE.refresh_acceptors(&mut sockets);
         drop(sockets);
+        timer_events += usize::from(timer_events < budget.timer_events && has_socket_state_change);
 
         if has_reached_time_limit {
             tx_remaining = 0;
@@ -254,17 +302,22 @@ impl Service {
                 return deferred_poll_progress(
                     rx_packets,
                     tx_packets,
-                    usize::from(budget.timer_events > 0 && has_socket_state_change),
+                    timer_events,
                     tx_capacity_changed,
                 );
             }
         }
 
+        let next_poll = earliest_poll_deadline(protocol_deadline, deferred_close_deadline);
+        let timer_current = now();
+        let timer_has_more = has_immediate_timer_work(timer_current, next_poll);
+        self.update_poll_timeout(timer_current, next_poll);
+
         let Some(mut router) = self.router.try_lock() else {
             return deferred_poll_progress(
                 rx_packets,
                 tx_packets,
-                usize::from(budget.timer_events > 0 && has_socket_state_change),
+                timer_events,
                 tx_capacity_changed,
             );
         };
@@ -274,9 +327,14 @@ impl Service {
         PollProgress {
             rx_packets,
             tx_packets,
-            timer_events: usize::from(budget.timer_events > 0 && has_socket_state_change),
+            timer_events,
             tx_capacity_changed,
-            has_more: rx_has_more || ingress_has_more || tx_has_more || timer_has_more,
+            has_more: rx_has_more
+                || ingress_has_more
+                || tx_has_more
+                || timer_has_more
+                || ipv4_expiration.has_more
+                || self.has_pending_ipv4_reassembly_expiration(),
         }
     }
 
@@ -352,6 +410,32 @@ impl Service {
         progress
     }
 
+    fn try_expire_ipv4_fragments(
+        &self,
+        timestamp: MonotonicInstant,
+        timer_budget: usize,
+        control_packets: &mut Vec<Vec<u8>>,
+    ) -> Ipv4ExpirationProgress {
+        if !self.has_pending_ipv4_reassembly_expiration() {
+            return Ipv4ExpirationProgress::default();
+        }
+        let Some(mut ingress) = self.ingress.try_lock() else {
+            return Ipv4ExpirationProgress {
+                timer_events: 0,
+                has_more: true,
+            };
+        };
+        let timer_events = ingress.expire_ipv4_fragments(timestamp, timer_budget, control_packets);
+        let next_deadline = ingress.ipv4_reassembly_deadline();
+        let has_more = next_deadline.is_some_and(|deadline| deadline <= timestamp);
+        self.complete_ipv4_reassembly_expiration(next_deadline, has_more);
+        drop(ingress);
+        Ipv4ExpirationProgress {
+            timer_events,
+            has_more: self.has_pending_ipv4_reassembly_expiration(),
+        }
+    }
+
     fn try_process_rx_batch(
         &self,
         device_timestamp: MonotonicInstant,
@@ -372,6 +456,9 @@ impl Service {
             accepted_packets,
             control_packets,
         );
+        let next_deadline = ingress.ipv4_reassembly_deadline();
+        self.update_ipv4_reassembly_timeout(next_deadline);
+        drop(ingress);
         true
     }
 
@@ -555,21 +642,67 @@ impl Service {
             .store(deadline, Ordering::Release);
     }
 
-    pub(crate) fn handle_timer_tick(&self) {
-        let deadline = self.timeout_deadline_micros.load(Ordering::Acquire);
-        if deadline == 0
-            || u64::try_from(now().total_micros())
-                .unwrap_or(0)
-                .saturating_add(1)
-                < deadline
-        {
-            return;
+    fn update_ipv4_reassembly_timeout(&self, next: Option<MonotonicInstant>) {
+        let next_state = ipv4_reassembly_timer_state(next);
+        let mut current = self.ipv4_reassembly_deadline_micros.load(Ordering::Acquire);
+        loop {
+            // A timer tick owns the pending state until the poller consumes
+            // the due queues. A concurrent RX refresh must not disarm it.
+            if current == IPV4_REASSEMBLY_TIMER_PENDING {
+                return;
+            }
+            match self.ipv4_reassembly_deadline_micros.compare_exchange_weak(
+                current,
+                next_state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
-        if self
-            .timeout_deadline_micros
-            .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+    }
+
+    fn complete_ipv4_reassembly_expiration(&self, next: Option<MonotonicInstant>, has_more: bool) {
+        let next_state = if has_more {
+            IPV4_REASSEMBLY_TIMER_PENDING
+        } else {
+            ipv4_reassembly_timer_state(next)
+        };
+        self.ipv4_reassembly_deadline_micros
+            .store(next_state, Ordering::Release);
+    }
+
+    fn has_pending_ipv4_reassembly_expiration(&self) -> bool {
+        self.ipv4_reassembly_deadline_micros.load(Ordering::Acquire)
+            == IPV4_REASSEMBLY_TIMER_PENDING
+    }
+
+    pub(crate) fn handle_timer_tick(&self) {
+        let current_micros = u64::try_from(now().total_micros()).unwrap_or(0);
+        let protocol_deadline = self.timeout_deadline_micros.load(Ordering::Acquire);
+        let has_protocol_expired = protocol_deadline != 0
+            && current_micros.saturating_add(1) >= protocol_deadline
+            && self
+                .timeout_deadline_micros
+                .compare_exchange(protocol_deadline, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+
+        let reassembly_deadline = self.ipv4_reassembly_deadline_micros.load(Ordering::Acquire);
+        let has_reassembly_expired = reassembly_deadline > IPV4_REASSEMBLY_TIMER_PENDING
+            && current_micros.saturating_add(IPV4_REASSEMBLY_DEADLINE_OFFSET)
+                >= reassembly_deadline
+            && self
+                .ipv4_reassembly_deadline_micros
+                .compare_exchange(
+                    reassembly_deadline,
+                    IPV4_REASSEMBLY_TIMER_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+
+        if has_protocol_expired || has_reassembly_expired {
             self.publish_timer_expiration();
         }
     }
@@ -899,10 +1032,7 @@ fn earliest_poll_deadline(
     protocol: Option<SmoltcpInstant>,
     deferred_close: Option<SmoltcpInstant>,
 ) -> Option<SmoltcpInstant> {
-    match (protocol, deferred_close) {
-        (Some(protocol), Some(close)) => Some(protocol.min(close)),
-        (protocol, close) => protocol.or(close),
-    }
+    [protocol, deferred_close].into_iter().flatten().min()
 }
 
 fn output_ipv4_packet_count(
@@ -977,11 +1107,13 @@ mod tests {
     }
 
     #[def_test]
-    fn future_timer_is_not_immediate_work() {
+    fn deadline_crossed_during_round_is_immediate_work() {
         let current = SmoltcpInstant::from_millis(10);
         let future = SmoltcpInstant::from_millis(11);
+        let later = SmoltcpInstant::from_millis(12);
 
         assert!(!has_immediate_timer_work(current, Some(future)));
+        assert!(has_immediate_timer_work(later, Some(future)));
     }
 
     #[def_test]
@@ -997,6 +1129,41 @@ mod tests {
         let protocol = SmoltcpInstant::from_millis(20);
 
         assert!(earliest_poll_deadline(Some(protocol), Some(close)) == Some(close));
+    }
+
+    #[def_test]
+    fn protocol_deadline_update_preserves_ipv4_reassembly_timer_source() {
+        let service = Service::new(Router::new());
+        let reassembly_deadline = monotonic_time() + TimeSpan::from_secs(30);
+        service.update_ipv4_reassembly_timeout(Some(reassembly_deadline));
+        let reassembly_state = service
+            .ipv4_reassembly_deadline_micros
+            .load(Ordering::Acquire);
+
+        service.update_poll_timeout(now(), None);
+
+        assert_eq!(
+            service
+                .ipv4_reassembly_deadline_micros
+                .load(Ordering::Acquire),
+            reassembly_state
+        );
+    }
+
+    #[def_test]
+    fn unrelated_ingress_lock_contention_is_not_ipv4_timer_work() {
+        let service = Service::new(Router::new());
+        let _ingress = service.ingress.lock();
+        let mut control_packets = Vec::new();
+
+        let progress = service.try_expire_ipv4_fragments(
+            monotonic_time(),
+            TEST_POLL_BUDGET.timer_events,
+            &mut control_packets,
+        );
+
+        assert_eq!(progress.timer_events, 0);
+        assert!(!progress.has_more);
     }
 
     #[def_test]
@@ -1045,6 +1212,37 @@ mod tests {
 
         assert_eq!(progress.rx_packets, 0);
         assert_eq!(progress.tx_packets, 0);
+        assert!(progress.has_more);
+    }
+
+    #[def_test(serial)]
+    fn poll_round_dispatches_tx_when_due_ipv4_expiration_lock_is_contended() {
+        let loopback_addr = Ipv4Address::new(127, 0, 0, 1);
+        let mut router = Router::new();
+        let loopback = router.add_device(Box::new(LoopbackDevice::new()));
+        router
+            .add_ipv4_addr(Ipv4AddrEntry {
+                dev: loopback,
+                addr: Ipv4Cidr::new(loopback_addr, 8),
+                scope: ROUTE_SCOPE_HOST,
+                broadcast: None,
+            })
+            .unwrap();
+        let packet =
+            ipv4::build_ipv4_packet(loopback_addr, loopback_addr, ipv4::PROTOCOL_ICMP, 64, &[])
+                .unwrap();
+        router
+            .queue_ipv4_packet(packet, loopback as i32 + 1)
+            .unwrap();
+        let service = Service::new(router);
+        service
+            .ipv4_reassembly_deadline_micros
+            .store(IPV4_REASSEMBLY_TIMER_PENDING, Ordering::Release);
+        let _ingress = service.ingress.lock();
+
+        let progress = service.poll_budgeted(TEST_POLL_BUDGET);
+
+        assert_eq!(progress.tx_packets, 1);
         assert!(progress.has_more);
     }
 
