@@ -14,14 +14,21 @@ evidence is needed.
 
 ## Enable
 
+Off by default on release configs, including QEMU virt defconfigs
+(`default y if BUILD_TYPE_DEBUG` only). Turn it on when you need
+`/proc/lock_stat` or to lint the `stats` lock paths:
+
 ```bash
 cp platforms/kplat-aarch64/qemu_defconfig .config
 make defconfig
 make menuconfig   # Task Scheduler → Task Diagnostics → Lock contention statistics
-# or append to .config: CONFIG_KFEAT_LOCK_STAT=y
+# or append to .config: KFEAT_LOCK_STAT=y
 make olddefconfig
-make build
+make clippy       # or make build / make run
 ```
+
+Lock construction rules (`static_lock!` vs `::new`) are in
+`docs/ai/skills/code-guidelines/concurrency.md`.
 
 Use **SMP** when investigating Spin `contentions` (UP records `acquisitions`
 only).
@@ -106,6 +113,10 @@ cat /proc/lock_stat
 
 - `static_lock!` static Mutex / RwLock / Spin;
 - heap `Mutex::new` / `RwLock::new` with `stats` (`#[track_caller]`).
+
+Construction rules (when to use `static_lock!` vs `::new` vs
+`const_new`) live in
+`docs/ai/skills/code-guidelines/concurrency.md`.
 
 **Often not tracked**
 

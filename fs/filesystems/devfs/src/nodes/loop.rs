@@ -11,7 +11,7 @@ use core::{
 
 use kerrno::{KError, KResult, LinuxError};
 use klazy::Lazy;
-use ksync::Mutex;
+use ksync::{Mutex, static_lock};
 use kvfs::{FMode, NodeType, VfsFile, VfsResult};
 use linux_raw_sys::{
     ioctl::{BLKRAGET, BLKRASET},
@@ -21,7 +21,9 @@ use linux_raw_sys::{
 };
 use osvm::{VirtMutPtr, VirtPtr};
 
-static LOOP_VALIDATE_MUTEX: Mutex<()> = Mutex::new(());
+static_lock! {
+    static LOOP_VALIDATE_MUTEX: Mutex<()> = Mutex::new(());
+}
 
 /// State owned by one loop disk.
 pub struct LoopDevice {

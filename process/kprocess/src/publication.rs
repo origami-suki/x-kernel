@@ -10,7 +10,7 @@ use alloc::{
 
 use kerrno::{KError, KResult};
 use kspin::SpinNoIrq;
-use ksync::RwLock;
+use ksync::{RwLock, static_lock};
 use ktask::{KtaskRef, TaskInner, WeakKtaskRef, activate_task, current, prepare_task};
 
 use crate::{
@@ -251,16 +251,20 @@ impl<T> PublicationSlotEffect<T> {
 
 /// Global publication owner for the process domain.
 pub(crate) struct ProcessPublication {
-    tables: RwLock<PublicationTables>,
+    tables: &'static RwLock<PublicationTables>,
 }
 
-static PROCESS_PUBLICATION: ProcessPublication = ProcessPublication {
-    tables: RwLock::new(PublicationTables {
+static_lock! {
+    static PROCESS_PUBLICATION_TABLES: RwLock<PublicationTables> = RwLock::new(PublicationTables {
         task_table: BTreeMap::new(),
         process_table: BTreeMap::new(),
         process_group_table: BTreeMap::new(),
         session_table: BTreeMap::new(),
-    }),
+    });
+}
+
+static PROCESS_PUBLICATION: ProcessPublication = ProcessPublication {
+    tables: &PROCESS_PUBLICATION_TABLES,
 };
 
 /// Returns the global process-publication owner.

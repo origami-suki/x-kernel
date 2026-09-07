@@ -373,12 +373,12 @@ impl fmt::Debug for JournalTransactions {
 impl JournalTransactions {
     /// Creates an unbounded transaction engine for isolated tests.
     #[cfg(test)]
-    pub const fn new(first_transaction: TransactionId) -> Self {
+    pub fn new(first_transaction: TransactionId) -> Self {
         Self::new_with_credit_limit(first_transaction, u32::MAX)
     }
 
     /// Creates the transaction engine for one mounted journal.
-    pub(crate) const fn new_with_credit_limit(
+    pub(crate) fn new_with_credit_limit(
         first_transaction: TransactionId,
         max_reserved_credits: u32,
     ) -> Self {

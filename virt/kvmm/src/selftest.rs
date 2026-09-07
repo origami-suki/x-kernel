@@ -7,6 +7,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
+use ksync::{Mutex, static_lock};
 use vdev_test_mmio::{TEST_MMIO_GPA, TEST_MMIO_SIZE, TestMmioDevice};
 
 use crate::{
@@ -21,7 +22,9 @@ struct BackgroundVm {
     _task: ktask::KtaskRef,
 }
 
-static BACKGROUND_VMS: ksync::Mutex<Vec<BackgroundVm>> = ksync::Mutex::new(Vec::new());
+static_lock! {
+    static BACKGROUND_VMS: Mutex<Vec<BackgroundVm>> = Mutex::new(Vec::new());
+}
 
 /// Pages owned by the guest loader, freed when dropped.
 struct GuestPages {

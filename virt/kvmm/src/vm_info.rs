@@ -11,6 +11,8 @@ use alloc::{
     vec::Vec,
 };
 
+use ksync::{Mutex, static_lock};
+
 use crate::vcpu_state::VcpuRunState;
 
 /// Type-erased VM information for the global registry, used by `/proc/kvmm`.
@@ -29,7 +31,9 @@ pub trait VmInfo: Send + Sync {
     fn device_names(&self) -> Vec<(String, u64)>;
 }
 
-static VM_REGISTRY: ksync::Mutex<Vec<Weak<dyn VmInfo>>> = ksync::Mutex::new(Vec::new());
+static_lock! {
+    static VM_REGISTRY: Mutex<Vec<Weak<dyn VmInfo>>> = Mutex::new(Vec::new());
+}
 
 pub(crate) fn register_vm(vm: &Arc<dyn VmInfo>) {
     VM_REGISTRY.lock().push(Arc::downgrade(vm));

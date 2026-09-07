@@ -111,8 +111,6 @@ unsafe impl lock_api::RawMutex for RawMutex {
 
     #[inline(always)]
     fn lock(&self) {
-        #[cfg(feature = "stats")]
-        self.stats.total_locks.fetch_add(1, Ordering::Relaxed);
         let current_id = current().owner_key();
         let mut spin = Spin::new(self.config);
         let mut owner_id = self.owner_id.load(Ordering::Relaxed);

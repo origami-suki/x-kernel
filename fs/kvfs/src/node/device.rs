@@ -13,6 +13,7 @@ use block::{BlockDevice, BlockDeviceOperations, BlockOpenMode, DriverError};
 use hashbrown::HashMap;
 use kerrno::{KError, LinuxError};
 use kpoll::{IoEvents, PollContext, PollRegisterError};
+use ksync::static_lock;
 use linux_raw_sys::ioctl::{BLKGETSIZE, BLKGETSIZE64, BLKROGET, BLKROSET};
 use memaddr::PhysAddrRange;
 use osvm::{VirtMutPtr, VirtPtr};
@@ -44,11 +45,15 @@ impl ChrdevEntry {
     }
 }
 
-struct ChrdevRegistry(Mutex<Option<HashMap<u64, ChrdevEntry>>>);
+static_lock! {
+    static CHRDEV_MAP: Mutex<Option<HashMap<u64, ChrdevEntry>>> = Mutex::new(None);
+}
+
+struct ChrdevRegistry;
 
 impl ChrdevRegistry {
     fn with<R>(&self, f: impl FnOnce(&mut HashMap<u64, ChrdevEntry>) -> R) -> R {
-        let mut registry = self.0.lock();
+        let mut registry = CHRDEV_MAP.lock();
         f(registry.get_or_insert_with(HashMap::new))
     }
 
@@ -92,7 +97,7 @@ impl ChrdevRegistry {
     }
 }
 
-static CHRDEV_REGISTRY: ChrdevRegistry = ChrdevRegistry(Mutex::new(None));
+static CHRDEV_REGISTRY: ChrdevRegistry = ChrdevRegistry;
 
 /// Register a character-device operation table for a device number.
 pub fn cdev_add(device: DeviceId, ops: Arc<dyn DeviceFileOps>) {
