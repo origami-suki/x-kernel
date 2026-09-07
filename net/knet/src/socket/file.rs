@@ -42,6 +42,10 @@ impl SocketFileOps {
 }
 
 impl FileOperations for SocketFileOps {
+    fn fsync(&self, _file: &VfsFile, _data_only: bool) -> VfsResult<()> {
+        Err(kvfs::VfsError::InvalidInput)
+    }
+
     fn supports_read(&self) -> bool {
         true
     }

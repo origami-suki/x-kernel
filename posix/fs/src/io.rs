@@ -401,10 +401,9 @@ pub fn sys_fsync(fd: c_int) -> KResult<isize> {
     Ok(0)
 }
 
-/// Synchronizes a file's data (not metadata) with storage.
+/// Synchronizes file data and the metadata needed to retrieve it with storage.
 pub fn sys_fdatasync(fd: c_int) -> KResult<isize> {
     debug!("sys_fdatasync <= {fd}");
-    // Synchronize file data to disk - only syncs data, not metadata
     let file = kprocess::current_resources().get_file(fd)?;
     file.fsync(true)?;
     Ok(0)

@@ -100,6 +100,13 @@ root 长生命周期的对应职责，不增加第二套目录树或 lifecycle �
 2. `kvfs::AddressSpace` 写入 folio 并标记 dirty。
 3. inode-owned `AddressSpace` 继续提供共享 object identity 与 mmap contract。
 
+### 文件同步
+
+`MemoryNode` 为内存文件和目录显式提供 `fsync/fdatasync` 成功的空操作，
+包括 tmpfs、ramfs 和基于 shmem 的 memfd；这些对象没有持久化设备，
+同步不能通过清除或驱逐 dirty folio 丢弃唯一的数据副本。
+FIFO 和设备 inode 在 VFS open 时安装专用 operation table，不继承该空操作。
+
 ## 并发模型
 
 - inode metadata 由 `Mutex<Metadata>` 保护。

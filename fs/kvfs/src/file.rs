@@ -233,6 +233,12 @@ pub trait FileOperations: Send + Sync + 'static {
     }
 
     /// Synchronizes this file's data and optionally metadata.
+    ///
+    /// `data_only` may omit metadata that is not needed to retrieve file data.
+    /// The default remains a successful no-op for compatibility with existing
+    /// backends; it does not promise persistence. Backends with storage must
+    /// implement synchronization explicitly. Unsupported special-file operation
+    /// tables override this method to return [`VfsError::InvalidInput`] (`EINVAL`).
     fn fsync(&self, _file: &VfsFile, _data_only: bool) -> VfsResult<()> {
         Ok(())
     }
@@ -939,7 +945,15 @@ impl VfsFile {
     }
 
     /// Synchronizes this open file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::BadFileDescriptor`] for a path-only open, otherwise
+    /// propagates the file operation's synchronization error unchanged.
     pub fn fsync(&self, data_only: bool) -> VfsResult<()> {
+        if self.is_path() {
+            return Err(VfsError::BadFileDescriptor);
+        }
         self.operations().fsync(self, data_only)
     }
 
@@ -1001,5 +1015,87 @@ impl Drop for VfsFile {
                 .unwrap_or_else(|_| "<error>".into());
             warn!("failed to release VFS file {}: {err:?}", path);
         }
+    }
+}
+
+#[cfg(unittest)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+
+    use unittest::{assert_eq, def_test};
+
+    use super::*;
+
+    fn sync_test_file(operations: Arc<dyn FileOperations>, mode: FMode) -> Arc<VfsFile> {
+        let super_block = crate::nullfs::new_superblock();
+        let root = crate::Mount::new_root(&super_block).root_path();
+        VfsFileBuilder::from_path_state(
+            root,
+            mode,
+            OpenFlags::empty(),
+            operations,
+            kcred::initial_cred(),
+        )
+        .finish()
+        .unwrap()
+    }
+
+    struct SyncOperations {
+        intents: Mutex<Vec<bool>>,
+    }
+
+    impl FileOperations for SyncOperations {
+        fn fsync(&self, _file: &VfsFile, data_only: bool) -> VfsResult<()> {
+            self.intents.lock().push(data_only);
+            if data_only {
+                Err(VfsError::StorageFull)
+            } else {
+                Err(VfsError::Io)
+            }
+        }
+    }
+
+    #[def_test]
+    fn fsync_keeps_legacy_backend_default_success() {
+        let file = sync_test_file(Arc::new(EmptyFileOperations), FMode::READ);
+        for data_only in [false, true] {
+            assert_eq!(file.fsync(data_only), Ok(()));
+        }
+    }
+
+    #[def_test]
+    fn pipe_and_fifo_operation_tables_reject_sync() {
+        for operations in [
+            crate::pipe::pipe_file_operations(),
+            crate::pipe::fifo_file_operations(),
+        ] {
+            let file = sync_test_file(operations, FMode::READ | FMode::WRITE);
+            for data_only in [false, true] {
+                assert_eq!(file.fsync(data_only), Err(VfsError::InvalidInput));
+            }
+        }
+    }
+
+    #[def_test]
+    fn fsync_preserves_sync_intent_and_backend_errors_on_readonly_file() {
+        let operations = Arc::new(SyncOperations {
+            intents: Mutex::new(Vec::new()),
+        });
+        let file = sync_test_file(operations.clone(), FMode::READ);
+        assert_eq!(file.fsync(false), Err(VfsError::Io));
+        assert_eq!(file.fsync(true), Err(VfsError::StorageFull));
+        assert_eq!(*operations.intents.lock(), vec![false, true]);
+    }
+
+    #[def_test]
+    fn fsync_path_only_file_returns_ebadf_without_calling_backend() {
+        let operations = Arc::new(SyncOperations {
+            intents: Mutex::new(Vec::new()),
+        });
+        let file = sync_test_file(operations.clone(), FMode::PATH);
+        for data_only in [false, true] {
+            assert_eq!(file.fsync(data_only), Err(VfsError::BadFileDescriptor));
+        }
+        assert_eq!(operations.intents.lock().len(), 0);
     }
 }

@@ -6,6 +6,9 @@
 它把驱动层网卡、smoltcp 协议栈、socket 对象、轮询唤醒、Unix domain socket、netlink 和可选 vsock 组合成统一的 `SocketOps` 接口。
 上层 `posix/net` 负责 syscall 参数解析和文件描述符接入，`core/kruntime` 负责启动期设备注入，`knet` 负责协议状态、路由、收发推进和 socket 语义。
 
+打开的 socket 统一使用 `SocketFileOps`，其 `fsync/fdatasync` 显式返回 `EINVAL`；
+网络发送完成不提供文件持久化语义，也不继承通用文件操作的兼容性成功空操作。
+
 ## 背景
 
 x-kernel 运行在 `no_std` 内核环境中，无法直接使用 Linux 内核网络栈或标准库网络类型。

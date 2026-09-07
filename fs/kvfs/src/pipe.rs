@@ -608,6 +608,10 @@ fn register_pipe_poll(
 struct PipeFileOperations;
 
 impl FileOperations for PipeFileOperations {
+    fn fsync(&self, _file: &VfsFile, _data_only: bool) -> VfsResult<()> {
+        Err(KError::InvalidInput)
+    }
+
     fn supports_read(&self) -> bool {
         true
     }
@@ -661,6 +665,10 @@ impl FileOperations for PipeFileOperations {
 struct FifoFileOperations;
 
 impl FileOperations for FifoFileOperations {
+    fn fsync(&self, _file: &VfsFile, _data_only: bool) -> VfsResult<()> {
+        Err(KError::InvalidInput)
+    }
+
     fn open(self: Arc<Self>, inode: &VfsInode, file: &mut VfsFileBuilder) -> VfsResult<()> {
         let access = PipeAccess::from_mode(file.mode())?;
         let pipe = inode.acquire_fifo_pipe()?;

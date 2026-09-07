@@ -295,6 +295,11 @@ slot 在 callback 前已经存在，commit 只交换 location 和原位替换 sl
 
 ## 已知限制
 
+- pipe、FIFO、socket 和通用字符设备操作表显式拒绝同步并返回 `EINVAL`。
+  `O_PATH` 同步在调用后端前返回 `EBADF`，后端同步错误原样传播。
+  通用默认同步仍为兼容性成功空操作；FAT、9p 等后端的成功返回不构成持久化保证，
+  必须由后续后端同步实现及持久化验证补齐。
+
 - 尚无完整 capability、LSM、POSIX ACL、user namespace ID 映射和 idmapped mount DAC；
   `trusted.*` 访问和 `security.*` mutation 当前使用 `euid == 0` 近似相应 capability。
 - FAT 等后端不能完整表达 Unix UID/GID owner。

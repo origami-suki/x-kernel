@@ -756,6 +756,12 @@ impl InodeDirOperations for MemoryNode {
 }
 
 impl FileOperations for MemoryNode {
+    fn fsync(&self, _file: &VfsFile, _data_only: bool) -> VfsResult<()> {
+        // Memory-backed files and directories have no persistent writeback.
+        // Special inodes install their own operation tables during VFS open.
+        Ok(())
+    }
+
     fn dir_operations(&self) -> Option<&dyn FileDirOperations> {
         if matches!(self.inode.content.as_ref(), Some(InodeContent::Dir(_))) {
             Some(self)
@@ -950,6 +956,39 @@ mod tests {
         assert_eq!(file.write_from(b"hello", &mut pos).unwrap(), 5);
         assert_eq!(file.path().getattr().unwrap().size, 5);
         assert_eq!(file.inode().size(), 5);
+    }
+
+    #[def_test]
+    fn tmpfs_fsync_preserves_file_contents_and_accepts_directories() {
+        let fs = shmem::new_tmpfs(SuperBlockFlags::empty());
+        let root = Mount::new_root(&fs).root_path();
+        let file = kvfs::Filename::new("sync")
+            .open_with_flags_at(
+                &root,
+                &root,
+                linux_raw_sys::general::O_RDWR | O_CREAT | O_EXCL,
+                NodePermission::from_bits_truncate(0o600),
+                NodePermission::empty(),
+                kcred::initial_cred(),
+            )
+            .unwrap();
+        assert_eq!(file.write(b"sync-data"), Ok(9));
+        for data_only in [false, true] {
+            assert_eq!(file.fsync(data_only), Ok(()));
+        }
+        let mut contents = [0; 9];
+        assert_eq!(file.read_from(&mut contents, &mut 0), Ok(9));
+        assert_eq!(&contents, b"sync-data");
+
+        let directory = kvfs::dentry_open(
+            root,
+            linux_raw_sys::general::O_RDONLY | linux_raw_sys::general::O_DIRECTORY,
+            kcred::initial_cred(),
+        )
+        .unwrap();
+        for data_only in [false, true] {
+            assert_eq!(directory.fsync(data_only), Ok(()));
+        }
     }
 
     #[def_test]

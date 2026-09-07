@@ -120,6 +120,10 @@ impl ChrdevFileOperations {
 }
 
 impl FileOperations for ChrdevFileOperations {
+    fn fsync(&self, _file: &VfsFile, _data_only: bool) -> VfsResult<()> {
+        Err(VfsError::InvalidInput)
+    }
+
     fn open(self: Arc<Self>, inode: &VfsInode, file: &mut VfsFileBuilder) -> VfsResult<()> {
         self.ops.open(inode, file)
     }

@@ -12,6 +12,17 @@ namespace validation、lock ordering、dcache identity、类型化 operation fla
 credential snapshot，`kvfs` 接收显式 `&Cred` 并完成路径遍历和通用 DAC。`kvfs` 不
 依赖 `kprocess`，因此可被 boot、内核伪文件系统和测试以明确身份复用。
 
+## 文件同步契约
+
+`VfsFile::fsync` 先拒绝 `FMode::PATH`（`EBADF`），再把 `data_only` 原样传给
+文件 operation，并原样传播后端错误。只读打开本身不禁止同步。
+`FileOperations::fsync` 保留兼容性的成功空操作，不承诺数据已持久化。
+pipe、FIFO、socket 和通用字符设备操作表显式返回 `EINVAL`，不按 inode 类型在
+syscall 层统一拒绝。字符设备 open 若替换操作表，同步由最终安装的操作表决定。
+已有 kext4、块设备和 simple-directory/nullfs 同步回调不变；memfs 显式提供成功空操作。
+FAT、9p 和其他未覆盖同步的后端保持既有返回行为。它们的真实持久化能力、匿名事件
+对象及其他伪文件的同步语义仍需单独完善；本次不通过全局修改默认值扩大影响范围。
+
 ## 范围
 
 - `src/open_flags.rs`：原始 `O_*` 参数的规范化与 open intent。
