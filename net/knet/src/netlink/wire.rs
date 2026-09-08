@@ -309,8 +309,9 @@ pub(super) fn build_nlmsg(msg_type: u16, seq: u32, flags: u16, payload: Vec<u8>)
     out
 }
 
+// NLMSG_DONE carries a zero status when the dump finishes successfully.
 pub(super) fn build_nlmsg_done_response(request: &NlMsgHeader) -> Vec<u8> {
-    request.build_payload_response(NLMSG_DONE, NLM_F_MULTI, &[])
+    request.build_payload_response(NLMSG_DONE, NLM_F_MULTI, &0i32.to_ne_bytes())
 }
 
 pub(super) fn build_nlmsg_error_response(

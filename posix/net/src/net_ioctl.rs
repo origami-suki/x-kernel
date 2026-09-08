@@ -13,10 +13,10 @@ use alloc::string::ToString;
 use core::{ffi::c_char, net::Ipv4Addr};
 
 use kerrno::{KError, KResult, LinuxError};
-use knet::{find_interface, sock_from_file};
+use knet::{find_interface, interface_ipv4_addr, sock_from_file};
 use linux_raw_sys::{
     ioctl::{
-        SIOCADDRT, SIOCDELRT, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCSIFADDR,
+        SIOCADDRT, SIOCDELRT, SIOCGIFADDR, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCSIFADDR,
         SIOCSIFBRDADDR, SIOCSIFFLAGS, SIOCSIFNETMASK,
     },
     net::AF_INET,
@@ -40,6 +40,15 @@ unsafe impl UserRead for Sockaddr {}
 unsafe impl UserWrite for Sockaddr {}
 
 impl Sockaddr {
+    fn ipv4(addr: Ipv4Addr) -> Self {
+        let mut data = [0u8; 14];
+        data[2..6].copy_from_slice(&addr.octets());
+        Self {
+            family: AF_INET as u16,
+            data,
+        }
+    }
+
     fn hwaddr(hw: [u8; 6], arphrd: u16) -> Self {
         let mut data = [0u8; 14];
         data[..6].copy_from_slice(&hw);
@@ -120,6 +129,10 @@ pub fn handle_net_ioctl(fd: i32, cmd: u32, arg: usize) -> KResult<Option<isize>>
             handle_get_flags(arg)?;
             Ok(Some(0))
         }
+        SIOCGIFADDR => {
+            handle_get_addr(arg)?;
+            Ok(Some(0))
+        }
         SIOCSIFADDR => {
             handle_set_addr(arg)?;
             Ok(Some(0))
@@ -154,6 +167,7 @@ fn is_net_ioctl_cmd(cmd: u32) -> bool {
         SIOCGIFINDEX
             | SIOCGIFHWADDR
             | SIOCGIFFLAGS
+            | SIOCGIFADDR
             | SIOCSIFADDR
             | SIOCSIFNETMASK
             | SIOCSIFBRDADDR
@@ -412,6 +426,15 @@ fn handle_get_flags(arg: usize) -> KResult {
     let name = ifr.name_str()?;
     let iface = find_interface(&name).ok_or(KError::from(LinuxError::ENODEV))?;
     ifr.set_u16(iface.flags as u16);
+    UserPtr::<Ifreq>::from(arg).write_vm(ifr)?;
+    Ok(())
+}
+
+fn handle_get_addr(arg: usize) -> KResult {
+    let mut ifr: Ifreq = UserConstPtr::<Ifreq>::from(arg).read_vm()?;
+    let name = ifr.name_str()?;
+    let addr = interface_ipv4_addr(&name).map_err(KError::from)?;
+    ifr.set_sockaddr(Sockaddr::ipv4(addr));
     UserPtr::<Ifreq>::from(arg).write_vm(ifr)?;
     Ok(())
 }

@@ -69,6 +69,23 @@ pub fn find_interface(name: &str) -> Option<NetInterfaceInfo> {
     })
 }
 
+/// Returns the primary IPv4 address of the specified interface.
+///
+/// Device resolution and address lookup run under a single Router lock.
+///
+/// # Errors
+///
+/// Returns `ENODEV` when `name` is unknown and `EADDRNOTAVAIL` when the
+/// interface has no IPv4 address.
+pub fn interface_ipv4_addr(name: &str) -> Result<Ipv4Addr, LinuxError> {
+    if !SERVICE.is_inited() {
+        return Err(LinuxError::ENODEV);
+    }
+    SERVICE
+        .interface_ipv4_addr(name)
+        .map(|cidr| Ipv4Addr::from(cidr.address().octets()))
+}
+
 /// Updates the primary IPv4 address on `name`.
 ///
 /// Other IPv4 addresses assigned to the interface remain unchanged.

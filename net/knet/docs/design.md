@@ -296,12 +296,12 @@ RTM_GETNEIGH ──────────────────────�
 | 从 | 到 | 触发条件 |
 |----|----|----------|
 | 设备 link 配置 | 更新后的设备 link 配置 | `RTM_NEWLINK` 经 `Service::update_device_link` 更新目标 `NetDevice` |
-| 设备 link 配置 | `RTM_NEWLINK` dump | `RTM_GETLINK` 在 `SERVICE` 内读取每个设备的 `LinkSnapshot` |
+| 设备 link 配置 | `RTM_NEWLINK` response | `RTM_GETLINK` dump 读取全部 `LinkSnapshot`，单对象查询按接口索引或名称读取匹配快照 |
 | 初始 IPv4 地址条目 | `Router::ipv4_addrs` | `init_network` 通过 `Router::add_ipv4_addr` 注册，Router 同时生成 local 和 connected 路由 |
 | IPv4 地址条目 | smoltcp、IngressProcessor 和设备地址投影 | 地址加入、删除或所属设备移除时由 `Service` 刷新所有派生视图 |
 | 最后一个 IPv4 地址持有者 | `Router` 配置路由 | 地址删除时移除以该地址为 `prefsrc` 的配置路由 |
 | 已移除设备 | `Router` 路由与设备邻居 | `unregister_netdev` 持有 `network_config_lock`，Router 删除该接口的路由和邻居并重编号后续接口索引 |
-| `RTM_GETADDR` | Router 地址快照 | rtnetlink 直接读取 `Service::ipv4_addr_snapshots` |
+| `RTM_GETADDR` | Router 地址快照 | rtnetlink 直接读取 `Service::ipv4_addr_snapshots`，请求携带接口索引时只返回该设备的地址 |
 | 初始路由 | `Router` | `init_network` 直接调用 `Router::add_rule` |
 | `RTM_NEWROUTE` / `RTM_DELROUTE` / `SIOCADDRT` / `SIOCDELRT` | `Router` | 控制面在 Router owner 内完成校验和 mutation |
 | `RTM_NEWNEIGH` | 目标 `NetDevice` | rtnetlink 通过 `Service` 和 `Router` 把更新交给设备邻居表 |
@@ -427,17 +427,19 @@ Loopback UDP 独立于 poller 执行权，发送路径在 BH 窗口内完成 xmi
 
 1. POSIX send 路径和 socket file write 路径先区分协议，仅在 netlink 分支取得当前
    调用者的 `Cred` 快照，通过 `Socket::send_with_cred` 传给 `NetlinkSocket`。
-2. `NlMsgHeader::read` 校验每条 netlink message 的 header 长度，批次拆分再校验
-   message 对齐边界。framing 错误在处理任何 message 前返回 syscall `EINVAL`。
+2. `NlMsgHeader::read` 校验每条 netlink message 的 header 长度。批次拆分按
+   `NLMSG_ALIGN(nlmsg_len)` 推进；剩余不足一个 header、`nlmsg_len` 小于 header
+   或大于剩余字节时停止，已处理消息不回滚，也不要求尾部填充为零。
 3. 仅含查询的批次逐条生成 response；仅含 mutation 的批次在检查完整批次的
    response queue 空间后逐条执行；混合查询和 mutation 的批次在修改状态前返回
    syscall `EOPNOTSUPP`。
 4. 每条 mutation 使用本次发送携带的凭据检查权限。跨 socket mutation 与设备移除通过 `network_config_lock` 串行化，地址存在性判断、地址更新和依赖的 Router 路由清理处于同一事务作用域。无权限请求生成带 `EPERM`
    的 `NLMSG_ERROR`，response 入队后发送入口返回已消费的请求长度。
-5. `RTM_GETLINK` 从设备实时快照生成 multi-part response，`RTM_NEWLINK` 在整组名称、MTU 和 flags 校验通过后直接更新目标设备。
-6. `RTM_GETADDR` 从 Router 地址快照生成 multi-part response；`RTM_NEWADDR` 和 `RTM_DELADDR` 直接调用 Router 地址 mutation，失败时返回 netlink error。重复地址策略在 Router 锁内判定；最后一个同值地址删除后，`RTM_DELADDR` 同时清理 Router 中以该地址为 `prefsrc` 的配置路由。
+5. 带 `NLM_F_DUMP` 的 `RTM_GETLINK` 从设备实时快照生成 multi-part response；单对象查询优先按 `ifi_index`、其次按 `IFLA_IFNAME` 返回一个匹配快照，成功且请求带 `NLM_F_ACK` 时在 `RTM_NEWLINK` 后追加 `NLMSG_ERROR(error=0)`。`RTM_NEWLINK` 在整组名称、MTU 和 flags 校验通过后直接更新目标设备。
+6. `RTM_GETADDR` 从 Router 地址快照生成 multi-part response，请求携带 `ifa_index` 时只返回该设备的地址；`RTM_NEWADDR` 和 `RTM_DELADDR` 直接调用 Router 地址 mutation，失败时返回 netlink error。重复地址策略在 Router 锁内判定；最后一个同值地址删除后，`RTM_DELADDR` 同时清理 Router 中以该地址为 `prefsrc` 的配置路由。
 7. `RTM_GETROUTE` 和 route mutation 直接访问 Router，neighbor mutation 直接访问目标设备的邻居表，create/replace 判定与更新在同一 Router 临界区完成，带 `NLM_F_ACK` 时返回 ack。未识别的 route attribute 按 Linux `rtm_to_fib_config` 跳过，不返回 `EOPNOTSUPP`。
-8. 传统 ioctl `SIOCSIFADDR`、`SIOCSIFNETMASK`、`SIOCSIFBRDADDR`、`SIOCADDRT` 和 `SIOCDELRT` 同样进入 Router / 设备 owner。`SIOCSIFADDR` 的 classful 前缀对齐 Linux 6.8 `inet_abc_len`：仅 `0.0.0.0` 和有限广播使用前缀 0，其余 `0.x.x.x` 走 class A `/8`。地址设置直接更新 Router 中的主地址条目，其余地址保持不变；`SIOCSIFADDR 0.0.0.0` 只删除主地址，供 DHCP deconfig 流程使用。`SIOCSIFNETMASK` 直接更新主地址前缀并保留 scope 和自定义 broadcast。`SIOCDELRT` 在未给出 `rt_dev`、未设置网关或网关为 `0.0.0.0` 时按 Linux `fib_nh_match` 通配对应字段，因此 BusyBox 的 `route del default gw 0.0.0.0 dev eth0` 可以删除旧默认路由。`SIOCSIFFLAGS` 当前只应用 `IFF_UP`，其余接口标志不改变设备状态。
+8. 传统 ioctl `SIOCGIFADDR`、`SIOCSIFADDR`、`SIOCSIFNETMASK`、`SIOCSIFBRDADDR`、`SIOCADDRT` 和 `SIOCDELRT` 同样进入 Router / 设备 owner。`SIOCGIFADDR` 在单次 Router 锁内按接口名解析设备并读取主地址，未知设备返回 `ENODEV`，无地址返回 `EADDRNOTAVAIL`。`SIOCSIFADDR` 的 classful 前缀对齐 Linux 6.8 `inet_abc_len`：仅 `0.0.0.0` 和有限广播使用前缀 0，其余 `0.x.x.x` 走 class A `/8`。地址设置直接更新 Router 中的主地址条目，其余地址保持不变；`SIOCSIFADDR 0.0.0.0` 只删除主地址，供 DHCP deconfig 流程使用。`SIOCSIFNETMASK` 直接更新主地址前缀并保留 scope 和自定义 broadcast。`SIOCDELRT` 在未给出 `rt_dev`、未设置网关或网关为 `0.0.0.0` 时按 Linux `fib_nh_match` 通配对应字段，因此 BusyBox 的 `route del default gw 0.0.0.0 dev eth0` 可以删除旧默认路由。`SIOCSIFFLAGS` 当前只应用 `IFF_UP`，其余接口标志不改变设备状态。
+9. netlink 数据报接收遵循 `MSG_PEEK` 与 `MSG_TRUNC` 语义，短缓冲区复制可容纳部分并通过输出 flags 报告截断。iproute2 先用零长度缓冲与这两个 flags 探测完整消息长度，再分配缓冲读取消息；dump 结束的 `NLMSG_DONE` 携带值为 0 的整数状态载荷，供 iproute2 检查完成状态。
 
 ## 并发模型
 

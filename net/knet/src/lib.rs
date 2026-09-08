@@ -35,8 +35,9 @@ pub mod vsock;
 use alloc::{borrow::ToOwned, boxed::Box, sync::Arc};
 
 pub use control::{
-    NetInterfaceInfo, add_ipv4_route, del_ipv4_route, find_interface, set_interface_flags,
-    set_interface_ipv4_addr, set_interface_ipv4_broadcast, set_interface_ipv4_netmask,
+    NetInterfaceInfo, add_ipv4_route, del_ipv4_route, find_interface, interface_ipv4_addr,
+    set_interface_flags, set_interface_ipv4_addr, set_interface_ipv4_broadcast,
+    set_interface_ipv4_netmask,
 };
 #[cfg(feature = "vsock")]
 use kclass::{ClassDevice, VsockDeviceImpl, subscribe_vsock_available, vsock_devices};

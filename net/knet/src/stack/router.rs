@@ -512,6 +512,25 @@ impl Router {
         self.devices.iter().position(|device| device.name() == name)
     }
 
+    /// Returns the primary IPv4 address of the device named `name`.
+    ///
+    /// Device resolution and address lookup happen under one Router borrow so
+    /// a concurrent device removal cannot renumber slots between the two
+    /// steps, matching Linux `devinet_ioctl` holding `rtnl_lock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENODEV` for an unknown device and `EADDRNOTAVAIL` when the
+    /// device has no IPv4 address.
+    pub(crate) fn interface_ipv4_addr(&self, name: &str) -> Result<Ipv4Cidr, LinuxError> {
+        let dev = self.device_index_by_name(name).ok_or(LinuxError::ENODEV)?;
+        self.ipv4_addrs
+            .iter()
+            .find(|entry| entry.dev == dev)
+            .map(|entry| entry.addr)
+            .ok_or(LinuxError::EADDRNOTAVAIL)
+    }
+
     fn first_ipv4_addr_for_device(&self, ifindex: u32) -> Option<Ipv4Cidr> {
         ifindex
             .checked_sub(1)

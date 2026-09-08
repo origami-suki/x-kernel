@@ -19,7 +19,7 @@ use super::{
     wire::{NlMsgHeader, align},
 };
 use crate::{
-    ConnectOptions, RecvOptions, SendOptions, Shutdown, SocketAddrEx, SocketOps,
+    ConnectOptions, RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx, SocketOps,
     options::{Configurable, GetSocketOption, OptionHandled, SetSocketOption},
 };
 
@@ -96,7 +96,12 @@ impl NetlinkSocket {
         let _send_guard = self.inner.send_lock.lock();
 
         if self.inner.protocol == NETLINK_ROUTE {
-            let requests = split_route_requests(&request)?;
+            // Match Linux netlink_rcv_skb: stop at a short or truncated header
+            // without failing the send or rolling back earlier messages.
+            let requests = split_route_requests(&request);
+            if requests.is_empty() {
+                return Ok(request.len());
+            }
             let has_mutation = requests
                 .iter()
                 .any(|request| route_request_requires_privilege(request));
@@ -239,20 +244,28 @@ impl SocketOps for NetlinkSocket {
             .general
             .recv_poller_with_nonblocking(self, options.flags.nonblocking(), || {
                 let mut rx_queue = self.inner.rx_queue.lock();
-                let packet_len = rx_queue
-                    .front()
-                    .map(|packet| packet.data.len())
-                    .ok_or(KError::WouldBlock)?;
-                if dst.remaining_mut() < packet_len {
-                    return Err(LinuxError::EMSGSIZE.into());
-                }
-                let packet = rx_queue.pop_front().ok_or(KError::WouldBlock)?;
+                let packet = rx_queue.front().ok_or(KError::WouldBlock)?;
+                let packet_len = packet.data.len();
                 if let Some(from) = options.from.as_deref_mut() {
                     *from = SocketAddrEx::Netlink(packet.from);
                 }
 
-                let written = dst.write(&packet.data)?;
-                Ok(written)
+                let write_len = packet_len.min(dst.remaining_mut());
+                dst.write_all(&packet.data[..write_len])?;
+                if write_len < packet_len
+                    && let Some(out_flags) = options.out_flags.as_deref_mut()
+                {
+                    *out_flags |= RecvFlags::TRUNCATE;
+                }
+                if !options.flags.contains(RecvFlags::PEEK) {
+                    let _ = rx_queue.pop_front();
+                }
+
+                Ok(if options.flags.contains(RecvFlags::TRUNCATE) {
+                    packet_len
+                } else {
+                    write_len
+                })
             })
     }
 
@@ -281,23 +294,24 @@ fn route_request_requires_privilege(request: &[u8]) -> bool {
     rtnetlink_request_requires_privilege(header.msg_type)
 }
 
-fn split_route_requests(mut datagram: &[u8]) -> Result<Vec<&[u8]>, LinuxError> {
+/// Splits a NETLINK_ROUTE datagram into complete netlink messages.
+///
+/// Mirrors Linux `netlink_rcv_skb`: iterate while at least one header fits,
+/// stop when `nlmsg_len` is shorter than a header or longer than the remaining
+/// bytes, and ignore any trailing padding without requiring it to be zero.
+fn split_route_requests(mut datagram: &[u8]) -> Vec<&[u8]> {
     let mut requests = Vec::new();
-    while !datagram.is_empty() {
-        let header = NlMsgHeader::read(datagram).ok_or(LinuxError::EINVAL)?;
-        let message_len = header.len as usize;
-        requests.push(&datagram[..message_len]);
-
-        let aligned_len = align(message_len);
-        if aligned_len <= datagram.len() {
-            datagram = &datagram[aligned_len..];
-        } else if message_len == datagram.len() {
-            datagram = &[];
-        } else {
-            return Err(LinuxError::EINVAL);
+    while datagram.len() >= NLMSG_HDR_LEN {
+        let message_len =
+            u32::from_ne_bytes([datagram[0], datagram[1], datagram[2], datagram[3]]) as usize;
+        if message_len < NLMSG_HDR_LEN || message_len > datagram.len() {
+            break;
         }
+        requests.push(&datagram[..message_len]);
+        let aligned_len = align(message_len).min(datagram.len());
+        datagram = &datagram[aligned_len..];
     }
-    Ok(requests)
+    requests
 }
 
 fn max_error_response_len(request: &[u8]) -> usize {

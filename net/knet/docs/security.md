@@ -189,7 +189,7 @@ vtable 回调保持原指针与静态生命周期，不释放该测试计数器�
 3. `Service` 互斥访问：设备 RX drain、路由状态、ingress queue 和 TX dispatch 必须经过内部 Router mutex，smoltcp Interface 必须经过独立 mutex；IPv4 校验和 snoop 在 Router 锁外执行。
 4. ring buffer publish 规则：Unix stream 和 vsock 只能发布已经写入的字节，只能消费当前 occupied 区域内的字节。Unix stream 的 write index 发布、方向关闭和空队列 EOF 判定由同一个方向锁排序。
 5. driver buffer 生命周期：`NetBufHandle::data` 只在 handle 被 recycle 前使用，RX handle 必须在处理后归还。
-6. netlink message 边界：所有 payload 读取必须先经过单条 header 长度、批次对齐边界、attribute 长度和 family 校验。
+6. netlink message 边界：所有 payload 读取必须先经过单条 header 长度、批次对齐边界、attribute 长度和 family 校验。批次拆分在剩余不足一个 header、`nlmsg_len` 非法或截断时停止，不回滚已处理消息，也不因尾部非零填充返回 syscall 错误。
 7. netlink credential 边界：每次 `send` 或 `write` 必须传入当前调用者的独立 `Cred` 快照，netlink socket 不得缓存调用者权限。
 8. netlink batch 执行边界：每个 socket 的发送事务锁串行化容量预检、mutation 执行和 response 入队；`network_config_lock` 串行化跨 socket mutation、legacy socket ioctl mutation 与 `unregister_netdev`；混合查询和 mutation 的批次必须在状态更新前拒绝；同类 mutation 执行前必须检查完整批次的 response queue 空间。response 在 rx queue 锁外生成，锁顺序固定为发送事务锁、`network_config_lock`、Router、ingress、Interface、netlink rx queue，未涉及的锁按序跳过。
 9. route index 边界：rtnetlink route 的 `oif` 转换成设备索引后必须检查 `dev < devices.len()`。
@@ -239,7 +239,7 @@ vtable 回调保持原指针与静态生命周期，不释放该测试计数器�
 | T-06 | listen backlog 被 SYN 洪泛占满 | 中 | 大量连接请求命中同一 listener | backlog 被 clamp 到 `LISTEN_QUEUE_SIZE`；超限丢弃并记录 warn |
 | T-07 | raw socket 被无权限调用者创建 | 中 | syscall 层没有实施权限门禁 | `knet` 层只封装 raw socket 行为；权限策略应保留在 `posix/net::sys_socket` |
 | T-08 | netlink RX queue 被 uevent 或 response 填满 | 中 | 订阅者不消费，publisher 持续写入 | `NETLINK_RX_QUEUE_LIMIT` 限制单 socket queue 字节数，超限丢弃 |
-| T-09 | 控制面与 data-plane 不一致 | 中 | link mutation 更新设备 owner 失败，rtnetlink 与 legacy socket ioctl 地址 mutation 交错，设备移除后保留旧地址投影或控制面路由，删除地址后配置路由继续引用失效 `prefsrc`，或 route 与 neighbor mutation 绕过各自 owner | `network_config_lock` 串行化跨入口更新与 `unregister_netdev`；link query 与 mutation 直接访问 `NetDevice` owner；address 与 route query 和 mutation 直接访问 Router；`RTM_NEWNEIGH` 直接访问目标设备；地址与设备删除刷新自动路由、ingress、Interface 和设备投影；地址最后持有者和设备删除路径同步清理 Router 路由并更新接口索引 |
+| T-09 | 控制面与 data-plane 不一致 | 中 | link mutation 更新设备 owner 失败，rtnetlink 与 legacy socket ioctl 地址 mutation 交错，设备移除后保留旧地址投影或控制面路由，删除地址后配置路由继续引用失效 `prefsrc`，或 route 与 neighbor mutation 绕过各自 owner | `network_config_lock` 串行化跨入口更新与 `unregister_netdev`；link query 与 mutation 直接访问 `NetDevice` owner；address 与 route query 和 mutation 直接访问 Router；接口地址查询在 Router 单次锁内完成；`RTM_NEWNEIGH` 直接访问目标设备；地址与设备删除刷新自动路由、ingress、Interface 和设备投影；地址最后持有者和设备删除路径同步清理 Router 路由并更新接口索引 |
 | T-10 | 外部网络包触发 parser panic | 中 | malformed Ethernet、ARP、IP、UDP 或 TCP packet 进入 RX | Ethernet 和 ARP 使用 `zerocopy` checked view，IPv4 与 UDP 使用 crate 内 checked parser，TCP、raw IP 和 IPv6 使用 smoltcp checked parser；错误包直接丢弃 |
 | T-11 | 中断上下文误用导致锁竞争或延迟放大 | 中 | IRQ waker 回调中直接推进 `SERVICE`、`SOCKET_SET` 或执行阻塞 socket 操作 | VirtIO IRQ handler 只确认中断并调度 NetRx softirq；NetRx softirq 只标记/唤醒 RX source 并 queue `knet-poller` work；kwork callback 在普通任务上下文执行最多四轮的有界批次 |
 | T-12 | driver buffer 或 DMA 输入破坏 packet 边界 | 高 | 驱动返回长度异常、数据在 recycle 后继续被访问、TX/RX buffer 生命周期使用错误 | RX 数据只在 `NetBufHandle` recycle 前解析和复制；外部帧使用 checked parser；TX buffer 由 driver handle 管理 |
@@ -254,7 +254,7 @@ vtable 回调保持原指针与静态生命周期，不释放该测试计数器�
 | T-21 | 内核任务隐式读取用户凭据 | 高 | 启动期 pathname bind 调用普通 `SocketOps::bind`，当前线程不存在或主体错误 | 内核调用者使用 `bind_with_cred` 显式传入 `initial_cred()` 等已选择凭据；普通入口只服务当前用户任务 |
 | T-22 | Unix stream 在 EOF 后发布数据 | 中 | send、shutdown 与 peer recv 并发交错，关闭状态和 write index 缺少共同排序 | 每个发送方向使用共享 `tx_order`；send 在锁内复检后发布，recv 在锁内复查 empty 和 closed，Channel 释放前先发布关闭状态 |
 | T-23 | netlink socket 复用旧凭据导致越权 mutation | 高 | socket 跨进程传递或调用者凭据变化后继续使用创建时权限 | POSIX send 与 socket file write 路径仅在 netlink 分支取得当前 `Cred`，`NetlinkSocket::send_with_cred` 逐条检查 mutation；无权限请求生成 `NLMSG_ERROR` 和 `EPERM` |
-| T-24 | 混合 netlink 批次发生部分 mutation | 高 | 同一发送同时包含 query 和 mutation，framing 错误位于已处理消息之后，或 response queue 在批次中途耗尽 | 发送事务锁串行化同一 socket 的 mutation 批次；完整批次先校验 framing 和类别；混合批次返回 syscall `EOPNOTSUPP`；同类 mutation 执行前检查完整 response 空间 |
+| T-24 | 混合 netlink 批次发生部分 mutation | 高 | 同一发送同时包含 query 和 mutation，或 response queue 在批次中途耗尽 | 发送事务锁串行化同一 socket 的 mutation 批次；完整批次先校验类别；混合批次返回 syscall `EOPNOTSUPP`；同类 mutation 执行前检查完整 response 空间；截断或非法后续 header 只停止拆分，不回滚已处理消息 |
 | T-25 | poller 执行期间丢失新事件 | 中 | RX、TX 或 timer 通知与完成 CAS 并发 | `kwork::BudgetedPoller` 将执行期通知发布为 `RUNNING_PENDING`；完成 CAS 失败后按观察到的状态重试，并通过一次成功 CAS 同时释放执行权和发布下一轮 |
 | T-26 | smoltcp 协议 timer 缺少推进事件 | 中 | TCP 重传或 keep-alive deadline 到期时没有设备 IRQ 或 socket 调用 | 每次 Interface poll 后通过 `poll_at` 注册 timer，并在轮次末尾用新的单调时间判断绝对 deadline；到期后调用 `notify(PollReason::Timer)` 并唤醒 socket waiter；未来 deadline 不触发立即重轮询 |
 | T-27 | socket TX 工作缺少后台推进 | 中 | connect、send、receive window update 或 close 只更新 socket 状态 | 真实 TX 生产路径调用 `notify(PollReason::Tx)`；TCP 与 raw 注册 smoltcp send waker；Router data TX queue 容量增加后唤醒全局 TX waiter |
@@ -298,7 +298,7 @@ vtable 回调保持原指针与静态生命周期，不释放该测试计数器�
 | F-17 | 启动期 Unix pathname bind panic | 内核任务调用隐式 `current_cred()`，但尚无当前用户线程 | `/dev/log` 等内核 socket 无法绑定 | 启动中断 | 2 | 启动期调用 `bind_with_cred` 并显式传入 `initial_cred()`；保留可用的初始 fs context |
 | F-18 | smoltcp 过期 poll 期限变成超长等待 | 有符号微秒差值为负后通过 `as u64` 转换 | soft timer 被设置到远未来 | TCP 数据路径停顿，可能伴随 timer IRQ 异常 | 2 | 在同一 epoch 下直接把 `SmoltcpInstant` 映射为 `MonotonicInstant`，不计算无符号 delay；单测覆盖过期和未来期限 |
 | F-19 | 无权限 netlink mutation | 当前发送凭据不具备配置权限 | mutation 不执行，RX queue 收到 `NLMSG_ERROR` 和 `EPERM` | 调用者配置失败 | 4 | 每次发送重新检查凭据；error 入队后发送入口返回已消费请求长度 |
-| F-20 | 混合或畸形 netlink 批次 | 单次发送混合 query 与 mutation，或后续 message 的长度和对齐非法 | 整批未执行并返回 syscall 错误 | 调用者需修正或拆分批次 | 4 | 批次分类和 framing 校验在状态更新及 response 生成前完成 |
+| F-20 | 混合或截断 netlink 批次 | 单次发送混合 query 与 mutation，或后续 message 的长度不足、截断 | 混合批次未执行并返回 syscall 错误；截断尾部只停止后续解析 | 调用者需修正或拆分批次 | 4 | 批次分类在状态更新及 response 生成前完成；剩余不足一个 header 或非法 `nlmsg_len` 时结束拆分 |
 | F-21 | RX 或 TX backlog 长期占用推进任务 | 持续高包率超过单轮 budget | 单轮达到预算或 1 ms 软时间上限并留下 backlog | 其他任务调度延迟或网络吞吐下降 | 3 | 设备 RX、stack ingress、stack egress 和 Router TX 最多处理 32 个工作项后检查时间；每批最多连续执行四轮，达到上限后重新唤醒并归还执行权，剩余 backlog 进入下一批 |
 | F-22 | TCP peer 在本地文件关闭后不发送 FIN | peer 已确认本地 FIN，协议 handle 长期停留在 orphan `FIN_WAIT_2` | deferred-close registry 持续持有 socket buffer | 网络内存随失联连接增长 | 3 | 进入 `FIN_WAIT_2` 时设置 60 秒期限，期限进入统一 poll timer，到期后回收 handle |
 | F-23 | IPv4 输出设备管理 down | `RTM_NEWLINK` 清除匹配路由设备的 `IFF_UP` | 当前 UDP 或 raw IP 发送失败 | 应用收到 `ENETUNREACH` | 4 | UDP 和 raw IP 在提交发送缓冲前通过 `SERVICE` 校验输出路由和设备管理状态 |
@@ -317,7 +317,7 @@ vtable 回调保持原指针与静态生命周期，不释放该测试计数器�
 ## 故障管理
 
 - 普通输入错误使用 `KError` 和 `LinuxError` 返回，例如 `EINVAL`、`EAFNOSUPPORT`、`ENETUNREACH`、`EADDRINUSE`、`EWOULDBLOCK`。
-- netlink framing 错误在处理前返回 syscall `EINVAL` 且不生成 response；完成批次拆分后的 payload 或 attribute 错误返回 `NLMSG_ERROR`。
+- netlink 批次在剩余不足一个 header、`nlmsg_len` 小于 header 或大于剩余字节时停止拆分；已处理消息不回滚，尾部填充不必为零。完成批次拆分后的 payload 或 attribute 错误返回 `NLMSG_ERROR`。
 - 无权限 netlink mutation 在 RX queue 中返回带 `EPERM` 的 `NLMSG_ERROR`；混合查询和 mutation 批次在修改状态前返回 syscall `EOPNOTSUPP`。
 - malformed Ethernet、ARP、IP、UDP、TCP 包在 RX 路径丢弃，并通过 warn 或 trace 记录。
 - UDP PCB 接收队列和 Router TX 队列满时映射为丢包或 `WouldBlock`，poller 负责等待 IO readiness。

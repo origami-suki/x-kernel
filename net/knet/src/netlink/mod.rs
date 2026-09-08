@@ -37,6 +37,7 @@ pub const NETLINK_ROUTE: i32 = 0;
 pub(super) const NETLINK_KOBJECT_UEVENT: i32 = 15;
 pub(super) const NLM_F_REQUEST: u16 = 0x0001;
 pub(super) const NLM_F_ACK: u16 = 0x0004;
+pub(super) const NLM_F_DUMP: u16 = 0x0300;
 pub(super) const NLM_F_REPLACE: u16 = 0x0100;
 pub(super) const NLM_F_EXCL: u16 = 0x0200;
 pub(super) const NLM_F_CREATE: u16 = 0x0400;

@@ -39,6 +39,12 @@ pub(super) struct LinkUpdateRequest {
     pub(super) mtu: Option<u32>,
 }
 
+#[derive(Clone, Debug)]
+struct LinkQuery {
+    index: i32,
+    name: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AddrRequest {
     pub(super) index: u32,
@@ -132,9 +138,10 @@ impl RtnetlinkOperation {
         }
     }
 
-    fn is_dump(self) -> bool {
+    fn is_dump_request(self, flags: u16) -> bool {
         match self {
-            Self::GetLink | Self::GetAddr | Self::GetRoute => true,
+            Self::GetLink => flags & NLM_F_DUMP == NLM_F_DUMP,
+            Self::GetAddr | Self::GetRoute => true,
             Self::NewLink
             | Self::NewAddr
             | Self::DelAddr
@@ -191,8 +198,10 @@ pub(super) fn handle_rtnetlink_request(request: &[u8]) -> Vec<NetlinkPacket> {
         .get(NLMSG_HDR_LEN..(header.len as usize).min(request.len()))
         .unwrap_or(&[]);
     let operation = RtnetlinkOperation::from_msg_type(header.msg_type);
+    let is_dump = operation.is_dump_request(header.flags);
     let mut packets = match operation {
-        RtnetlinkOperation::GetLink => dump_links(&header, payload),
+        RtnetlinkOperation::GetLink if is_dump => dump_links(&header, payload),
+        RtnetlinkOperation::GetLink => get_link(request, &header, payload),
         RtnetlinkOperation::GetAddr => dump_addrs(&header, payload),
         RtnetlinkOperation::GetRoute => dump_routes(&header, payload),
         RtnetlinkOperation::NewLink => apply_newlink(request, &header, payload),
@@ -206,13 +215,42 @@ pub(super) fn handle_rtnetlink_request(request: &[u8]) -> Vec<NetlinkPacket> {
             data: build_error_response(request, LinuxError::EOPNOTSUPP),
         }],
     };
-    if operation.is_dump() {
+    if is_dump {
         packets.push(NetlinkPacket {
             from: NetlinkAddr { pid: 0, groups: 0 },
             data: build_done_response(&header),
         });
     }
     packets
+}
+
+fn get_link(request: &[u8], header: &NlMsgHeader, payload: &[u8]) -> Vec<NetlinkPacket> {
+    let result = parse_link_query(payload).and_then(|query| {
+        if !SERVICE.is_inited() {
+            return Err(LinuxError::ENODEV);
+        }
+        let link = if query.index > 0 {
+            SERVICE.link_snapshot_for_ifindex(query.index)
+        } else {
+            SERVICE
+                .link_snapshots()
+                .into_iter()
+                .find(|link| query.name.as_deref() == Some(link.name.as_str()))
+        }
+        .ok_or(LinuxError::ENODEV)?;
+        Ok(NetlinkPacket {
+            from: NetlinkAddr { pid: 0, groups: 0 },
+            data: build_link_message(header, link, 0),
+        })
+    });
+    match result {
+        Ok(packet) => {
+            let mut packets = vec![packet];
+            packets.extend(ack_packets(request, header));
+            packets
+        }
+        Err(errno) => error_packets(request, errno),
+    }
 }
 
 fn dump_links(request: &NlMsgHeader, _payload: &[u8]) -> Vec<NetlinkPacket> {
@@ -224,23 +262,26 @@ fn dump_links(request: &NlMsgHeader, _payload: &[u8]) -> Vec<NetlinkPacket> {
         .into_iter()
         .map(|link| NetlinkPacket {
             from: NetlinkAddr { pid: 0, groups: 0 },
-            data: build_link_message(request, link),
+            data: build_link_message(request, link, NLM_F_MULTI),
         })
         .collect()
 }
 
 fn dump_addrs(request: &NlMsgHeader, payload: &[u8]) -> Vec<NetlinkPacket> {
-    let family = payload
-        .first()
-        .copied()
+    let info = IfAddrMsg::read(payload).ok();
+    let family = info
+        .map(|info| info.family)
+        .or_else(|| payload.first().copied())
         .filter(|family| *family != 0)
         .unwrap_or(wire_route::FAMILY_IPV4);
+    let ifindex = info.map_or(0, |info| info.index);
     if family != wire_route::FAMILY_IPV4 || !SERVICE.is_inited() {
         return Vec::new();
     }
     SERVICE
         .ipv4_addr_snapshots()
         .into_iter()
+        .filter(|snapshot| ifindex == 0 || snapshot.entry.dev as u32 + 1 == ifindex)
         .map(|snapshot| NetlinkPacket {
             from: NetlinkAddr { pid: 0, groups: 0 },
             data: build_addr_message(request, snapshot.entry, &snapshot.label),
@@ -600,6 +641,18 @@ pub(super) fn parse_link_update(payload: &[u8]) -> Result<LinkUpdateRequest, Lin
     })
 }
 
+fn parse_link_query(payload: &[u8]) -> Result<LinkQuery, LinuxError> {
+    let info = IfInfoMsg::read(payload)?;
+    let attrs = parse_link_query_attrs(parse_attrs(&payload[IfInfoMsg::SIZE..])?)?;
+    if info.index <= 0 && attrs.name.is_none() {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(LinkQuery {
+        index: info.index,
+        name: attrs.name,
+    })
+}
+
 fn parse_addr_request(payload: &[u8]) -> Result<AddrRequest, LinuxError> {
     let info = IfAddrMsg::read(payload)?;
     // Linux derives the legacy IPv4 `ifa_flags` bits from address ordering
@@ -669,6 +722,20 @@ fn parse_link_attrs(attrs: Vec<NlAttr<'_>>) -> Result<LinkAttrs, LinuxError> {
     Ok(parsed)
 }
 
+fn parse_link_query_attrs(attrs: Vec<NlAttr<'_>>) -> Result<LinkAttrs, LinuxError> {
+    let mut parsed = LinkAttrs::default();
+    for attr in attrs {
+        match attr.kind {
+            wire_link::attr::IFNAME => parsed.name = Some(parse_string(attr.payload)?),
+            wire_link::attr::EXT_MASK => {
+                let _ = read_u32_payload(attr.payload)?;
+            }
+            _ => return Err(LinuxError::EOPNOTSUPP),
+        }
+    }
+    Ok(parsed)
+}
+
 fn parse_addr_attrs(family: u8, attrs: Vec<NlAttr<'_>>) -> Result<AddrAttrs, LinuxError> {
     let mut parsed = AddrAttrs::default();
     for attr in attrs {
@@ -725,7 +792,7 @@ fn parse_neigh_attrs(family: u8, attrs: Vec<NlAttr<'_>>) -> Result<NeighAttrs, L
     Ok(parsed)
 }
 
-fn build_link_message(request: &NlMsgHeader, link: LinkSnapshot) -> Vec<u8> {
+fn build_link_message(request: &NlMsgHeader, link: LinkSnapshot, flags: u16) -> Vec<u8> {
     let mut payload = Vec::new();
     IfInfoMsg {
         family: 0,
@@ -754,7 +821,7 @@ fn build_link_message(request: &NlMsgHeader, link: LinkSnapshot) -> Vec<u8> {
     );
     push_attr(&mut payload, wire_link::attr::OPERSTATE, &[link.operstate]);
 
-    build_nlmsg(RTM_NEWLINK, request.seq, NLM_F_MULTI, payload)
+    build_nlmsg(RTM_NEWLINK, request.seq, flags, payload)
 }
 
 fn build_addr_message(request: &NlMsgHeader, addr: Ipv4AddrEntry, label: &str) -> Vec<u8> {

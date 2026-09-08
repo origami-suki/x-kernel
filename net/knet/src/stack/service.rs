@@ -779,6 +779,13 @@ impl Service {
         self.router.lock().ipv4_addr_entries().to_vec()
     }
 
+    pub(crate) fn interface_ipv4_addr(
+        &self,
+        name: &str,
+    ) -> Result<crate::ip::Ipv4Cidr, LinuxError> {
+        self.router.lock().interface_ipv4_addr(name)
+    }
+
     pub(crate) fn add_ipv4_addr(
         &self,
         entry: crate::router::Ipv4AddrEntry,

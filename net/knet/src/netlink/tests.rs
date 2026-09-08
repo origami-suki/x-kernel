@@ -25,7 +25,7 @@ use super::{
     *,
 };
 use crate::{
-    RecvOptions, SERVICE, SendOptions, SocketAddrEx,
+    RecvFlags, RecvOptions, SERVICE, SendOptions, SocketAddrEx,
     buf::PacketBuf,
     device::{
         IF_OPER_DOWN, IF_OPER_UNKNOWN, IF_OPER_UP, LINK_FLAG_BROADCAST, LINK_FLAG_LOOPBACK,
@@ -578,8 +578,12 @@ fn test_reject_invalid_link_name_and_mtu_without_partial_update() {
 #[def_test(serial)]
 fn test_link_dump_reads_device_snapshots() {
     init_test_state();
-    let packets =
-        handle_rtnetlink_request(&build_nlmsg(RTM_GETLINK, 17, NLM_F_REQUEST, Vec::new()));
+    let packets = handle_rtnetlink_request(&build_nlmsg(
+        RTM_GETLINK,
+        17,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        Vec::new(),
+    ));
 
     assert_eq!(packets.len(), 3);
     let links: Vec<_> = packets
@@ -603,6 +607,62 @@ fn test_link_dump_reads_device_snapshots() {
         })
         .collect();
     assert_eq!(links, vec![1, 2]);
+}
+
+#[def_test(serial)]
+fn test_getlink_by_name_returns_only_matching_link() {
+    init_test_state();
+    let mut payload = Vec::new();
+    IfInfoMsg {
+        family: 0,
+        pad: 0,
+        link_type: 0,
+        index: 0,
+        flags: 0,
+        change: 0,
+    }
+    .write(&mut payload);
+    payload.extend(attr(wire_link::attr::IFNAME, b"eth0\0"));
+
+    let packets = handle_rtnetlink_request(&build_nlmsg(RTM_GETLINK, 18, NLM_F_REQUEST, payload));
+
+    assert_eq!(packets.len(), 1);
+    let header = NlMsgHeader::read(&packets[0].data).unwrap();
+    let msg_type = header.msg_type;
+    let flags = header.flags;
+    assert_eq!(msg_type, RTM_NEWLINK);
+    assert_eq!(flags & NLM_F_MULTI, 0);
+    let info = IfInfoMsg::read(&packets[0].data[NLMSG_HDR_LEN..]).unwrap();
+    let index = info.index;
+    assert_eq!(index, 2);
+}
+
+#[def_test(serial)]
+fn test_getlink_by_name_with_ack_appends_success_ack() {
+    init_test_state();
+    let mut payload = Vec::new();
+    IfInfoMsg {
+        family: 0,
+        pad: 0,
+        link_type: 0,
+        index: 0,
+        flags: 0,
+        change: 0,
+    }
+    .write(&mut payload);
+    payload.extend(attr(wire_link::attr::IFNAME, b"eth0\0"));
+
+    let packets = handle_rtnetlink_request(&build_nlmsg(
+        RTM_GETLINK,
+        18,
+        NLM_F_REQUEST | NLM_F_ACK,
+        payload,
+    ));
+
+    assert_eq!(packets.len(), 2);
+    assert_eq!(read_u16_ne(&packets[0].data, 4), Some(RTM_NEWLINK));
+    assert_eq!(read_u16_ne(&packets[1].data, 4), Some(NLMSG_ERROR));
+    assert_eq!(read_i32_ne(&packets[1].data, NLMSG_HDR_LEN), Some(0));
 }
 
 #[def_test(serial)]
@@ -634,6 +694,67 @@ fn test_addr_dump_reads_router_addresses() {
     assert!(addresses.iter().any(|(index, prefix_len, address)| {
         *index == 2 && *prefix_len == 24 && address == &vec![192, 168, 1, 2]
     }));
+}
+
+#[def_test(serial)]
+fn test_addr_dump_observes_ioctl_address_on_requested_interface() {
+    init_test_state();
+    let address = core::net::Ipv4Addr::new(192, 168, 1, 99);
+    crate::set_interface_ipv4_addr("eth0", address, 24).unwrap();
+    let mut payload = Vec::new();
+    IfAddrMsg {
+        family: wire_route::FAMILY_IPV4,
+        prefix_len: 0,
+        flags: 0,
+        scope: 0,
+        index: 2,
+    }
+    .write(&mut payload);
+
+    let packets = handle_rtnetlink_request(&build_nlmsg(
+        RTM_GETADDR,
+        19,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        payload,
+    ));
+    let addresses: Vec<_> = packets
+        .iter()
+        .filter_map(|packet| {
+            let header = NlMsgHeader::read(&packet.data)?;
+            (header.msg_type == RTM_NEWADDR)
+                .then(|| IfAddrMsg::read(&packet.data[NLMSG_HDR_LEN..]).unwrap())
+        })
+        .collect();
+
+    assert_eq!(addresses.len(), 1);
+    let index = addresses[0].index;
+    assert_eq!(index, 2);
+    let packet = packets
+        .iter()
+        .find(|packet| read_u16_ne(&packet.data, 4) == Some(RTM_NEWADDR))
+        .unwrap();
+    let attrs = parse_attrs(&packet.data[NLMSG_HDR_LEN + IfAddrMsg::SIZE..]).unwrap();
+    let local = attrs
+        .iter()
+        .find(|attr| attr.kind == wire_addr::attr::LOCAL)
+        .unwrap();
+    assert_eq!(local.payload, address.octets().as_slice());
+    assert_eq!(crate::interface_ipv4_addr("eth0"), Ok(address));
+
+    let request = build_ipv4_addr_mutation(
+        Ipv4Address::from_octets(address.octets()),
+        20,
+        NLM_F_REQUEST | NLM_F_ACK,
+    );
+    // Delete through rtnetlink and read the same state through the ioctl helper.
+    let mut request = request;
+    request[4..6].copy_from_slice(&RTM_DELADDR.to_ne_bytes());
+    let response = handle_rtnetlink_request(&request);
+    assert_eq!(read_i32_ne(&response[0].data, NLMSG_HDR_LEN), Some(0));
+    assert_eq!(
+        crate::interface_ipv4_addr("eth0"),
+        Err(LinuxError::EADDRNOTAVAIL)
+    );
 }
 
 #[def_test(serial)]
@@ -860,6 +981,7 @@ fn test_dump_routes_returns_done_message() {
     let last = packets.last().unwrap();
     let seq = header.seq;
     assert_eq!(read_u16_ne(&last.data, 4), Some(NLMSG_DONE));
+    assert_eq!(read_i32_ne(&last.data, NLMSG_HDR_LEN), Some(0));
     assert_eq!(seq, 7);
 }
 
@@ -978,22 +1100,175 @@ fn test_publish_kobject_uevent_appends_monotonic_seqnum() {
 }
 
 #[def_test(serial)]
-fn test_recv_preserves_packet_when_dst_buffer_too_small() {
+fn test_recv_reports_datagram_length_and_truncation() {
     let socket = NetlinkSocket::new(NETLINK_ROUTE);
     socket.inner.rx_queue.lock().push_back(NetlinkPacket {
         from: NetlinkAddr { pid: 1, groups: 0 },
         data: vec![1, 2, 3, 4],
     });
 
-    let mut buf = [0u8; 2];
-    let result = socket.recv(Cursor::new(buf.as_mut_slice()), RecvOptions::default());
+    let mut probe = [];
+    let mut probe_flags = RecvFlags::empty();
+    let result = socket.recv(
+        Cursor::new(probe.as_mut_slice()),
+        RecvOptions {
+            flags: RecvFlags::PEEK | RecvFlags::TRUNCATE,
+            out_flags: Some(&mut probe_flags),
+            ..RecvOptions::default()
+        },
+    );
+    assert_eq!(result, Ok(4));
+    assert!(probe_flags.contains(RecvFlags::TRUNCATE));
 
-    assert_eq!(result, Err(LinuxError::EMSGSIZE.into()));
+    let mut buf = [0u8; 2];
+    let mut recv_flags = RecvFlags::empty();
+    let result = socket.recv(
+        Cursor::new(buf.as_mut_slice()),
+        RecvOptions {
+            out_flags: Some(&mut recv_flags),
+            ..RecvOptions::default()
+        },
+    );
+    assert_eq!(result, Ok(2));
+    assert_eq!(buf, [1, 2]);
+    assert!(recv_flags.contains(RecvFlags::TRUNCATE));
 
     let mut queue = socket.inner.rx_queue.lock();
-    let packet = queue.pop_front().unwrap();
-    assert_eq!(packet.data, vec![1, 2, 3, 4]);
     assert!(queue.pop_front().is_none());
+}
+
+#[def_test(serial)]
+fn test_route_dump_ignores_nonzero_short_trailer() {
+    init_test_state();
+    let socket = NetlinkSocket::new(NETLINK_ROUTE);
+    socket
+        .bind(SocketAddrEx::Netlink(NetlinkAddr { pid: 42, groups: 0 }))
+        .unwrap();
+
+    let mut payload = vec![wire_route::FAMILY_IPV4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    push_attr(
+        &mut payload,
+        wire_route::attr::TABLE,
+        &(wire_route::TABLE_MAIN as u32).to_ne_bytes(),
+    );
+    let mut request = build_nlmsg(RTM_GETROUTE, 43, NLM_F_REQUEST | NLM_F_DUMP, payload);
+    // Fewer than NLMSG_HDR_LEN trailing bytes that are not zero padding.
+    request.extend_from_slice(&[0xaa; 7]);
+
+    assert_eq!(
+        socket.send(Cursor::new(request.as_slice()), SendOptions::default()),
+        Ok(request.len())
+    );
+    assert!(socket.inner.rx_queue.lock().pop_front().is_some());
+}
+
+#[def_test(serial)]
+fn test_route_dump_stops_at_invalid_trailing_header() {
+    init_test_state();
+    let socket = NetlinkSocket::new(NETLINK_ROUTE);
+    socket
+        .bind(SocketAddrEx::Netlink(NetlinkAddr { pid: 42, groups: 0 }))
+        .unwrap();
+
+    let mut request = build_nlmsg(
+        RTM_GETROUTE,
+        44,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        vec![wire_route::FAMILY_IPV4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    // A second "header" whose nlmsg_len exceeds the remaining bytes.
+    request.extend_from_slice(&64u32.to_ne_bytes());
+    request.extend_from_slice(&[0xff; 12]);
+
+    assert_eq!(
+        socket.send(Cursor::new(request.as_slice()), SendOptions::default()),
+        Ok(request.len())
+    );
+    let mut done_count = 0;
+    let mut queue = socket.inner.rx_queue.lock();
+    while let Some(packet) = queue.pop_front() {
+        let header = NlMsgHeader::read(&packet.data).unwrap();
+        if header.msg_type == NLMSG_DONE {
+            done_count += 1;
+            let seq = header.seq;
+            assert_eq!(seq, 44);
+        }
+    }
+    assert_eq!(done_count, 1);
+}
+
+#[def_test(serial)]
+fn test_interface_ipv4_addr_survives_middle_device_removal() {
+    let ethernet = |ifindex: i32, name: &str, id: u64| {
+        TestDevice::new(LinkSnapshot {
+            ifindex,
+            name: String::from(name),
+            flags: LINK_FLAG_UP
+                | LINK_FLAG_RUNNING
+                | LINK_FLAG_BROADCAST
+                | LINK_FLAG_MULTICAST
+                | LINK_FLAG_LOWER_UP,
+            mtu: 1500,
+            operstate: IF_OPER_UP,
+            kind: LinkKind::Ethernet,
+            hardware_addr: [0x02, 0, 0, 0, 0, ifindex as u8],
+            broadcast_addr: [0xff; 6],
+        })
+        .with_device_id(kdevice::DeviceId::new(id))
+    };
+    let mut router = Router::new();
+    router.add_device(Box::new(TestDevice::new(LinkSnapshot {
+        ifindex: 1,
+        name: String::from("lo"),
+        flags: LINK_FLAG_UP | LINK_FLAG_RUNNING | LINK_FLAG_LOOPBACK | LINK_FLAG_LOWER_UP,
+        mtu: 65_536,
+        operstate: IF_OPER_UNKNOWN,
+        kind: LinkKind::Loopback,
+        hardware_addr: [0; 6],
+        broadcast_addr: [0; 6],
+    })));
+    router.add_device(Box::new(ethernet(2, "eth0", 2)));
+    router.add_device(Box::new(ethernet(3, "eth1", 3)));
+    for (dev, addr, scope) in [
+        (
+            0,
+            crate::ip::Ipv4Address::new(127, 0, 0, 1),
+            wire_route::SCOPE_HOST,
+        ),
+        (
+            1,
+            crate::ip::Ipv4Address::new(192, 168, 1, 2),
+            wire_route::SCOPE_UNIVERSE,
+        ),
+        (
+            2,
+            crate::ip::Ipv4Address::new(10, 0, 0, 2),
+            wire_route::SCOPE_UNIVERSE,
+        ),
+    ] {
+        router
+            .add_ipv4_addr(Ipv4AddrEntry {
+                dev,
+                addr: crate::ip::Ipv4Cidr::new(addr, 24),
+                scope,
+                broadcast: None,
+            })
+            .unwrap();
+    }
+    if SERVICE.is_inited() {
+        SERVICE.replace_router_for_tests(router);
+    } else {
+        SERVICE.init_once(Service::new(router));
+    }
+
+    // Removing eth0 renumbers eth1 from slot 2 to slot 1; the lookup must
+    // still resolve eth1 by name and never return eth0's address.
+    assert!(crate::unregister_netdev(kdevice::DeviceId::new(2)));
+    assert_eq!(
+        crate::interface_ipv4_addr("eth1"),
+        Ok(core::net::Ipv4Addr::new(10, 0, 0, 2))
+    );
+    assert_eq!(crate::interface_ipv4_addr("eth0"), Err(LinuxError::ENODEV));
 }
 
 #[def_test(serial)]
@@ -1097,7 +1372,7 @@ fn test_route_socket_processes_query_batch() {
     socket
         .bind(SocketAddrEx::Netlink(NetlinkAddr { pid: 47, groups: 0 }))
         .unwrap();
-    let mut datagram = build_nlmsg(RTM_GETLINK, 57, NLM_F_REQUEST, Vec::new());
+    let mut datagram = build_nlmsg(RTM_GETLINK, 57, NLM_F_REQUEST | NLM_F_DUMP, Vec::new());
     datagram.extend_from_slice(&build_nlmsg(RTM_GETADDR, 58, NLM_F_REQUEST, Vec::new()));
 
     assert_eq!(
@@ -1173,7 +1448,7 @@ fn test_malformed_nlmsg_len_does_not_mutate_network_state() {
             SendOptions::default(),
             &Cred::root(),
         ),
-        Err(LinuxError::EINVAL.into())
+        Ok(request.len())
     );
     assert!(socket.inner.rx_queue.lock().is_empty());
     assert!(
