@@ -45,6 +45,8 @@ The device relies on two mechanism features:
   and wakes any vCPU parked in WFI; `stop_and_join` then joins each vCPU
   thread. Only after every vCPU thread has exited does the last
   `Arc<VmShared>` drop, releasing the second-stage page table.
+  The vCPU thread drops its local `Vcpu` before calling `ktask::exit`, because
+  that exit path does not unwind the closure stack.
 
 ## Teardown ordering
 
@@ -68,9 +70,11 @@ this in practice for Linux guests.
 * This crate owns the Linux boot control plane, including image loading and DTB
   patching. The `kvmm` crate keeps only the VMM mechanism (`Vm`, `Vcpu`, guest
   memory, and virtual-device substrate).
-* The `bootlinux` argument parse and slot allocation are shared across arches;
-  only the `build_and_start_{rv64,aarch64}` VM-construction tails differ
+* The `bootlinux` argument parse and default memory-base selection are shared
+  across arches; only the `build_and_start_{rv64,aarch64}` VM-construction tails differ
   (console model, interrupt controller, and vCPU entry-register conventions).
+  The guest-visible memory base is patched into the DTB; the host backing pages
+  are allocator-chosen by `kvmm` and need not live at the same physical address.
 * `read` drains the guest console TX channel. The channel
   (`vdev_vpl011::TxChannel`) is a bounded SPSC FIFO the boot path installs and
   enables per VM; the UART's guest-output path then forwards bytes into it

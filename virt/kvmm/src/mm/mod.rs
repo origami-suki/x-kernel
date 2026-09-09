@@ -14,30 +14,64 @@ pub fn alloc_vmid() -> u32 {
     NEXT_VMID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Reserve an identity-mapped guest RAM range in the host allocator.
+/// RAII reservation for allocator-chosen guest RAM backing pages.
 ///
-/// Current second-stage implementations map guest RAM as GPA == HPA. Reserving
-/// the backing physical pages prevents later host allocations from reusing guest
-/// RAM and also validates that the alias is backed by host RAM before the loader
-/// writes through it.
-pub fn reserve_guest_ram(mem_base: u64, mem_size: u64) -> bool {
-    let npages = (mem_size as usize) / PAGE_SIZE_4K;
-    let va = kaddr_layout::p2v(mem_base as usize);
+/// Dropping this handle returns the reserved pages to the host allocator.
+pub struct GuestRamReservation {
+    start_va: usize,
+    npages: usize,
+    hpa_base: u64,
+}
 
-    match kalloc::global_allocator().alloc_pages_at(
-        va,
-        npages,
-        PAGE_SIZE_4K,
-        kalloc::UsageKind::VirtMem,
-    ) {
-        Ok(_) => {
+impl Drop for GuestRamReservation {
+    fn drop(&mut self) {
+        log::info!(
+            "[kvmm] releasing guest RAM reservation VA {:#x} ({} pages)",
+            self.start_va,
+            self.npages,
+        );
+        kalloc::global_allocator().dealloc_pages(
+            self.start_va,
+            self.npages,
+            kalloc::UsageKind::VirtMem,
+        );
+    }
+}
+
+impl GuestRamReservation {
+    pub fn hpa_base(&self) -> u64 {
+        self.hpa_base
+    }
+}
+
+/// Reserve backing memory for a guest RAM range in the host allocator.
+///
+/// The guest RAM range starts at `mem_base` in the guest physical address space.
+/// The backing host physical range is allocator-chosen and may differ from the
+/// guest base; [`GuestMem::gpa_to_hpa`] translates between them.
+pub fn reserve_guest_ram(mem_base: u64, mem_size: u64) -> Option<GuestRamReservation> {
+    let npages = (mem_size as usize) / PAGE_SIZE_4K;
+
+    match kalloc::global_allocator().alloc_pages(npages, PAGE_SIZE_4K, kalloc::UsageKind::VirtMem) {
+        Ok(addr) => {
+            let size = npages * PAGE_SIZE_4K;
+            // SAFETY: `addr` points to `npages` pages just allocated from the
+            // host page allocator, so the full reservation is valid to zero.
+            unsafe {
+                core::ptr::write_bytes(addr as *mut u8, 0, size);
+            }
             log::info!(
-                "[kvmm] reserved guest RAM GPA {:#x}+{:#x} ({} pages)",
+                "[kvmm] reserved guest RAM GPA {:#x}+{:#x} backed by HPA {:#x} ({} pages)",
                 mem_base,
                 mem_size,
+                kaddr_layout::v2p(addr),
                 npages,
             );
-            true
+            Some(GuestRamReservation {
+                start_va: addr,
+                npages,
+                hpa_base: kaddr_layout::v2p(addr) as u64,
+            })
         }
         Err(err) => {
             log::error!(
@@ -46,7 +80,7 @@ pub fn reserve_guest_ram(mem_base: u64, mem_size: u64) -> bool {
                 mem_size,
                 err,
             );
-            false
+            None
         }
     }
 }
@@ -95,11 +129,12 @@ pub enum GuestPerm {
 pub trait GuestMem: Sized {
     /// Build an identity-mapped page table covering `[0, 4 GiB)`.
     ///
-    /// RAM in `[mem_base, mem_base+mem_size)` gets normal cacheable
-    /// attributes; everything else gets device attributes.
+    /// RAM in `[mem_base, mem_base+mem_size)` maps to the backing host physical
+    /// range starting at `hpa_base`; everything else gets device attributes or
+    /// traps according to the architecture implementation.
     ///
     /// Returns `None` if page table allocation fails.
-    fn new(mem_base: u64, mem_size: u64, vmid: u32) -> Option<Self>;
+    fn new(mem_base: u64, mem_size: u64, hpa_base: u64, vmid: u32) -> Option<Self>;
 
     /// Map a region of guest physical address space.
     fn map_region(&mut self, gpa: u64, hpa: u64, size: u64, perm: GuestPerm) -> bool;

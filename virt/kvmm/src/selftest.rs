@@ -408,7 +408,7 @@ mod unsupported {
     pub struct UnsupportedGuestMem;
 
     impl crate::mm::GuestMem for UnsupportedGuestMem {
-        fn new(_mem_base: u64, _mem_size: u64, _vmid: u32) -> Option<Self> {
+        fn new(_mem_base: u64, _mem_size: u64, _hpa_base: u64, _vmid: u32) -> Option<Self> {
             None
         }
 

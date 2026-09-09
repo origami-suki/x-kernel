@@ -47,6 +47,9 @@ const L2_ENTRIES: usize = 512; // PD entries per PDPT entry (2 MiB each)
 /// all sub-pages, then the PML4 page itself is freed by `GlobalPage::drop`.
 pub struct Ept {
     pml4_page: kalloc::GlobalPage,
+    mem_base: u64,
+    mem_size: u64,
+    hpa_base: u64,
 }
 
 impl Ept {
@@ -92,7 +95,7 @@ impl Drop for Ept {
 }
 
 impl GuestMem for Ept {
-    fn new(mem_base: u64, mem_size: u64, vmid: u32) -> Option<Self> {
+    fn new(mem_base: u64, mem_size: u64, hpa_base: u64, vmid: u32) -> Option<Self> {
         let _ = vmid;
         let mem_end = mem_base.checked_add(mem_size)?;
 
@@ -131,7 +134,12 @@ impl GuestMem for Ept {
                 let gpa = ((i as u64) << 30) | ((j as u64) << 21);
                 let is_ram = gpa >= mem_base && gpa < mem_end;
                 let mt = if is_ram { EPT_MT_WB } else { EPT_MT_UC };
-                let entry = gpa | EPT_RWX | mt | EPT_LARGE;
+                let hpa = if is_ram {
+                    hpa_base + (gpa - mem_base)
+                } else {
+                    gpa
+                };
+                let entry = hpa | EPT_RWX | mt | EPT_LARGE;
                 // SAFETY: pd_va is valid; j < 512.
                 unsafe {
                     pd_va.add(j).write(entry);
@@ -140,13 +148,19 @@ impl GuestMem for Ept {
         }
 
         log::info!(
-            "[ept] init mem={:#x}+{:#x} pml4_pa={:#x}",
+            "[ept] init mem={:#x}+{:#x} hpa={:#x} pml4_pa={:#x}",
             mem_base,
             mem_size,
+            hpa_base,
             pml4_pa,
         );
 
-        Some(Self { pml4_page })
+        Some(Self {
+            pml4_page,
+            mem_base,
+            mem_size,
+            hpa_base,
+        })
     }
 
     fn map_region(&mut self, _gpa: u64, _hpa: u64, _size: u64, _perm: GuestPerm) -> bool {
@@ -154,11 +168,8 @@ impl GuestMem for Ept {
     }
 
     fn gpa_to_hpa(&self, gpa: u64) -> Option<u64> {
-        if gpa < (L1_ENTRIES as u64) << 30 {
-            Some(gpa)
-        } else {
-            None
-        }
+        let offset = gpa.checked_sub(self.mem_base)?;
+        (offset < self.mem_size).then_some(self.hpa_base + offset)
     }
 
     fn activate(&self) {

@@ -4,7 +4,7 @@
 
 //! Guest physical memory access for virtual device backends.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{Ordering, fence};
 
 use vdev_core::{DmaError, GuestDma};
@@ -14,12 +14,14 @@ use crate::{arch::VmmArch, mm::GuestMem, vm::VmRef};
 const PAGE_SIZE: u64 = 4096;
 
 pub struct VmGuestDma<A: VmmArch> {
-    vm: VmRef<A>,
+    vm: Weak<crate::vm::VmShared<A>>,
 }
 
 impl<A: VmmArch> VmGuestDma<A> {
-    pub fn new(vm: VmRef<A>) -> Self {
-        Self { vm }
+    pub fn new(vm: &VmRef<A>) -> Self {
+        Self {
+            vm: Arc::downgrade(vm),
+        }
     }
 
     fn copy_chunks(
@@ -28,7 +30,8 @@ impl<A: VmmArch> VmGuestDma<A> {
         mut len: usize,
         mut copy: impl FnMut(usize, *mut u8) -> Result<(), DmaError>,
     ) -> Result<(), DmaError> {
-        let guest_mem = self.vm.guest_mem().ok_or(DmaError::NoGuestMem)?;
+        let vm = self.vm.upgrade().ok_or(DmaError::NoGuestMem)?;
+        let guest_mem = vm.guest_mem().ok_or(DmaError::NoGuestMem)?;
         let mut done = 0usize;
         while len != 0 {
             let hpa = guest_mem.gpa_to_hpa(gpa).ok_or(DmaError::AddressFault)?;
@@ -78,5 +81,5 @@ impl<A: VmmArch> GuestDma for VmGuestDma<A> {
 }
 
 pub fn make_guest_dma<A: VmmArch + 'static>(vm: VmRef<A>) -> Arc<dyn GuestDma> {
-    Arc::new(VmGuestDma::new(vm))
+    Arc::new(VmGuestDma::new(&vm))
 }

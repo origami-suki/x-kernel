@@ -39,6 +39,9 @@ const HGATP_VMID_SHIFT: u64 = 44;
 /// is freed by `GlobalPage::drop`.
 pub struct GStage {
     root_page: kalloc::GlobalPage,
+    mem_base: u64,
+    mem_size: u64,
+    hpa_base: u64,
     vmid: u32,
 }
 
@@ -70,7 +73,7 @@ impl Drop for GStage {
 }
 
 impl GuestMem for GStage {
-    fn new(mem_base: u64, mem_size: u64, vmid: u32) -> Option<Self> {
+    fn new(mem_base: u64, mem_size: u64, hpa_base: u64, vmid: u32) -> Option<Self> {
         let mem_end = mem_base.checked_add(mem_size)?;
 
         // Sv39x4 root: 4 contiguous 4KB pages (16KB, 16KB-aligned)
@@ -107,7 +110,12 @@ impl GuestMem for GStage {
                 } else {
                     PTE_V | PTE_R | PTE_W | PTE_A | PTE_D
                 };
-                let pte = ((gpa >> 12) << 10) | flags;
+                let hpa = if is_ram {
+                    hpa_base + (gpa - mem_base)
+                } else {
+                    gpa
+                };
+                let pte = ((hpa >> 12) << 10) | flags;
                 // SAFETY: l1_va is valid; j < 512.
                 unsafe {
                     l1_va.add(j).write(pte);
@@ -116,13 +124,20 @@ impl GuestMem for GStage {
         }
 
         log::info!(
-            "[gstage] init mem={:#x}+{:#x} root_pa={:#x}",
+            "[gstage] init mem={:#x}+{:#x} hpa={:#x} root_pa={:#x}",
             mem_base,
             mem_size,
+            hpa_base,
             root_pa,
         );
 
-        Some(Self { root_page, vmid })
+        Some(Self {
+            root_page,
+            mem_base,
+            mem_size,
+            hpa_base,
+            vmid,
+        })
     }
 
     fn map_region(&mut self, _gpa: u64, _hpa: u64, _size: u64, _perm: GuestPerm) -> bool {
@@ -130,11 +145,8 @@ impl GuestMem for GStage {
     }
 
     fn gpa_to_hpa(&self, gpa: u64) -> Option<u64> {
-        if gpa < (L2_ENTRIES as u64) << 30 {
-            Some(gpa)
-        } else {
-            None
-        }
+        let offset = gpa.checked_sub(self.mem_base)?;
+        (offset < self.mem_size).then_some(self.hpa_base + offset)
     }
 
     fn activate(&self) {

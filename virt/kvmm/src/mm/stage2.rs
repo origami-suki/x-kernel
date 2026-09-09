@@ -53,6 +53,9 @@ const VTTBR_VMID_SHIFT: u64 = 48;
 /// then the L1 page itself is freed by `GlobalPage::drop`.
 pub struct Stage2 {
     l1_page: kalloc::GlobalPage,
+    mem_base: u64,
+    mem_size: u64,
+    hpa_base: u64,
     vmid: u32,
 }
 
@@ -155,7 +158,7 @@ impl Drop for Stage2 {
 }
 
 impl GuestMem for Stage2 {
-    fn new(mem_base: u64, mem_size: u64, vmid: u32) -> Option<Self> {
+    fn new(mem_base: u64, mem_size: u64, hpa_base: u64, vmid: u32) -> Option<Self> {
         let mem_end = mem_base.checked_add(mem_size)?;
 
         // Allocate L1 page (4 entries, but we need a full 4KB page)
@@ -191,7 +194,8 @@ impl GuestMem for Stage2 {
                 let ipa = ((i1 as u64) << 30) | ((i2 as u64) << 21);
                 let is_ram = ipa >= mem_base && ipa < mem_end;
                 let entry = if is_ram {
-                    ipa | LPAE_AF | LPAE_SH_IS | LPAE_MATTR_NORM | LPAE_S2AP_RW | LPAE_VALID
+                    let hpa = hpa_base + (ipa - mem_base);
+                    hpa | LPAE_AF | LPAE_SH_IS | LPAE_MATTR_NORM | LPAE_S2AP_RW | LPAE_VALID
                 } else {
                     0 // invalid → Stage-2 fault → trap to VMM MMIO emulation
                 };
@@ -217,14 +221,21 @@ impl GuestMem for Stage2 {
             | VTCR_PS_36BITS;
 
         log::info!(
-            "[stage2] init mem={:#x}+{:#x} l1_pa={:#x} vtcr={:#x}",
+            "[stage2] init mem={:#x}+{:#x} hpa={:#x} l1_pa={:#x} vtcr={:#x}",
             mem_base,
             mem_size,
+            hpa_base,
             l1_pa,
             vtcr,
         );
 
-        Some(Self { l1_page, vmid })
+        Some(Self {
+            l1_page,
+            mem_base,
+            mem_size,
+            hpa_base,
+            vmid,
+        })
     }
 
     fn map_region(&mut self, gpa: u64, hpa: u64, size: u64, perm: GuestPerm) -> bool {
@@ -279,12 +290,8 @@ impl GuestMem for Stage2 {
     }
 
     fn gpa_to_hpa(&self, gpa: u64) -> Option<u64> {
-        // Identity map: GPA = HPA within the 4 GiB window
-        if gpa < (L1_ENTRIES as u64) << 30 {
-            Some(gpa)
-        } else {
-            None
-        }
+        let offset = gpa.checked_sub(self.mem_base)?;
+        (offset < self.mem_size).then_some(self.hpa_base + offset)
     }
 
     fn activate(&self) {

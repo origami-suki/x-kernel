@@ -245,10 +245,13 @@ pub fn spawn_vcpu_thread<A: VmmArch + 'static>(vcpu: Vcpu<A>) -> ktask::KtaskRef
     let task = ktask::spawn_with_name(
         move || {
             let mut vcpu: Vcpu<A> = vcpu;
-            match vmm_run_vcpu::<A>(&mut vcpu) {
-                Ok(()) => ktask::exit(0),
-                Err(()) => ktask::exit(1),
-            }
+            let exit_code = if vmm_run_vcpu::<A>(&mut vcpu).is_ok() {
+                0
+            } else {
+                1
+            };
+            drop(vcpu);
+            ktask::exit(exit_code);
         },
         alloc::format!("vcpu-{}", id),
     );

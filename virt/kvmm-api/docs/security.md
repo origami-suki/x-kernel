@@ -15,15 +15,21 @@ owning file description is closed:
 
 * `release` calls `Vm::stop_and_join`, which blocks until every vCPU kernel
   thread has left its run loop. Only then is the last `Arc<VmShared>` dropped,
-  which runs the second-stage page table `Drop`.
+  which runs the second-stage page table `Drop` and releases the guest RAM
+  reservation held by the VM.
 * Because teardown joins the vCPU threads synchronously, a closing process
   cannot leave detached vCPU threads still executing guest code against
   freed VM state.
+* vCPU threads explicitly drop their local `Vcpu` before calling `ktask::exit`,
+  so the task-exit path cannot leak the vCPU's `Arc<VmShared>` by bypassing Rust
+  stack unwinding.
 
-Guest RAM itself is reserved in `kvmm::mm::reserve_guest_ram`, whose current
-implementation does not hold the reservation past the call (a pre-existing
-mechanism-crate behaviour). This crate does not change that; it only ensures
-the page-table and vCPU-thread resources it introduces are reclaimed.
+Guest RAM itself is reserved in `kvmm::mm::reserve_guest_ram` and held by the VM
+through an RAII reservation handle. Closing `/dev/kvmm-vm` therefore releases
+the reserved physical range before a later VM attempts to reuse the default
+guest memory base. The guest-visible physical base is translated to an
+allocator-chosen host physical backing range, so the control plane does not need
+to reserve a hard-coded host physical address.
 
 ## Input handling
 
@@ -50,9 +56,10 @@ the page-table and vCPU-thread resources it introduces are reclaimed.
 ## Known limitations (skeleton)
 
 * No per-open resource limits: a caller can open the device repeatedly to
-  create multiple VMs. Slot/base allocation is monotonic and never reused
-  within a boot session, so bases do not alias, but there is no cap on VM
-  count or aggregate memory. A production control plane should enforce quotas.
+  create multiple VMs. Automatic boots use the architecture's default guest
+  memory base, so a concurrent second VM without an explicit `@0xBASE` fails
+  reservation instead of aliasing RAM. A production control plane should enforce
+  quotas and a real address allocator.
 * riscv64 and aarch64 are supported; other architectures reject boot.
 * The console TX FIFO is bounded and drops on overflow (see Input handling), so
   guest output under burst can be truncated. This is a fidelity limit, not a

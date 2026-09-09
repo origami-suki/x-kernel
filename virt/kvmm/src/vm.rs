@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 use crate::{
     arch::VmmArch,
-    mm::{GuestMem, mmio::MmioBus},
+    mm::{GuestMem, GuestRamReservation, mmio::MmioBus},
     vcpu::{MAX_VCPUS, Vcpu},
     vcpu_state::{VcpuRunState, VcpuStats},
     vdev::VmDevices,
@@ -55,7 +55,7 @@ const PCPU_NONE: i32 = -1;
 /// through `vcpu.vm` to dispatch MMIO, query sibling vCPUs, etc.
 pub struct VmShared<A: VmmArch> {
     cfg: VmConfig,
-    guest_mem: Option<A::GuestMem>,
+    guest_mem: Option<VmGuestMemory<A>>,
     devices: VmDevices<A>,
     vcpu_pcpu: [AtomicI32; MAX_VCPUS],
     /// Coarse per-vCPU execution state (see [`VcpuRunState`]).
@@ -80,6 +80,11 @@ pub struct VmShared<A: VmmArch> {
     stop_requested: AtomicBool,
 }
 
+struct VmGuestMemory<A: VmmArch> {
+    mapper: A::GuestMem,
+    _reservation: GuestRamReservation,
+}
+
 /// Reference-counted handle to a VM's shared state.
 pub type VmRef<A> = Arc<VmShared<A>>;
 
@@ -89,7 +94,7 @@ impl<A: VmmArch> VmShared<A> {
     }
 
     pub fn guest_mem(&self) -> Option<&A::GuestMem> {
-        self.guest_mem.as_ref()
+        self.guest_mem.as_ref().map(|guest_mem| &guest_mem.mapper)
     }
 
     pub fn mmio_bus(&self) -> &ksync::Mutex<MmioBus> {
@@ -302,17 +307,21 @@ impl<A: VmmArch + 'static> Vm<A> {
         }
 
         let guest_mem = if cfg.mem_size > 0 {
-            if !crate::mm::reserve_guest_ram(cfg.mem_base, cfg.mem_size) {
+            let Some(guest_ram) = crate::mm::reserve_guest_ram(cfg.mem_base, cfg.mem_size) else {
                 log::error!("[vmm] vm_create: guest RAM reservation failed");
                 return None;
-            }
+            };
             let vmid = crate::mm::alloc_vmid();
-            let gm = A::GuestMem::new(cfg.mem_base, cfg.mem_size, vmid);
-            if gm.is_none() {
+            let Some(mapper) =
+                A::GuestMem::new(cfg.mem_base, cfg.mem_size, guest_ram.hpa_base(), vmid)
+            else {
                 log::error!("[vmm] vm_create: guest_mem alloc failed");
                 return None;
-            }
-            gm
+            };
+            Some(VmGuestMemory {
+                mapper,
+                _reservation: guest_ram,
+            })
         } else {
             None
         };
@@ -366,12 +375,15 @@ impl<A: VmmArch + 'static> Vm<A> {
 
     /// Get mutable access to the guest memory (only valid before vCPUs are created).
     pub fn guest_mem_mut(&mut self) -> Option<&mut A::GuestMem> {
-        Arc::get_mut(&mut self.shared)?.guest_mem.as_mut()
+        Arc::get_mut(&mut self.shared)?
+            .guest_mem
+            .as_mut()
+            .map(|guest_mem| &mut guest_mem.mapper)
     }
 
     /// Activate the second-stage page table for a specific vCPU.
     pub fn activate_vcpu_guest_mem(&self, vcpu: &mut Vcpu<A>) {
-        if let Some(gm) = &self.shared.guest_mem {
+        if let Some(gm) = self.shared.guest_mem() {
             A::activate_guest_mem(vcpu, gm);
         }
     }

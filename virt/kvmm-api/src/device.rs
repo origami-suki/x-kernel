@@ -30,8 +30,6 @@
 //! control plane; the `kvmm` crate only provides the underlying VMM mechanism.
 
 use alloc::sync::Arc;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use kpoll::IoEvents;
 use kvfs::{DeviceFileOps, NodeFlags, VfsError, VfsFile, VfsFileBuilder, VfsInode, VfsResult};
@@ -39,21 +37,13 @@ use kvmm::{Vm, arch::CurrentArch};
 
 use crate::loader;
 
-/// First auto-allocated guest memory base (riscv64).
+/// Default guest memory base (riscv64; QEMU virt DRAM starts at 0x80000000).
 #[cfg(target_arch = "riscv64")]
-const GUEST_MEM_BASE: u64 = 0xC000_0000;
-/// First auto-allocated guest memory base (aarch64; matches the guest DTS
+const GUEST_MEM_BASE: u64 = 0x8000_0000;
+/// Default guest memory base (aarch64; matches the guest DTS
 /// `memory@70000000`).
 #[cfg(target_arch = "aarch64")]
 const GUEST_MEM_BASE: u64 = 0x7000_0000;
-/// Stride between auto-allocated VM bases (256 MiB).
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-const GUEST_MEM_SLOT: u64 = 0x1000_0000;
-
-/// Monotonic counter handing out disjoint guest memory slots / VM ids.
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
-
 /// Per-fd VM instance stored in the open file's private data.
 ///
 /// Interior mutability lets `open` install an idle instance and a later
@@ -205,10 +195,10 @@ fn boot_linux(_rest: &str) -> VfsResult<Vm<CurrentArch>> {
     Err(VfsError::NoSuchDevice)
 }
 
-/// Parse a `bootlinux` argument tail (`[kernel dtb initrd] [@0xBASE]`), allocate
-/// a disjoint guest memory slot, and start vCPU0.
+/// Parse a `bootlinux` argument tail (`[kernel dtb initrd] [@0xBASE]`), reserve
+/// the guest memory range, and start vCPU0.
 ///
-/// The parse and slot allocation are architecture-independent; the actual VM
+/// The parse and memory-base selection are architecture-independent; the actual VM
 /// construction dispatches to the per-arch `build_and_start_*` helper.
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 fn boot_linux(rest: &str) -> VfsResult<Vm<CurrentArch>> {
@@ -236,9 +226,8 @@ fn boot_linux(rest: &str) -> VfsResult<Vm<CurrentArch>> {
     let dtb = dtb.unwrap_or("/guests/linux/linux.dtb");
     let initrd = initrd.or(Some("/guests/linux/initrd.gz"));
 
-    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-    let vm_id = slot as u32;
-    let base = mem_base.unwrap_or(GUEST_MEM_BASE + slot * GUEST_MEM_SLOT);
+    let vm_id = kvmm::mm::alloc_vmid();
+    let base = mem_base.unwrap_or(GUEST_MEM_BASE);
 
     #[cfg(target_arch = "riscv64")]
     {
