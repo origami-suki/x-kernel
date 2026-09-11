@@ -11,7 +11,10 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    config::ConfigEngine, error::Result, ui::MenuConfigApp, validate::validate_input_path,
+    config::ConfigEngine,
+    error::{KconfigError, Result},
+    ui::MenuConfigApp,
+    validate::validate_input_path,
 };
 
 pub fn menuconfig_command(kconfig: PathBuf, srctree: PathBuf) -> Result<()> {
@@ -24,11 +27,16 @@ pub fn menuconfig_command(kconfig: PathBuf, srctree: PathBuf) -> Result<()> {
     let mut engine = ConfigEngine::from_kconfig(&kconfig, &srctree)?;
     println!("Parsed {} entries", engine.entries().len());
 
-    if std::path::Path::new(".config").exists() {
-        println!("Loading existing .config...");
-        engine.load_menuconfig_config(".config")?;
-    } else {
-        println!("No existing .config found, using defaults");
+    // Try the load unconditionally: a `.config` that disappears between an
+    // existence check and the open must behave like "no configuration",
+    // while every other read error (permissions, invalid UTF-8, ...) stays
+    // a hard error instead of silently starting from defaults.
+    match engine.load_menuconfig_config(".config") {
+        Ok(()) => println!("Loaded existing .config"),
+        Err(KconfigError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            println!("No existing .config found, using defaults");
+        }
+        Err(error) => return Err(error),
     }
 
     println!("Launching TUI...");

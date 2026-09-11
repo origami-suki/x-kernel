@@ -27,6 +27,8 @@ struct Spec {
 #[derive(Deserialize)]
 struct Root {
     path: PathBuf,
+    #[serde(default)]
+    readonly: bool,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +172,12 @@ fn enter_container(bundle: &Path, spec: &Spec, ready_fd: libc::c_int) -> io::Res
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "OCI seccomp is not implemented",
+        ));
+    }
+    if spec.root.readonly {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "OCI root.readonly is not implemented",
         ));
     }
     if spec.process.no_new_privileges {

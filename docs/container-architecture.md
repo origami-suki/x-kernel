@@ -44,7 +44,8 @@ X-Kernel 已经具备若干容器基础组件：
 
 当前仍缺 CPU、memory 和 I/O controller，`clone3(CLONE_INTO_CGROUP)`、delegation、完整
 PID/user/network namespace 以及 OCI lifecycle/security ABI。`mini-oci` 只提供受限的
-`run` 路径，不代表 OCI conformance。
+`run` 路径，不代表 OCI conformance；不支持的安全相关 spec 字段（`process.capabilities`、
+`process.seccomp`、`root.readonly`）会显式报错拒绝启动，而不是静默忽略。
 
 容器不是单一内核对象。Linux 通过 namespace、cgroup、capability、LSM 和 VFS 组合
 容器；FreeBSD Jail、Solaris Zone 和 Windows Silo 则提供更显式的容器聚合对象。

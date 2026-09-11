@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    config::{ConfigEngine, ConfigReader},
+    config::{ConfigEngine, ConfigReader, write_if_changed},
     error::{KconfigError, Result},
 };
 
@@ -65,17 +65,6 @@ fn load_effective_build_config(config: &Path) -> Result<HashMap<String, String>>
     }
 
     Ok(effective)
-}
-
-/// Write `content` to `path` only if it differs from the current file content.
-fn write_if_changed(path: &std::path::Path, content: &str) -> std::io::Result<bool> {
-    if let Ok(existing) = std::fs::read_to_string(path)
-        && existing == content
-    {
-        return Ok(false);
-    }
-    std::fs::write(path, content)?;
-    Ok(true)
 }
 
 /// Update `.vscode/settings.json` with rust-analyzer configuration derived
@@ -200,8 +189,7 @@ fn generate_rust_analyzer_config(config: &HashMap<String, String>) -> Result<()>
     let output = serde_json::to_string_pretty(&Value::Object(settings))
         .map_err(|e| KconfigError::Config(e.to_string()))?;
     let output_with_newline = format!("{}\n", output);
-    let changed =
-        write_if_changed(&settings_path, &output_with_newline).map_err(KconfigError::Io)?;
+    let changed = write_if_changed(&settings_path, &output_with_newline)?;
     if changed {
         println!("✅ Updated .vscode/settings.json");
     }
@@ -484,7 +472,7 @@ fn generate_cargo_config(config: &HashMap<String, String>, opts: &BuildOpts) -> 
         generated_toml
     );
     let xconfig_path = dot_cargo_dir.join(".xconfig.toml");
-    let changed = write_if_changed(&xconfig_path, &cargo_config_toml).map_err(KconfigError::Io)?;
+    let changed = write_if_changed(&xconfig_path, &cargo_config_toml)?;
     if changed {
         println!("✅ Generated .cargo/.xconfig.toml");
     }
