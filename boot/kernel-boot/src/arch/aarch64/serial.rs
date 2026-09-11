@@ -3,6 +3,13 @@
 // See LICENSES for license details.
 
 //! Minimal early-boot UART printing for diagnostics.
+//!
+//! `BOOT_CONSOLE_BAUDRATE` controls output pacing; it does not program the UART.
+//! A value of zero disables pacing and its counter-register accesses.
+//! Nonzero pacing reads `CNTFRQ_EL0` and the counter selected by
+//! `ARM_GENERIC_TIMER_MODE`, before the runtime timer driver is initialized.
+//! Firmware or the hypervisor must allow those reads from kernel entry onward;
+//! guests such as virtCCA may only allow the virtual counter at EL1.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -12,6 +19,10 @@ use memaddr::{MemoryAddr, PAGE_SIZE_4K};
 use crate::bootconsole_config;
 
 const BOOT_PREFIX: &[u8] = b"[boot] ";
+// Resolve the string at compile time so the idmap path never calls a string
+// comparison helper in `.text`, including in debug builds.
+const IS_VIRTUAL_COUNTER: bool =
+    matches!(kbuild_config::ARM_GENERIC_TIMER_MODE.as_bytes(), b"virtual");
 pub(crate) const BOOT_UART_BOOT_VADDR: usize =
     BOOT_UART_SLOT_VADDR + (kbuild_config::BOOT_CONSOLE_ADDR & (BOOT_IO_SLOT_SIZE - 1));
 static BOOT_CONSOLE_BASE: AtomicUsize = AtomicUsize::new(kbuild_config::BOOT_CONSOLE_ADDR);
@@ -216,63 +227,83 @@ pub struct Uart {
 // builds do not reliably inline these helpers, so idmap callers must not branch
 // into `.text` and runtime callers must not branch back into `.idmap.text`.
 #[inline]
-fn phys_count() -> u64 {
-    let v;
-    // SAFETY: `mrs` of a read-only counter register; no memory or control
-    // side effects.
+fn counter_ticks() -> u64 {
+    let ticks;
+    // SAFETY: Firmware/hypervisor entry must permit reads of the configured
+    // counter at the kernel's exception level. Selecting the virtual view
+    // avoids CNTPCT_EL0 accesses that may trap in an EL1 guest.
     unsafe {
-        core::arch::asm!(
-            "mrs {0}, CNTPCT_EL0",
-            out(reg) v,
-            options(nostack, preserves_flags)
-        );
+        if IS_VIRTUAL_COUNTER {
+            core::arch::asm!(
+                "mrs {0}, CNTVCT_EL0",
+                out(reg) ticks,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            core::arch::asm!(
+                "mrs {0}, CNTPCT_EL0",
+                out(reg) ticks,
+                options(nostack, preserves_flags)
+            );
+        }
     }
-    v
+    ticks
 }
 
 #[inline]
 #[unsafe(link_section = ".idmap.text")]
-fn phys_count_idmap() -> u64 {
-    let v;
-    // SAFETY: `mrs` of a read-only counter register; no memory or control
-    // side effects.
+fn counter_ticks_idmap() -> u64 {
+    let ticks;
+    // SAFETY: Firmware/hypervisor entry must permit reads of the configured
+    // counter at the kernel's exception level. Selecting the virtual view
+    // avoids CNTPCT_EL0 accesses that may trap in an EL1 guest.
     unsafe {
-        core::arch::asm!(
-            "mrs {0}, CNTPCT_EL0",
-            out(reg) v,
-            options(nostack, preserves_flags)
-        );
+        if IS_VIRTUAL_COUNTER {
+            core::arch::asm!(
+                "mrs {0}, CNTVCT_EL0",
+                out(reg) ticks,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            core::arch::asm!(
+                "mrs {0}, CNTPCT_EL0",
+                out(reg) ticks,
+                options(nostack, preserves_flags)
+            );
+        }
     }
-    v
+    ticks
 }
 
 #[inline]
-fn phys_freq() -> u64 {
-    let v;
-    // SAFETY: `mrs` of a read-only register; no side effects.
+fn counter_frequency_hz() -> u64 {
+    let frequency_hz;
+    // SAFETY: Firmware/hypervisor entry supplies a readable CNTFRQ_EL0 for
+    // both counter views. Reading the frequency does not change timer state.
     unsafe {
         core::arch::asm!(
             "mrs {0}, CNTFRQ_EL0",
-            out(reg) v,
+            out(reg) frequency_hz,
             options(nostack, preserves_flags)
         );
     }
-    v
+    frequency_hz
 }
 
 #[inline]
 #[unsafe(link_section = ".idmap.text")]
-fn phys_freq_idmap() -> u64 {
-    let v;
-    // SAFETY: `mrs` of a read-only register; no side effects.
+fn counter_frequency_hz_idmap() -> u64 {
+    let frequency_hz;
+    // SAFETY: Firmware/hypervisor entry supplies a readable CNTFRQ_EL0 for
+    // both counter views. Reading the frequency does not change timer state.
     unsafe {
         core::arch::asm!(
             "mrs {0}, CNTFRQ_EL0",
-            out(reg) v,
+            out(reg) frequency_hz,
             options(nostack, preserves_flags)
         );
     }
-    v
+    frequency_hz
 }
 
 /// Pace early-console output to roughly one byte time.
@@ -281,9 +312,10 @@ fn phys_freq_idmap() -> u64 {
 /// LSR/FR TX-ready bit, so without pacing a fast core overruns a real UART's TX
 /// FIFO and drops characters (heavy garble on a 1.5 Mbaud UART like RK3588's).
 /// The wait is derived from [`kbuild_config::BOOT_CONSOLE_BAUDRATE`] and measured
-/// with the always-running generic counter, so it is correct regardless of the
-/// core clock. A baud rate of 0 disables pacing: emulated UARTs and PL011s with
-/// deep FIFOs are not overrun and need no delay.
+/// with the generic counter selected by [`kbuild_config::ARM_GENERIC_TIMER_MODE`],
+/// independently of the core clock and runtime timer initialization.
+/// A baud rate of 0 skips all pacing-related counter reads; emulated UARTs do
+/// not need this delay.
 #[inline]
 fn pace_one_byte() {
     let baud = kbuild_config::BOOT_CONSOLE_BAUDRATE;
@@ -293,9 +325,9 @@ fn pace_one_byte() {
     let baud = baud as u64;
     // One 8N1 byte is 10 bit times. Wait *at least* that long (ceiling) so the
     // inject rate never exceeds the line rate and the FIFO cannot overflow.
-    let wait = phys_freq().saturating_mul(10).div_ceil(baud);
-    let start = phys_count();
-    while phys_count().wrapping_sub(start) < wait {
+    let wait_ticks = counter_frequency_hz().saturating_mul(10).div_ceil(baud);
+    let start_ticks = counter_ticks();
+    while counter_ticks().wrapping_sub(start_ticks) < wait_ticks {
         core::hint::spin_loop();
     }
 }
@@ -310,9 +342,11 @@ fn pace_one_byte_idmap() {
     let baud = baud as u64;
     // One 8N1 byte is 10 bit times. Wait *at least* that long (ceiling) so the
     // inject rate never exceeds the line rate and the FIFO cannot overflow.
-    let wait = phys_freq_idmap().saturating_mul(10).div_ceil(baud);
-    let start = phys_count_idmap();
-    while phys_count_idmap().wrapping_sub(start) < wait {
+    let wait_ticks = counter_frequency_hz_idmap()
+        .saturating_mul(10)
+        .div_ceil(baud);
+    let start_ticks = counter_ticks_idmap();
+    while counter_ticks_idmap().wrapping_sub(start_ticks) < wait_ticks {
         core::hint::spin_loop();
     }
 }

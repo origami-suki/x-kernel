@@ -60,15 +60,19 @@ config BOOT_CONSOLE_ADDR
       For BOOT_CONSOLE_TYPE="ioport", this is a legacy I/O port base.
 
 config BOOT_CONSOLE_BAUDRATE
-    hex "Boot console baud rate (bits/s)"
+    hex "Boot console output pacing rate (bits/s)"
     default 0x0
     help
-      The baud rate of the boot console UART. The early boot console (which runs
-      before the runtime console driver and cannot poll the TX-ready bit) uses
-      this to pace output at one byte time per character, so a fast core does not
-      overrun the UART TX FIFO and drop characters. Set to 0 to disable pacing
-      (emulated UARTs and PL011s with deep FIFOs do not need it). Only relevant
-      for real MMIO 16550 consoles such as the RK3588 DesignWare UART.
+      Pace AArch64 early-console output at one byte time per character, so a
+      fast core does not overrun a real UART's TX FIFO before the runtime
+      console driver can poll TX-ready. This does not program the UART baud
+      rate; firmware must already have configured the UART to this line rate.
+      Set to 0 for emulated UARTs (including QEMU, crosvm and virtCCA) to disable
+      pacing and its counter-register accesses. Real MMIO 16550 consoles such
+      as the RK3588 DesignWare UART may require a nonzero rate.
+      Nonzero pacing reads CNTFRQ_EL0 and the counter selected by
+      ARM_GENERIC_TIMER_MODE before runtime timer initialization. Firmware or
+      the hypervisor must permit those reads from kernel entry onward.
 
 config BOOT_CONSOLE_REG_IO_WIDTH
     usize "Boot console MMIO access width"
@@ -101,7 +105,8 @@ config ARM_GENERIC_TIMER_MODE
     depends on ARCH_AARCH64
     default "physical"
     help
-      Select which architected timer view EL1 should use.
+      Select which architected timer view EL1 should use, including the early
+      boot console counter when BOOT_CONSOLE_BAUDRATE is nonzero.
       - "physical": use CNTPCT_EL0/CNTP_* registers.
       - "virtual": use CNTVCT_EL0/CNTV_* registers.
       For virtcca-like guests where EL1 physical timer access is trapped,
