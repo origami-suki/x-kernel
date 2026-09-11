@@ -146,7 +146,7 @@ impl Port {
         }
     }
 
-    fn try_send_raw(&mut self, data: u8) -> Result<(), ()> {
+    pub(crate) fn try_send_raw(&mut self, data: u8) -> Result<(), ()> {
         // SAFETY: `self` carries the MMIO window invariants established by
         // `Self::new`; LSR and DATA are standard NS16550 registers.
         if unsafe { self.read_reg(Self::LSR) } & Self::LSR_TX_EMPTY != 0 {

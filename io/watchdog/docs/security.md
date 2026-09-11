@@ -1,82 +1,119 @@
-# io/watchdog — 安全与可靠性分析
+# io/watchdog — Security and Reliability Analysis
 
-## 信任模型
+## Trust Model
 
-本 crate 是内核可信组件，输入来自硬件事件（定时器中断、NMI/PMU 溢出）与内核内部状态（任务调度、互斥锁）。无用户输入。
+This crate is a trusted kernel component.
+Its inputs are hardware events (timer interrupts and NMI/PMU overflows) and internal
+kernel state (task scheduling and mutexes).
+It accepts no user input.
 
-## 外部边界 / 攻击面
+## External Boundaries and Attack Surface
 
-- 定时器中断与 NMI（PMU 溢出）事件：事件频率与正确性依赖硬件/仿真；
-- 内核内部：`ktask` 快照、任务状态、互斥锁状态（`check_mutex_deadlock`）；
-- 触发后的输出：`kprint_atomic`（原子打印，NMI 安全）。
+- Timer interrupts and NMI events from PMU overflows: Event frequency and correctness
+  depend on the hardware or emulator.
+- Kernel internals: `ktask` snapshots, task state, and mutex state examined by `check_mutex_deadlock`.
+- Triggered diagnostic output: `kprint_atomic!` uses emergency serial transmission
+  without ordinary locks and may discard output when its polling budget is exhausted.
+  Argument evaluation and formatting must also avoid locks.
+  It does not guarantee complete messages or serialized output across CPUs.
 
-## unsafe 代码清单
+## Unsafe Code Inventory
 
 ### `init.rs`
 
-- `init_softlockup_detection` 的定时器回调：`LAST_SOFTLOCKUP_REPORT.current_ref_raw()`（读上一次报告时间戳）与 `current_ref_mut_raw()`（写入本次报告时间戳）。不变量：定时器回调在 IRQ 关闭且不可迁移的上下文执行，per-CPU 原始指针不会与迁移竞争；写路径由同一非迁移回调独占更新。安全入口：`init_softlockup_detection` 注册的定时器回调。
+- The timer callback in `init_softlockup_detection` reads the previous report
+  timestamp through `LAST_SOFTLOCKUP_REPORT.current_ref_raw()` and updates it through
+  `current_ref_mut_raw()`.
+  Invariant: The callback runs with IRQs disabled and cannot migrate, so per-CPU raw
+  pointer access cannot race with migration. The same non-migrating callback
+  exclusively performs updates.
+  Safe entry point: The timer callback registered by `init_softlockup_detection`.
 
 ### `lockup_detection.rs`
 
-- `touch_softlockup` / `timer_tick` / `check_softlockup` / `register_hardlockup_detection_task`：`LOCKUP_DETECTION.current_ref_{mut_}raw()`。不变量：watchdog 任务固定核 + 抢占禁用；定时器回调 IRQ 关闭；均不迁移。安全入口：`init_softlockup_detection` 注册的回调与固定核任务。
+- `touch_softlockup`, `timer_tick`, `check_softlockup`, and
+  `register_hardlockup_detection_task` access `LOCKUP_DETECTION.current_ref_{mut_}raw()`.
+  Invariant: Watchdog tasks are pinned to a CPU with preemption disabled;
+  timer callbacks run with IRQs disabled. Neither path can migrate.
+  Safe entry points: The callbacks and pinned tasks registered by `init_softlockup_detection`.
 
 ### `watchdog_task.rs`
 
-- `register_watchdog_task` / `check_watchdog_tasks`：`WATCHDOG_TASK_QUEUE.current_ref_mut_raw()`。不变量：注册仅在 per-CPU init（迁移不可能）；检查在 NMI 上下文（不迁移）。安全入口：`init_nmi_watchdog` / `register_watchdog_task`。
+- `register_watchdog_task` and `check_watchdog_tasks` access
+  `WATCHDOG_TASK_QUEUE.current_ref_mut_raw()`.
+  Invariant: Registration occurs only during per-CPU initialization, when migration
+  is impossible. Checks run in NMI context and cannot migrate.
+  Safe entry points: `init_nmi_watchdog` and `register_watchdog_task`.
 
-## 内存安全不变量
+## Memory Safety Invariants
 
-- 每 CPU 状态只能被所属 CPU 访问；
-- NMI 回调中引用的 `&'static` per-CPU 指针与内核同生命周期；
-- 原子量排序：`Release` 写 + `Acquire` 读保证软锁时间戳初始化可见；`AcqRel` 用于 rendezvous 状态迁移。
+- Per-CPU state may be accessed only by its owning CPU.
+- The `&'static` per-CPU pointers referenced by NMI callbacks live as long as the kernel.
+- Atomic ordering: `Release` stores and `Acquire` loads make soft-lockup timestamp
+  initialization visible; rendezvous state transitions use `AcqRel`.
 
-## 线程安全
+## Thread Safety
 
-- NMI 与定时器中断可能并发访问同一 CPU 的 `LockupDetection`，字段均为原子量；
-- rendezvous 全局原子跨 CPU 可见，`try_trigger` 用 `compare_exchange` 保证唯一 cause CPU；
-- `ARRIVED_BITMAP` 位操作按 CPU id 写入，`usize::BITS` 以上 CPU id 被忽略（平台最多 64 核前提）。
+- NMIs and timer interrupts may concurrently access the same CPU's `LockupDetection`;
+  all fields are atomic.
+- Global rendezvous atomics are visible across CPUs.
+  `try_trigger` uses `compare_exchange` to select a unique initiating CPU.
+- `ARRIVED_BITMAP` bits are written by CPU ID.
+  IDs at or above `usize::BITS` are ignored, under the assumption that the platform
+  has at most 64 CPUs.
 
-## 威胁分析
+## Threat Analysis
 
-| 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
-|------|----------|----------|----------|----------|
-| T-01 | NMI 回调获取普通 IRQ 锁 | 高（同 CPU 自死锁） | pseudo-NMI 抢占持锁的普通 IRQ 路径 | NMI 路径只用原子与自旋；代码审查约束 |
-| T-02 | NMI 未按预期周期到达 | 中（误报 hardlockup） | TCG 仿真下 NMI 延迟 / 丢失 | hardlockup 计数需先初始化（`current != 0`）；NMI 不可用时启动期禁用检测 |
-| T-03 | 某 CPU 永远无法进入 NMI | 高（cause CPU 永久自旋） | 该 CPU 中断/NMI 停摆 | 强 rendezvous 无超时属有意设计（系统已不可用）；记录于设计文档 |
-| T-04 | 快照重入 | 中（快照损坏/死锁） | NMI 打断已有快照流程 | `nmi_begin()` 失败跳过 dump；`kprint_atomic` 原子输出 |
-| T-05 | 软锁误报刷屏 | 低（日志风暴） | watchdog 任务饥饿但定时器正常 | 每阈值周期限速一次报告 |
+| ID | Threat | Impact Level | Trigger | Mitigation |
+|----|--------|--------------|---------|------------|
+| T-01 | NMI callback acquires an ordinary IRQ lock | High (same-CPU self-deadlock) | A pseudo-NMI preempts an ordinary IRQ path holding the lock | NMI paths use only atomics and spinning; enforced through code review. |
+| T-02 | NMI does not arrive at the expected interval | Medium (false hard-lockup report) | Delayed or lost NMI under TCG emulation | The hard-lockup counter must first be initialized (`current != 0`); detection is disabled at boot if NMI is unavailable. |
+| T-03 | A CPU can never enter NMI context | High (initiating CPU spins forever) | The CPU's interrupt/NMI handling has stopped | The strong rendezvous intentionally has no timeout because the system is already unusable; documented in the design. |
+| T-04 | Snapshot reentry | Medium (snapshot corruption/deadlock) | NMI interrupts an existing snapshot operation | Skip the dump if `nmi_begin()` fails; `kprint_atomic!` bypasses normal serial locks for best-effort output. |
+| T-05 | False soft-lockup reports flood the console | Low (log storm) | The watchdog task is starved while the timer still runs | Limit reports to one per threshold interval. |
 
-## 故障模式与影响分析（FMEA）
+## Failure Mode and Effects Analysis (FMEA)
 
-| 编号 | 故障模式 | 故障原因 | 局部影响 | 系统影响 | 严重度 | 应对措施 |
-|------|----------|----------|----------|----------|--------|----------|
-| F-01 | NMI 机制不可用 | GICv2 / 无 FEAT_NMI | hardlockup 关闭 | 系统失去硬锁检测能力（软锁检测无法覆盖硬挂起） | 3 | 启动日志 + `mode()` 检查后直接返回 |
-| F-02 | 周期 NMI 武装失败 | PMU 不可用 / 武装返回 false | 本 CPU hardlockup 关闭 | 单 CPU 失去硬锁检测 | 3 | `enable_periodic_nmi` 失败记录 error |
-| F-03 | watchdog 任务饿死 | 调度问题 | 软锁误报 | 日志风暴 + dump | 3 | 4s 触碰 + 20s 阈值 + 限速 |
-| F-04 | 定时器中断停摆 | 中断屏蔽/硬件故障 | `hrtimer_interrupts` 不前进 | NMI 判定 hardlockup → rendezvous → panic | 2 | 这是硬锁检测的预期行为 |
-| F-05 | rendezvous 中 cause CPU panic | 检测到任务失败 | 系统停止 | 停机（保留 dump 输出） | 1 | 有意设计：宁可停机也要输出诊断 |
+| ID | Failure Mode | Cause | Local Effect | System Effect | Severity | Mitigation |
+|----|--------------|-------|--------------|---------------|----------|------------|
+| F-01 | NMI mechanism unavailable | GICv2 or no FEAT_NMI | Hard-lockup detection disabled | Loss of hard-lockup detection; soft-lockup detection cannot cover a hard hang | 3 | Log at boot, check `mode()`, and return. |
+| F-02 | Periodic NMI arming fails | PMU unavailable or arming returns `false` | Hard-lockup detection disabled on this CPU | One CPU loses hard-lockup detection | 3 | Log an error when `enable_periodic_nmi` fails. |
+| F-03 | Watchdog task starved | Scheduling problem | False soft-lockup report | Log storm and snapshot dumps | 3 | Update the timestamp every 4 seconds, use a 20-second threshold, and rate-limit reports. |
+| F-04 | Timer interrupts stop | Interrupt masking or hardware failure | `hrtimer_interrupts` stops advancing | NMI detects a hard lockup, then rendezvous and panic follow | 2 | This is the intended behavior of hard-lockup detection. |
+| F-05 | Initiating CPU panics during rendezvous | A task check failed | System stops | Shutdown with diagnostic dump output retained | 1 | Intentional: stop the system while preserving diagnostics. |
 
-## 故障管理
+## Failure Management
 
-- 软锁：记录日志、dump 调度统计与 CPU 任务，不停止系统；
-- 硬锁：全局 rendezvous → 收集所有 CPU 快照 → cause CPU panic 停机；
-- 启动期失败（NMI 不可用 / 武装失败）：记录并禁用对应检测，不阻塞启动。
+- Soft lockup: Log the failure and dump scheduling statistics and CPU tasks without
+  stopping the system.
+- Hard lockup: Enter the global rendezvous, collect every CPU's snapshot, and panic
+  on the initiating CPU to stop the system.
+- Boot-time failures (NMI unavailable or arming failed): Log and disable the affected
+  detection without blocking boot.
 
-## 隐私分析
+## Privacy Analysis
 
-不处理用户数据；dump 输出可能包含内核任务名等内部状态，不面向用户。
+No user data is processed.
+Dump output may contain internal state such as kernel task names and is not intended
+for users.
 
-## 已知限制
+## Known Limitations
 
-- 强 rendezvous 无超时：任一 CPU 无法进入 NMI 时 cause CPU 永久自旋；
-- hardlockup 依赖 NMI 周期精度（平台 PMU 后端当前按固定 2.5GHz 折算周期阈值，见 `platforms/kplat-aarch64/src/peripherals/pmu.rs`；代码 TODO 为改读 DT OPP 频率）；
-- `usize::BITS` 位图限制：CPU 数 ≥ 64 时 `mark_arrived` 直接忽略（`all_arrived_mask` 处理到位宽上限）；
-- `reset()` 与仍在 NMI 自旋的 CPU 并发时语义需谨慎（注释已说明）。
+- The strong rendezvous has no timeout: If any CPU cannot enter NMI context, the
+  initiating CPU spins forever.
+- Hard-lockup detection depends on NMI timing accuracy.
+  The platform PMU backend currently converts thresholds using a fixed 2.5 GHz clock;
+  see `platforms/kplat-aarch64/src/peripherals/pmu.rs`.
+  A code TODO calls for reading the DT OPP frequency instead.
+- `usize::BITS` limits the bitmap: `mark_arrived` ignores CPU IDs of 64 or above;
+  `all_arrived_mask` handles the upper limit of the bitmap width.
+- Concurrent use of `reset()` while other CPUs are still spinning in NMI context
+  requires care, as stated in its comment.
 
-## 审计清单
+## Audit Checklist
 
-- [ ] NMI 回调路径是否存在普通 IRQ 自旋锁 / 阻塞调用？
-- [ ] per-CPU 状态访问是否都有迁移保护（固定核 / IRQ 关闭 / NMI）？
-- [ ] rendezvous 状态迁移是否全部使用正确原子序？
-- [ ] 快照重入是否都有 `nmi_begin()` 保护？
-- [ ] NMI 不可用 / 武装失败路径是否都显式记录并降级？
+- [ ] Do NMI callback paths contain ordinary IRQ spinlocks or blocking calls?
+- [ ] Are all per-CPU accesses protected against migration by CPU pinning, disabled IRQs, or NMI context?
+- [ ] Do all rendezvous state transitions use the correct atomic ordering?
+- [ ] Does `nmi_begin()` protect every snapshot path against reentry?
+- [ ] Are NMI-unavailable and arming-failure paths explicitly logged and degraded?

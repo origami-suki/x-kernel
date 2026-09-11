@@ -4,10 +4,19 @@
 
 use core::fmt::{Arguments, Result, Write};
 
+/// Provides platform console input, output, and input interrupt discovery.
+///
+/// Normal I/O may use console locks; emergency output must remain usable when
+/// an NMI interrupts a normal I/O operation.
 #[kiface::interface]
 pub trait ConsoleIf {
     fn write_data(buf: &[u8]);
 
+    /// Attempt emergency output without ordinary locks or allocation.
+    ///
+    /// Implementations must tolerate NMI interruption of normal console I/O
+    /// and bound hardware polling. Output may be interleaved, truncated, or
+    /// discarded if the console is unavailable.
     fn write_data_atomic(buf: &[u8]);
 
     fn read_data(buf: &mut [u8]) -> usize;
@@ -20,6 +29,9 @@ pub fn write_data(buf: &[u8]) {
     ConsoleIf::write_data(buf)
 }
 
+/// Attempt best-effort emergency output, including from NMI context.
+///
+/// Bypasses normal console locks; does not guarantee complete or ordered output.
 #[inline]
 pub fn write_data_atomic(buf: &[u8]) {
     ConsoleIf::write_data_atomic(buf)
@@ -82,6 +94,25 @@ macro_rules! kprintln {
     }
 }
 
+/// Format best-effort emergency output without taking normal console locks.
+///
+/// In NMI context, argument evaluation and `Display`/`Debug` implementations
+/// must also avoid locks, allocation, and blocking. Output is not guaranteed
+/// to be complete or serialized with other writers.
+///
+/// # Syntax
+///
+/// `kprint_atomic!("format string", args...)` accepts a format string literal
+/// followed by optional positional or named arguments, as in
+/// [`core::format_args!`]. A newline is emitted only if included in the format
+/// string or a formatted argument.
+///
+/// # Example
+///
+/// ```no_run
+/// let cpu_id = 0usize;
+/// khal::kprint_atomic!("NMI on CPU {}\n", cpu_id);
+/// ```
 #[macro_export]
 macro_rules! kprint_atomic {
     ($($arg:tt)*) => {

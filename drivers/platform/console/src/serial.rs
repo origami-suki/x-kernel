@@ -10,13 +10,16 @@
 //! same hardware instance. Auxiliary ports (additional UARTs) are created later
 //! by the serial driver and exposed as standalone character devices.
 //!
-//! This is introduced in stages. Phase 1 only builds the stdout port and the
-//! legacy free-function backends delegate to it, leaving behavior unchanged.
+//! Emergency output uses immutable register addresses outside the normal port
+//! lock, so an NMI can print even after interrupting a lock holder.
+
+mod emergency;
 
 use alloc::sync::Arc;
 
 #[cfg(feature = "pl011")]
 use arm_pl011::Pl011Uart;
+use emergency::EmergencyTx;
 use khal::mem::PhysAddr;
 #[cfg(any(feature = "pl011", feature = "ns16550-mmio"))]
 use khal::mem::VirtAddr;
@@ -126,9 +129,15 @@ fn ns16550_mmio_putchar(uart: &mut Ns16550MmioPort, c: u8) {
     }
 }
 
-/// One UART instance.
+/// Provides serialized normal I/O and best-effort emergency output for one UART.
+///
+/// The early stdout port is shared through `Arc<SerialPort>` by kernel logging
+/// and the runtime console; auxiliary ports back standalone character devices.
+/// Use [`Self::read_data`] and [`Self::write_data`] for normal I/O, or
+/// [`Self::write_data_atomic`] for emergency output that bypasses the port lock.
 pub struct SerialPort {
     inner: SpinNoIrq<Backend>,
+    emergency_tx: EmergencyTx,
     ident: SerialIdent,
     role: SerialRole,
 }
@@ -138,8 +147,14 @@ impl SerialPort {
     ///
     /// `role` records whether this port is the kernel stdout console or an
     /// auxiliary char device; it is later read back through [`Self::role`].
+    ///
+    /// # Safety
+    ///
+    /// `uart_base` must name a valid PL011 register window, aligned for 32-bit
+    /// MMIO access and mapped for the lifetime of this port. Device setup must
+    /// be exclusive until construction completes.
     #[cfg(feature = "pl011")]
-    pub fn new_mmio_pl011(
+    pub unsafe fn new_mmio_pl011(
         uart_base: VirtAddr,
         paddr: PhysAddr,
         size: usize,
@@ -149,6 +164,9 @@ impl SerialPort {
         uart.init();
         Self::new(
             Backend::Pl011(uart),
+            EmergencyTx::Pl011 {
+                base: uart_base.as_usize(),
+            },
             SerialIdent::Mmio { paddr, size },
             role,
         )
@@ -187,6 +205,11 @@ impl SerialPort {
         unsafe { uart.init_preserve_baud() };
         Self::new(
             Backend::Ns16550Mmio(uart),
+            EmergencyTx::Ns16550Mmio {
+                base: uart_base.as_usize(),
+                stride,
+                reg_width,
+            },
             SerialIdent::Mmio { paddr, size },
             role,
         )
@@ -204,24 +227,44 @@ impl SerialPort {
         uart.init();
         Self::new(
             Backend::Ns16550IoPort(uart),
+            EmergencyTx::Ns16550IoPort { base: port },
             SerialIdent::IoPort { port },
             role,
         )
     }
 
-    fn new(backend: Backend, ident: SerialIdent, role: SerialRole) -> Self {
+    fn new(
+        backend: Backend,
+        emergency_tx: EmergencyTx,
+        ident: SerialIdent,
+        role: SerialRole,
+    ) -> Self {
         Self {
             inner: SpinNoIrq::new(backend),
+            emergency_tx,
             ident,
             role,
         }
     }
 
+    /// Write bytes while serializing access with normal port operations.
+    ///
+    /// Must not be called from NMI context; use [`Self::write_data_atomic`].
     pub fn write_data(&self, bytes: &[u8]) {
         let mut backend = self.inner.lock();
         for &c in bytes {
             backend.send_byte(c);
         }
+    }
+
+    /// Attempt emergency output without locking, allocation, or device setup.
+    ///
+    /// May run in NMI context, including while this port's normal lock is held.
+    /// Each transmitted byte has a finite polling budget; on timeout the
+    /// remainder is discarded. Concurrent writers may interleave or lose bytes.
+    /// The device must remain mapped, powered, and configured for transmission.
+    pub fn write_data_atomic(&self, bytes: &[u8]) {
+        self.emergency_tx.write_data(bytes);
     }
 
     pub fn getchar(&self) -> Option<u8> {
@@ -304,6 +347,122 @@ mod tests {
         // The platform `early_driver_init` registers the stdout UART before
         // unit tests run, so the registry must be populated.
         assert!(stdout_port().is_some());
+    }
+
+    #[def_test]
+    fn atomic_console_write_does_not_take_normal_locks() {
+        let port = stdout_port().expect("boot registered a stdout");
+        let _io_guard = khal::console::IO_LOCK.lock();
+        let _port_guard = port.inner.lock();
+        // Empty output exercises both adapters without depending on UART
+        // timing or modifying the permanently registered boot console.
+        khal::console::write_data_atomic(b"");
+        khal::kprint_atomic!("");
+    }
+
+    #[cfg(feature = "pl011")]
+    #[def_test]
+    fn atomic_pl011_write_bypasses_lock_without_reinitializing() {
+        let mut registers = [0u32; 18];
+        let base = VirtAddr::from_usize(registers.as_mut_ptr() as usize);
+        // SAFETY: this aligned, initialized test register window covers all
+        // PL011 accesses and outlives the port; no other CPU accesses it.
+        let port = unsafe {
+            SerialPort::new_mmio_pl011(
+                base,
+                PhysAddr::from_usize(0),
+                size_of_val(&registers),
+                SerialRole::Auxiliary,
+            )
+        };
+        // Distinguish reinitialization from transmission, including interrupt
+        // and control registers that the normal constructor programmed.
+        registers[12..].fill(0x1234_5678);
+        let before = registers;
+        {
+            let _guard = port.inner.lock();
+            port.write_data_atomic(b"atomic");
+        }
+        assert_eq!(registers[0], u32::from(b'c'));
+        assert_eq!(&registers[1..], &before[1..]);
+    }
+
+    #[cfg(feature = "pl011")]
+    #[def_test]
+    fn atomic_pl011_write_stops_when_fifo_stays_full() {
+        let mut registers = [0u32; 18];
+        registers[0] = 0x1234_5678;
+        registers[6] = 1 << 5;
+        let base = VirtAddr::from_usize(registers.as_mut_ptr() as usize);
+        // SAFETY: this aligned, initialized test register window covers all
+        // PL011 accesses and outlives the port; no other CPU accesses it.
+        let port = unsafe {
+            SerialPort::new_mmio_pl011(
+                base,
+                PhysAddr::from_usize(0),
+                size_of_val(&registers),
+                SerialRole::Auxiliary,
+            )
+        };
+        let before = registers;
+        port.write_data_atomic(b"not sent");
+        assert_eq!(registers, before);
+    }
+
+    #[cfg(feature = "ns16550-mmio")]
+    #[def_test]
+    fn atomic_ns16550_write_preserves_layout_and_configuration() {
+        for width in [SerialRegWidth::U8, SerialRegWidth::U16, SerialRegWidth::U32] {
+            let mut registers = [0xA5A5_A5A5u32; 8];
+            let base = VirtAddr::from_usize(registers.as_mut_ptr() as usize);
+            // SAFETY: the initialized test window is aligned for all tested
+            // widths, uses a four-byte stride, and outlives the local port.
+            let port = unsafe {
+                SerialPort::new_mmio_ns16550(
+                    base,
+                    PhysAddr::from_usize(0),
+                    size_of_val(&registers),
+                    SerialRole::Auxiliary,
+                    2,
+                    width,
+                )
+            };
+            let before = registers;
+            {
+                let _guard = port.inner.lock();
+                port.write_data_atomic(b"atomic");
+            }
+            let preserved_bits = match width {
+                SerialRegWidth::U8 => before[0] & !0xff,
+                SerialRegWidth::U16 => before[0] & !0xffff,
+                SerialRegWidth::U32 => 0,
+            };
+            assert_eq!(registers[0], preserved_bits | u32::from(b'c'));
+            assert_eq!(&registers[1..], &before[1..]);
+        }
+    }
+
+    #[cfg(feature = "ns16550-mmio")]
+    #[def_test]
+    fn atomic_ns16550_write_stops_when_transmitter_stays_busy() {
+        let mut registers = [0u32; 8];
+        registers[0] = 0x1234_5678;
+        let base = VirtAddr::from_usize(registers.as_mut_ptr() as usize);
+        // SAFETY: this aligned test window covers the 32-bit registers with
+        // four-byte stride and outlives the port; no other CPU accesses it.
+        let port = unsafe {
+            SerialPort::new_mmio_ns16550(
+                base,
+                PhysAddr::from_usize(0),
+                size_of_val(&registers),
+                SerialRole::Auxiliary,
+                2,
+                SerialRegWidth::U32,
+            )
+        };
+        let before = registers;
+        port.write_data_atomic(b"not sent");
+        assert_eq!(registers, before);
     }
 
     /// The adoption guard: `take_early_port` must match only the real stdout's

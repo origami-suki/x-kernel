@@ -93,7 +93,10 @@ fn resolve_port(device: &DeviceObject, kind: SerialKind) -> DriverResult<Arc<Ser
     let port = match kind {
         #[cfg(feature = "serial-pl011")]
         SerialKind::Pl011 => {
-            SerialPort::new_mmio_pl011(vaddr, paddr, mmio.size, SerialRole::Auxiliary)
+            // SAFETY: devm_iomap mapped this device's PL011 window; the device
+            // retains the mapping while the port is in use, and setup occurs
+            // before publishing the new port.
+            unsafe { SerialPort::new_mmio_pl011(vaddr, paddr, mmio.size, SerialRole::Auxiliary) }
         }
         #[cfg(feature = "serial-ns16550-mmio")]
         SerialKind::Ns16550Mmio => {

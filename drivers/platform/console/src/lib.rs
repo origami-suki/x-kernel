@@ -94,7 +94,7 @@ impl khal::console::ConsoleIf {
 
     fn write_data_atomic(buf: &[u8]) {
         if let Some(port) = serial::stdout_port() {
-            port.write_data(buf);
+            port.write_data_atomic(buf);
         }
     }
 
@@ -242,7 +242,11 @@ fn build_stdout_port(desc: &StdoutDesc) -> SerialPort {
     match desc.kind {
         #[cfg(feature = "pl011")]
         StdoutKind::Pl011 => {
-            SerialPort::new_mmio_pl011(uart_base, desc.paddr, desc.size, SerialRole::Stdout)
+            // SAFETY: iomap_device mapped the PL011 window described by the
+            // stdout node. The mapping persists and setup precedes publication.
+            unsafe {
+                SerialPort::new_mmio_pl011(uart_base, desc.paddr, desc.size, SerialRole::Stdout)
+            }
         }
         #[cfg(feature = "ns16550-mmio")]
         StdoutKind::Ns16550Mmio => {
