@@ -10,7 +10,7 @@ use khal::mem::PAGE_SIZE_4K;
 use kplat::dma::PlatformDmaIf;
 
 #[cfg(feature = "kvm-guest-mem-share")]
-#[impl_dev_interface]
+#[kiface::provide]
 impl PlatformDmaIf {
     fn prepare(paddr: usize, size: usize) -> kerrno::KResult {
         dma_share_pages(paddr, size);

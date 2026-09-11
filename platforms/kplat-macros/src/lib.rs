@@ -68,7 +68,7 @@ pub fn default_dma_if_impl(item: TokenStream) -> TokenStream {
         ));
     }
     quote! {
-        #[kplat::impl_dev_interface]
+        #[kplat::__priv::provide]
         impl kplat::dma::PlatformDmaIf {
             fn prepare(_pa: usize, _size: usize) -> kplat::kerrno::KResult {
                 Ok(())
@@ -92,7 +92,7 @@ pub fn default_mmio_if_impl(item: TokenStream) -> TokenStream {
         ));
     }
     quote! {
-        #[kplat::impl_dev_interface]
+        #[kplat::__priv::provide]
         impl kplat::mmio::PlatformMmioIf {
             fn prepare(_pa: usize, _size: usize) -> kplat::kerrno::KResult {
                 Ok(())

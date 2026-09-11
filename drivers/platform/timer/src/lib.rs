@@ -4,6 +4,8 @@
 
 #![no_std]
 
+//! Platform clock-source and clock-event providers for `khal::time`.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerSource {
     PlatformStatic,

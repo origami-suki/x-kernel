@@ -84,7 +84,7 @@ pub fn boot_console_io_port() -> u16 {
 // printk to the early stdout [`SerialPort`]. The stdout port is brought up in
 // platform `early_driver_init`, before the driver model exists, so this is the
 // one console path that must not depend on kdriver.
-#[kplat::impl_dev_interface]
+#[kiface::provide]
 impl khal::console::ConsoleIf {
     fn write_data(buf: &[u8]) {
         if let Some(port) = serial::stdout_port() {

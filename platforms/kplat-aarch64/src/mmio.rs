@@ -48,7 +48,7 @@ fn map_guarded_granules(phys_addr: usize, size_bytes: usize) {
 }
 
 #[cfg(feature = "kvm-mmio-guard")]
-#[impl_dev_interface]
+#[kiface::provide]
 impl PlatformMmioIf {
     fn prepare(paddr: usize, size: usize) -> kerrno::KResult {
         map_guarded_granules(paddr, size);

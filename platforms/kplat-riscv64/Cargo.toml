@@ -26,7 +26,9 @@ kcpu = { workspace = true }
 kcpu_id_map = { workspace = true }
 karch = { workspace = true }
 kerrno = { workspace = true }
+kiface = { workspace = true }
 kplat = { workspace = true }
+ktime_types = { workspace = true }
 of = { workspace = true }
 rtc_driver = { workspace = true }
 timer_driver = { workspace = true }

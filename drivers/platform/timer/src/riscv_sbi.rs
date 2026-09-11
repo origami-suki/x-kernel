@@ -4,6 +4,7 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use ktime_types::Frequency;
 use riscv::register::time;
 
 use crate::TimerSource;
@@ -12,8 +13,8 @@ static TIMER_IRQ: AtomicUsize = AtomicUsize::new(0);
 static TIMER_FREQ_HZ: AtomicU64 = AtomicU64::new(0);
 static NANOS_PER_TICK: AtomicU64 = AtomicU64::new(0);
 
-#[kplat::impl_dev_interface]
-impl khal::time::MonotonicTimerIf {
+#[kiface::provide]
+impl khal::time::ClockSourceIf {
     fn now_ticks() -> khal::time::TimerTicks {
         now_ticks()
     }
@@ -22,14 +23,17 @@ impl khal::time::MonotonicTimerIf {
         ktime_types::TimeSpan::from_nanos(ticks_to_nanos(ticks.as_raw()))
     }
 
-    fn freq() -> u64 {
-        freq()
+    fn frequency() -> Frequency {
+        frequency()
     }
 
     fn span_to_ticks(span: ktime_types::TimeSpan) -> khal::time::TimerTicks {
         khal::time::TimerTicks::from_raw(nanos_to_ticks(span.as_nanos_u64_saturating()))
     }
+}
 
+#[kiface::provide]
+impl khal::time::ClockEventIf {
     fn interrupt_id() -> usize {
         interrupt_id()
     }
@@ -50,15 +54,15 @@ impl khal::time::MonotonicTimerIf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerConfig {
     pub irq: usize,
-    pub frequency_hz: u64,
+    pub frequency: Frequency,
     pub source: TimerSource,
 }
 
 impl TimerConfig {
-    pub const fn platform_static(irq: usize, frequency_hz: u64) -> Self {
+    pub const fn platform_static(irq: usize, frequency: Frequency) -> Self {
         Self {
             irq,
-            frequency_hz,
+            frequency,
             source: TimerSource::PlatformStatic,
         }
     }
@@ -67,13 +71,13 @@ impl TimerConfig {
 pub fn init(config: TimerConfig) {
     assert!(config.irq != 0, "RISC-V SBI timer IRQ must be non-zero");
     assert!(
-        config.frequency_hz != 0,
+        !config.frequency.is_zero(),
         "RISC-V SBI timer frequency must be non-zero"
     );
     TIMER_IRQ.store(config.irq, Ordering::Relaxed);
-    TIMER_FREQ_HZ.store(config.frequency_hz, Ordering::Relaxed);
+    TIMER_FREQ_HZ.store(config.frequency.as_hz(), Ordering::Relaxed);
     NANOS_PER_TICK.store(
-        ktime_types::NANOS_PER_SEC / config.frequency_hz,
+        ktime_types::NANOS_PER_SEC / config.frequency.as_hz(),
         Ordering::Relaxed,
     );
 }
@@ -83,7 +87,7 @@ pub fn init_percpu() {
 }
 
 #[inline]
-pub fn now_ticks() -> khal::time::TimerTicks {
+fn now_ticks() -> khal::time::TimerTicks {
     khal::time::TimerTicks::from_raw(read_timer_ticks_raw())
 }
 
@@ -93,33 +97,33 @@ fn read_timer_ticks_raw() -> u64 {
 }
 
 #[inline]
-pub(crate) fn ticks_to_nanos(ticks: u64) -> u64 {
+fn ticks_to_nanos(ticks: u64) -> u64 {
     ticks * NANOS_PER_TICK.load(Ordering::Relaxed)
 }
 
 #[inline]
-pub(crate) fn nanos_to_ticks(nanos: u64) -> u64 {
+fn nanos_to_ticks(nanos: u64) -> u64 {
     nanos / NANOS_PER_TICK.load(Ordering::Relaxed)
 }
 
 #[inline]
-pub fn freq() -> u64 {
-    TIMER_FREQ_HZ.load(Ordering::Relaxed)
+fn frequency() -> Frequency {
+    Frequency::from_hz(TIMER_FREQ_HZ.load(Ordering::Relaxed))
 }
 
 #[inline]
-pub fn interrupt_id() -> usize {
+fn interrupt_id() -> usize {
     let irq = TIMER_IRQ.load(Ordering::Relaxed);
     assert!(irq != 0, "RISC-V SBI timer not initialized");
     irq
 }
 
-pub fn arm_timer(deadline: ktime_types::MonotonicInstant) {
+fn arm_timer(deadline: ktime_types::MonotonicInstant) {
     let deadline_ns = deadline.as_nanos_u64_saturating();
     sbi_rt::set_timer(nanos_to_ticks(deadline_ns));
 }
 
-pub fn disarm_timer() {
+fn disarm_timer() {
     // A compare value far in the future disables practical timer IRQs until re-armed.
     sbi_rt::set_timer(u64::MAX);
 }

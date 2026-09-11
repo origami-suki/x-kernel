@@ -5,7 +5,7 @@
 use kcpu_id_map::LogicalCpuId;
 use kplat::boot::{BootHandler, BootInfo};
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl BootHandler {
     fn prepare_boot_memory(boot_info: &BootInfo) {
         let _ = boot_info;
@@ -16,7 +16,7 @@ impl BootHandler {
     fn early_driver_init() {
         timer_driver::riscv_sbi::init(timer_driver::riscv_sbi::TimerConfig::platform_static(
             irq_driver::riscv::S_TIMER,
-            10_000_000,
+            ktime_types::Frequency::from_hz(10_000_000),
         ));
         irq_driver::riscv::init_primary();
         irq_driver::riscv::init_current_cpu_context();

@@ -7,8 +7,6 @@
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate kplat;
 // Force-link kernel_boot so that _start and boot code are included in the final binary.
 extern crate kernel_boot;
 mod init;

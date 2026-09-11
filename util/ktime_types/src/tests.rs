@@ -7,6 +7,29 @@ use unittest::def_test;
 use crate::*;
 
 #[def_test]
+fn frequency_conversions_preserve_hertz_and_make_rounding_explicit() {
+    let frequency = Frequency::from_hz(2_400_000_999);
+
+    assert_eq!(frequency.as_hz(), 2_400_000_999);
+    assert_eq!(frequency.as_khz_floor(), 2_400_000);
+    assert_eq!(frequency.as_mhz_floor(), 2_400);
+    assert_eq!(
+        Frequency::checked_from_khz(2_400_000),
+        Some(Frequency::from_hz(2_400_000_000))
+    );
+    assert_eq!(
+        Frequency::checked_from_mhz(2_400),
+        Some(Frequency::from_hz(2_400_000_000))
+    );
+}
+
+#[def_test]
+fn frequency_scaled_constructors_reject_overflow() {
+    assert_eq!(Frequency::checked_from_khz(u64::MAX), None);
+    assert_eq!(Frequency::checked_from_mhz(u64::MAX), None);
+}
+
+#[def_test]
 fn clock_domains_are_distinct() {
     let monotonic = MonotonicInstant::from_span_since_origin(TimeSpan::from_secs(2));
     let boot = BoottimeInstant::from_span_since_origin(TimeSpan::from_secs(2));

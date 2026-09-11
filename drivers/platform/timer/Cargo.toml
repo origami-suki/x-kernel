@@ -1,6 +1,6 @@
 [package]
 name = "timer-driver"
-description = "platform timer drivers for x-kernel"
+description = "platform clock source and clock event providers for X-Kernel"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,9 +18,9 @@ vmm = []
 khal = { workspace = true }
 ktime_types = { workspace = true }
 kirq = { workspace = true }
-kplat = { workspace = true }
 kbuild_config = { workspace = true }
 kcpu_id_map = { workspace = true }
+kiface = { workspace = true }
 klazy = { workspace = true }
 log = "0.4"
 percpu.workspace = true
@@ -32,9 +32,11 @@ of = { workspace = true }
 int_ratio = { workspace = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+kernel_boot = { workspace = true }
 int_ratio = { workspace = true }
 raw-cpuid = "11.5"
 x2apic = "0.5"
+x86_64 = { workspace = true }
 x86_apic = { workspace = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]

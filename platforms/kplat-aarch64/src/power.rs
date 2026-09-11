@@ -8,7 +8,7 @@ use kcpu_id_map::{LogicalCpuId, raw_cpu_id};
 use kerrno::{KError, KResult};
 use kplat::sys::SysCtrl;
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl SysCtrl {
     #[cfg(feature = "smp")]
     fn boot_ap(logical_cpu_id: LogicalCpuId, _stack_top_paddr: usize) -> KResult {

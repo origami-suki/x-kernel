@@ -3,8 +3,8 @@
 // See LICENSES for license details.
 
 use kbuild_config::RTC_PADDR;
-use khal::time::{MonotonicTimerIf, TimerTicks};
-use ktime_types::{MonotonicInstant, NANOS_PER_MILLIS, NANOS_PER_SEC, SystemTime};
+use khal::time::{ClockEventIf, ClockSourceIf, TimerTicks};
+use ktime_types::{Frequency, MonotonicInstant, NANOS_PER_MILLIS, NANOS_PER_SEC, SystemTime};
 use lazyinit::LazyInit;
 use loongArch64::{register::tcfg, time::Time};
 
@@ -83,8 +83,8 @@ pub(super) fn early_init() {
     #[cfg(feature = "rtc")]
     ktime::initialize_realtime(read_rtc());
 }
-#[kplat::impl_dev_interface]
-impl MonotonicTimerIf {
+#[kiface::provide]
+impl ClockSourceIf {
     fn now_ticks() -> TimerTicks {
         TimerTicks::from_raw(read_timer_ticks_raw())
     }
@@ -97,10 +97,13 @@ impl MonotonicTimerIf {
         TimerTicks::from_raw(nanos_to_ticks(span.as_nanos_u64_saturating()))
     }
 
-    fn freq() -> u64 {
-        loongArch64::time::get_timer_freq() as u64
+    fn frequency() -> Frequency {
+        Frequency::from_hz(loongArch64::time::get_timer_freq() as u64)
     }
+}
 
+#[kiface::provide]
+impl ClockEventIf {
     fn interrupt_id() -> usize {
         TIMER_IRQ
     }

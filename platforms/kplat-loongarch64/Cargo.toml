@@ -33,6 +33,7 @@ ktime = { workspace = true }
 kirq = { workspace = true }
 kcpu_id_map = { workspace = true }
 kerrno = { workspace = true }
+kiface = { workspace = true }
 kplat = { workspace = true }
 kbuild_config = { workspace = true }
 kernel_boot = { workspace = true }

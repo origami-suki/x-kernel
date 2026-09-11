@@ -4,22 +4,24 @@
 
 //! Semantic time value types for X-Kernel.
 //!
-//! [`TimeSpan`] represents a non-negative length of time, [`Instant`] represents
-//! a point in a specific clock domain, and [`SystemTime`] represents a signed
-//! Unix timestamp. [`TimestampLimits`] describes the precision and inclusive
-//! range a persistent format can represent. The distinct types prevent
-//! durations, deadlines, and wall clock timestamps from being mixed
-//! accidentally.
+//! [`Frequency`] represents a rate in canonical hertz, [`TimeSpan`] represents
+//! a non-negative length of time, [`Instant`] represents a point in a specific
+//! clock domain, and [`SystemTime`] represents a signed Unix timestamp.
+//! [`TimestampLimits`] describes the precision and inclusive range a persistent
+//! format can represent. The distinct types prevent rates, durations,
+//! deadlines, and wall clock timestamps from being mixed accidentally.
 
 #![no_std]
 #![deny(unsafe_code)]
 
+mod frequency;
 mod instant;
 mod span;
 mod system_time;
 mod timestamp;
 mod units;
 
+pub use frequency::Frequency;
 pub use instant::{
     Boottime, BoottimeInstant, Instant, Monotonic, MonotonicInstant, ProcessCpu, ProcessCpuInstant,
     ThreadCpu, ThreadCpuInstant,

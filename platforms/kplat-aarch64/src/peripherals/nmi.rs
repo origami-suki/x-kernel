@@ -109,7 +109,7 @@ macro_rules! nmi_if_impl {
             (pfr1 >> 36) & 0xF == 0b0001
         }
 
-        #[impl_dev_interface]
+        #[kiface::provide]
         impl kplat::nm_irq::NmiDef {
             fn early_init() -> bool {
                 let mode = detect_mode();

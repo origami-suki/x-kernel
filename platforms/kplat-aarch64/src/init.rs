@@ -7,7 +7,7 @@
 use kbuild_config::PSCI_METHOD;
 use kplat::boot::{BootHandler, BootInfo};
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl BootHandler {
     fn prepare_boot_memory(_boot_info: &BootInfo) {
         crate::mmio::prepare_boot_memory();

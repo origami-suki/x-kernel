@@ -16,6 +16,7 @@ use aarch64_cpu::registers::{
 use aarch64_cpu::registers::{CNTP_CTL_EL0, CNTP_TVAL_EL0};
 use int_ratio::Ratio;
 use klazy::Once;
+use ktime_types::Frequency;
 #[cfg(feature = "arm-timer-resume-fixup")]
 use log::info;
 
@@ -92,7 +93,7 @@ impl TimerMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerConfig {
     pub irq: usize,
-    pub frequency_hz: Option<u64>,
+    pub frequency: Option<Frequency>,
     pub source: TimerSource,
     pub mode: TimerMode,
 }
@@ -101,15 +102,15 @@ impl TimerConfig {
     pub const fn platform_static(irq: usize) -> Self {
         Self {
             irq,
-            frequency_hz: None,
+            frequency: None,
             source: TimerSource::PlatformStatic,
             mode: TimerMode::Physical,
         }
     }
 }
 
-#[kplat::impl_dev_interface]
-impl khal::time::MonotonicTimerIf {
+#[kiface::provide]
+impl khal::time::ClockSourceIf {
     fn now_ticks() -> khal::time::TimerTicks {
         now_ticks()
     }
@@ -118,14 +119,17 @@ impl khal::time::MonotonicTimerIf {
         ktime_types::TimeSpan::from_nanos(ticks_to_nanos(ticks.as_raw()))
     }
 
-    fn freq() -> u64 {
-        freq()
+    fn frequency() -> Frequency {
+        frequency()
     }
 
     fn span_to_ticks(span: ktime_types::TimeSpan) -> khal::time::TimerTicks {
         khal::time::TimerTicks::from_raw(nanos_to_ticks(span.as_nanos_u64_saturating()))
     }
+}
 
+#[kiface::provide]
+impl khal::time::ClockEventIf {
     fn interrupt_id() -> usize {
         interrupt_id()
     }
@@ -161,15 +165,20 @@ pub fn init(config: TimerConfig) {
     #[cfg(feature = "arm-timer-resume-fixup")]
     TICK_RESUME_OFFSET.store(0, Ordering::Relaxed);
 
-    let freq = config.frequency_hz.unwrap_or_else(|| CNTFRQ_EL0.get());
-    assert!(freq != 0, "ARM generic timer frequency must be non-zero");
+    let frequency = config
+        .frequency
+        .unwrap_or_else(|| Frequency::from_hz(CNTFRQ_EL0.get()));
     assert!(
-        u32::try_from(freq).is_ok(),
+        !frequency.is_zero(),
+        "ARM generic timer frequency must be non-zero"
+    );
+    assert!(
+        u32::try_from(frequency.as_hz()).is_ok(),
         "ARM generic timer frequency must fit in u32"
     );
-    TIMER_FREQ_HZ.store(freq, Ordering::Relaxed);
+    TIMER_FREQ_HZ.store(frequency.as_hz(), Ordering::Relaxed);
     let ratio = CNTPCT_TO_NANOS_RATIO
-        .call_once(|| Ratio::new(ktime_types::NANOS_PER_SEC as u32, freq as u32));
+        .call_once(|| Ratio::new(ktime_types::NANOS_PER_SEC as u32, frequency.as_hz() as u32));
     NANOS_TO_CNTPCT_RATIO.call_once(|| ratio.inverse());
 }
 
@@ -202,7 +211,7 @@ fn rearm_local_timer_irq() {
 }
 
 #[inline]
-pub fn now_ticks() -> khal::time::TimerTicks {
+fn now_ticks() -> khal::time::TimerTicks {
     khal::time::TimerTicks::from_raw(now_ticks_raw())
 }
 
@@ -278,7 +287,7 @@ pub fn handle_ipi_fixup() {
 }
 
 #[inline]
-pub(crate) fn ticks_to_nanos(ticks: u64) -> u64 {
+fn ticks_to_nanos(ticks: u64) -> u64 {
     CNTPCT_TO_NANOS_RATIO
         .get()
         .expect("ARM generic timer conversion ratio is not initialized")
@@ -286,7 +295,7 @@ pub(crate) fn ticks_to_nanos(ticks: u64) -> u64 {
 }
 
 #[inline]
-pub(crate) fn nanos_to_ticks(nanos: u64) -> u64 {
+fn nanos_to_ticks(nanos: u64) -> u64 {
     NANOS_TO_CNTPCT_RATIO
         .get()
         .expect("ARM generic timer inverse conversion ratio is not initialized")
@@ -294,18 +303,18 @@ pub(crate) fn nanos_to_ticks(nanos: u64) -> u64 {
 }
 
 #[inline]
-pub fn freq() -> u64 {
-    TIMER_FREQ_HZ.load(Ordering::Relaxed)
+fn frequency() -> Frequency {
+    Frequency::from_hz(TIMER_FREQ_HZ.load(Ordering::Relaxed))
 }
 
 #[inline]
-pub fn interrupt_id() -> usize {
+fn interrupt_id() -> usize {
     let irq = TIMER_IRQ.load(Ordering::Relaxed);
     assert!(irq != 0, "ARM generic timer not initialized");
     irq
 }
 
-pub fn arm_timer(deadline: ktime_types::MonotonicInstant) {
+fn arm_timer(deadline: ktime_types::MonotonicInstant) {
     let current_ticks = now_ticks_raw();
     let deadline_ns = deadline.as_nanos_u64_saturating();
     let deadline_ticks = nanos_to_ticks(deadline_ns);
@@ -332,7 +341,7 @@ pub fn arm_timer(deadline: ktime_types::MonotonicInstant) {
     }
 }
 
-pub fn disarm_timer() {
+fn disarm_timer() {
     match mode() {
         TimerMode::Physical => write_physical_timer_ctl(0),
         TimerMode::Virtual => CNTV_CTL_EL0.write(CNTV_CTL_EL0::ENABLE::CLEAR),
@@ -377,7 +386,7 @@ pub fn config_from_device_tree() -> Option<TimerConfig> {
         .or_else(|| of::find_compatible("arm,armv7-timer"))?;
     Some(TimerConfig {
         irq: timer_irq_from_device_tree(node, timer_mode)?,
-        frequency_hz: timer_frequency_from_device_tree(node),
+        frequency: timer_frequency_from_device_tree(node),
         source: TimerSource::DeviceTree,
         mode: timer_mode,
     })
@@ -431,11 +440,15 @@ fn interrupt_spec_at(specs: &[u8], index: usize) -> Option<usize> {
     Some(intid as usize)
 }
 
-fn timer_frequency_from_device_tree(node: of::FdtNode<'static, 'static>) -> Option<u64> {
+fn timer_frequency_from_device_tree(node: of::FdtNode<'static, 'static>) -> Option<Frequency> {
     let value = node.property("clock-frequency")?.value;
     match value.len() {
-        4 => Some(u32::from_be_bytes(value.try_into().ok()?) as u64),
-        8 => Some(u64::from_be_bytes(value.try_into().ok()?)),
+        4 => Some(Frequency::from_hz(u64::from(u32::from_be_bytes(
+            value.try_into().ok()?,
+        )))),
+        8 => Some(Frequency::from_hz(u64::from_be_bytes(
+            value.try_into().ok()?,
+        ))),
         _ => None,
     }
 }

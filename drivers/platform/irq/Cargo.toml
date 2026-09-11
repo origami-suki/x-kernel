@@ -18,6 +18,7 @@ karch = { workspace = true }
 kirq = { workspace = true }
 kbuild_config = { workspace = true }
 kcpu_id_map = { workspace = true }
+kiface = { workspace = true }
 kplat = { workspace = true }
 kspin = { workspace = true }
 lazyinit = "0.2"

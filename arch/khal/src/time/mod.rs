@@ -4,7 +4,7 @@
 
 //! Unified time capability exposed by `khal`.
 
-use ktime_types::{MonotonicInstant, TimeSpan};
+use ktime_types::{Frequency, MonotonicInstant, TimeSpan};
 
 /// Raw counter ticks in the platform monotonic timer domain.
 #[repr(transparent)]
@@ -28,64 +28,70 @@ impl TimerTicks {
     }
 }
 
+/// Provides a monotonic counter and conversions for its tick domain.
 #[kiface::interface]
-pub trait MonotonicTimerIf {
+pub trait ClockSourceIf {
     /// Returns the current monotonic timer tick count.
     fn now_ticks() -> TimerTicks;
     /// Converts monotonic timer ticks to elapsed time.
     fn ticks_to_span(ticks: TimerTicks) -> TimeSpan;
-    /// Returns the monotonic timer frequency in Hz.
-    fn freq() -> u64;
+    /// Returns the monotonic counter frequency.
+    fn frequency() -> Frequency;
     /// Converts elapsed time to monotonic timer ticks.
     fn span_to_ticks(span: TimeSpan) -> TimerTicks;
-    /// Returns the monotonic timer interrupt ID.
+}
+
+/// Provides per-CPU clock events for monotonic deadlines.
+#[kiface::interface]
+pub trait ClockEventIf {
+    /// Returns the clock-event interrupt ID.
     fn interrupt_id() -> usize;
-    /// Arms the monotonic timer to trigger at the given deadline.
+    /// Arms the local clock event to trigger at the given deadline.
     fn arm_timer(deadline: MonotonicInstant);
-    /// Disarms the local monotonic timer so it will not interrupt until re-armed.
+    /// Disarms the local clock event so it will not interrupt until re-armed.
     fn disarm_timer();
-    /// Allows the timer backend to handle counter/timer repair after idle returns.
+    /// Allows the clock-event backend to repair timer state after idle returns.
     fn handle_idle_return(previous_ticks: TimerTicks) -> bool;
 }
 
 #[inline]
 pub fn now_ticks() -> TimerTicks {
-    MonotonicTimerIf::now_ticks()
+    ClockSourceIf::now_ticks()
 }
 
 #[inline]
 pub fn ticks_to_span(ticks: TimerTicks) -> TimeSpan {
-    MonotonicTimerIf::ticks_to_span(ticks)
+    ClockSourceIf::ticks_to_span(ticks)
 }
 
 #[inline]
-pub fn freq() -> u64 {
-    MonotonicTimerIf::freq()
+pub fn frequency() -> Frequency {
+    ClockSourceIf::frequency()
 }
 
 #[inline]
 pub fn span_to_ticks(span: TimeSpan) -> TimerTicks {
-    MonotonicTimerIf::span_to_ticks(span)
+    ClockSourceIf::span_to_ticks(span)
 }
 
 #[inline]
 pub fn interrupt_id() -> usize {
-    MonotonicTimerIf::interrupt_id()
+    ClockEventIf::interrupt_id()
 }
 
 #[inline]
 pub fn arm_timer(deadline: MonotonicInstant) {
-    MonotonicTimerIf::arm_timer(deadline)
+    ClockEventIf::arm_timer(deadline)
 }
 
 #[inline]
 pub fn disarm_timer() {
-    MonotonicTimerIf::disarm_timer()
+    ClockEventIf::disarm_timer()
 }
 
 #[inline]
 pub fn handle_idle_return(previous_ticks: TimerTicks) -> bool {
-    MonotonicTimerIf::handle_idle_return(previous_ticks)
+    ClockEventIf::handle_idle_return(previous_ticks)
 }
 
 #[inline]

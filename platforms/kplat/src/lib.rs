@@ -20,13 +20,12 @@ pub mod perf;
 pub mod sys;
 
 pub use kerrno;
-pub use kiface::provide as impl_dev_interface;
 pub use kplat_macros::{default_dma_if_impl, default_mmio_if_impl};
 
 #[doc(hidden)]
 pub mod __priv {
     pub use const_str::equal as str_eq;
-    pub use kiface::interface as interface_def;
+    pub use kiface::{interface as interface_def, provide};
 }
 
 #[macro_export]

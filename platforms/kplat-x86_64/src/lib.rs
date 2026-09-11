@@ -10,8 +10,6 @@
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate kplat;
 extern crate irq_driver as _;
 extern crate kernel_boot;
 mod init;

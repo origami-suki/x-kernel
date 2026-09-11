@@ -87,7 +87,7 @@ fn dispatch_irq(vector: usize) -> Option<kirq::PendingIrq> {
     None
 }
 
-#[kplat::impl_dev_interface]
+#[kiface::provide]
 impl kirq::IntrManagerIf {
     fn configure(desc: kirq::IrqDesc) {
         configure(desc);

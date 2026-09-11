@@ -40,7 +40,7 @@ fn pm1a_control_port() -> Option<u16> {
     }
 }
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl SysCtrl {
     #[cfg(feature = "smp")]
     fn boot_ap(logical_cpu_id: LogicalCpuId, stack_top_paddr: usize) -> KResult {

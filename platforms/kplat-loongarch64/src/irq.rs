@@ -40,7 +40,7 @@ impl IrqType {
         }
     }
 }
-#[impl_dev_interface]
+#[kiface::provide]
 impl kirq::IntrManagerIf {
     fn configure(_desc: kirq::IrqDesc) {}
 

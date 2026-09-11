@@ -106,7 +106,9 @@ pub fn vmm_run_vcpu<A: VmmArch>(vcpu: &mut Vcpu<A>) -> Result<(), ()> {
     // vCPU monopolises its pCPU by yielding at most once per `yield_interval`
     // of wall time, rather than on every exit.
     let mut last_yield = khal::time::now_ticks();
-    let yield_interval = (khal::time::freq() / 1000).max(1); // ~1 ms
+    let yield_interval = khal::time::span_to_ticks(ktime_types::TimeSpan::from_millis(1))
+        .as_raw()
+        .max(1);
 
     let result = loop {
         // Host-requested teardown: leave the run loop so the owning task can

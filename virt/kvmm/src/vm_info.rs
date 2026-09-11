@@ -44,7 +44,6 @@ pub fn dump_vm_info() -> String {
     let mut reg = VM_REGISTRY.lock();
     reg.retain(|w| w.upgrade().is_some_and(|vm| vm.is_active()));
 
-    let freq = khal::time::freq();
     let now = khal::time::now_ticks();
     let mut out = String::new();
     let _ = writeln!(out, "VMs: {}", reg.len());
@@ -52,7 +51,7 @@ pub fn dump_vm_info() -> String {
     for (idx, weak) in reg.iter().enumerate() {
         let Some(vm) = weak.upgrade() else { continue };
 
-        let uptime_ms = ticks_to_us(now.as_raw().wrapping_sub(vm.created_ticks()), freq) / 1000;
+        let uptime_ms = ticks_to_us(now.as_raw().wrapping_sub(vm.created_ticks())) / 1000;
         let _ = writeln!(out);
         let _ = writeln!(
             out,
@@ -70,8 +69,8 @@ pub fn dump_vm_info() -> String {
             let exits = vm.vcpu_exit_count(i);
             let guest_t = vm.vcpu_guest_ticks(i);
             let exit_t = vm.vcpu_exit_ticks(i);
-            let guest_us = ticks_to_us(guest_t, freq);
-            let exit_us = ticks_to_us(exit_t, freq);
+            let guest_us = ticks_to_us(guest_t);
+            let exit_us = ticks_to_us(exit_t);
             let total = guest_t + exit_t;
             let util = (guest_t * 100).checked_div(total).unwrap_or(0);
             let bd = vm.vcpu_exit_breakdown(i);
@@ -110,9 +109,7 @@ pub fn dump_vm_info() -> String {
     out
 }
 
-fn ticks_to_us(ticks: u64, freq: u64) -> u64 {
-    if freq == 0 {
-        return 0;
-    }
-    ticks * 1_000_000 / freq
+fn ticks_to_us(ticks: u64) -> u64 {
+    let span = khal::time::ticks_to_span(khal::time::TimerTicks::from_raw(ticks));
+    u64::try_from(span.as_micros()).unwrap_or(u64::MAX)
 }

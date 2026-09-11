@@ -309,7 +309,7 @@ pub fn set_nmi_attr(irq: usize, nmi: bool) -> bool {
     }
 }
 
-#[kplat::impl_dev_interface]
+#[kiface::provide]
 impl kirq::IntrManagerIf {
     fn configure(desc: kirq::IrqDesc) {
         match desc.trigger {

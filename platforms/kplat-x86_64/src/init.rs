@@ -17,7 +17,7 @@ fn io_apic_paddr_from_firmware_or_fallback() -> khal::mem::PhysAddr {
         })
 }
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl BootHandler {
     fn prepare_boot_memory(boot_info: &BootInfo) {
         crate::peripherals::bootmem::init_ap_trampoline_page(boot_info);
@@ -27,7 +27,9 @@ impl BootHandler {
 
     fn early_driver_init() {
         timer_driver::x86_lapic_tsc::early_init(
-            timer_driver::x86_lapic_tsc::TimerConfig::platform_static(TIMER_FREQUENCY_HZ as u64),
+            timer_driver::x86_lapic_tsc::TimerConfig::platform_static(
+                ktime_types::Frequency::from_hz(TIMER_FREQUENCY_HZ as u64),
+            ),
         );
         kernel_boot::bootln!("timer init");
         console_driver::init_stdout_ioport(

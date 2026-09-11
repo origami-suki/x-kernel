@@ -5,9 +5,9 @@
 //! Dummy implementation of platform-related interfaces defined in [`kplat`].
 
 use kcpu_id_map::LogicalCpuId;
-use kplat::{boot::BootHandler, impl_dev_interface, sys::SysCtrl};
+use kplat::{boot::BootHandler, sys::SysCtrl};
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl BootHandler {
     fn prepare_boot_memory(_boot_info: &kplat::boot::BootInfo) {}
 
@@ -21,7 +21,7 @@ impl BootHandler {
     fn final_init_ap(_logical_cpu_id: LogicalCpuId) {}
 }
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl crate::console::ConsoleIf {
     fn write_data(_bytes: &[u8]) {
         unimplemented!()
@@ -40,8 +40,8 @@ impl crate::console::ConsoleIf {
     }
 }
 
-#[impl_dev_interface]
-impl crate::time::MonotonicTimerIf {
+#[kiface::provide]
+impl crate::time::ClockSourceIf {
     fn now_ticks() -> crate::time::TimerTicks {
         crate::time::TimerTicks::from_raw(0)
     }
@@ -54,10 +54,14 @@ impl crate::time::MonotonicTimerIf {
         crate::time::TimerTicks::from_raw(span.as_nanos_u64_saturating())
     }
 
-    fn freq() -> u64 {
-        0
+    fn frequency() -> ktime_types::Frequency {
+        ktime_types::Frequency::ZERO
     }
 
+}
+
+#[kiface::provide]
+impl crate::time::ClockEventIf {
     fn interrupt_id() -> usize {
         0
     }
@@ -71,7 +75,7 @@ impl crate::time::MonotonicTimerIf {
     }
 }
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl SysCtrl {
     #[cfg(feature = "smp")]
     fn boot_ap(_logical_cpu_id: LogicalCpuId, _stack_top_paddr: usize) -> kerrno::KResult {
@@ -91,7 +95,7 @@ impl SysCtrl {
     }
 }
 
-#[impl_dev_interface]
+#[kiface::provide]
 impl kirq::IntrManagerIf {
     fn configure(_desc: kirq::IrqDesc) {}
 

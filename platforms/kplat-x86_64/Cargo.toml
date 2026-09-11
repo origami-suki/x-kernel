@@ -25,6 +25,7 @@ kcpu = { workspace = true }
 karch = { workspace = true }
 kcpu_id_map = { workspace = true }
 kerrno = { workspace = true }
+kiface = { workspace = true }
 kplat = { workspace = true }
 console_driver = { workspace = true, features = ["ns16550-ioport"] }
 kbuild_config = { workspace = true }

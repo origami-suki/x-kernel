@@ -211,7 +211,7 @@ macro_rules! pmu_if_impl {
     () => {
         use kplat::perf::PerfCb;
 
-        #[impl_dev_interface]
+        #[kiface::provide]
         impl kplat::perf::PerfMgr {
             fn on_overflow() -> bool {
                 $crate::peripherals::pmu::dispatch_irq_overflows()
@@ -277,7 +277,7 @@ macro_rules! nmi_pmu_if_impl {
     () => {
         use kplat::nm_irq::NmiCb;
 
-        #[impl_dev_interface]
+        #[kiface::provide]
         impl kplat::nm_irq::NmiPeriodic {
             fn enable_periodic_nmi(period_ns: u64, handler: NmiCb) -> bool {
                 // ── 1. Compute cycle threshold ────────────────────────

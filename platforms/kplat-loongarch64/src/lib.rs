@@ -7,8 +7,6 @@
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate kplat;
 mod init;
 mod irq;
 #[cfg(feature = "smp")]

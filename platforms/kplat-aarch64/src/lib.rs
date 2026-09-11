@@ -15,8 +15,6 @@
 extern crate alloc;
 
 #[macro_use]
-extern crate kplat;
-#[macro_use]
 extern crate log;
 // Force-link kernel_boot so that _start and boot code are included in the final binary.
 extern crate kernel_boot;

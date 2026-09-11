@@ -128,7 +128,7 @@ macro_rules! with_cause {
     };
 }
 
-#[kplat::impl_dev_interface]
+#[kiface::provide]
 impl kirq::IntrManagerIf {
     fn configure(_desc: kirq::IrqDesc) {}
 

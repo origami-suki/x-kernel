@@ -20,8 +20,8 @@ driver_base = { workspace = true }
 kclass = { workspace = true, features = ["char"] }
 kdevice = { workspace = true }
 khal = { workspace = true }
+kiface = { workspace = true }
 kirq = { workspace = true }
-kplat = { workspace = true }
 kspin = { workspace = true }
 lazyinit = { workspace = true }
 log = { workspace = true }
