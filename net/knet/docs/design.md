@@ -1,36 +1,28 @@
-# knet — 设计文档
+# knet — Design
 
-## 定位
+## Role
 
-`knet` 提供 x-kernel 的内核网络栈抽象。
-它把驱动层网卡、smoltcp 协议栈、socket 对象、轮询唤醒、Unix domain socket、netlink 和可选 vsock 组合成统一的 `SocketOps` 接口。
-上层 `posix/net` 负责 syscall 参数解析和文件描述符接入，`core/kruntime` 负责启动期设备注入，`knet` 负责协议状态、路由、收发推进和 socket 语义。
+`knet` provides a kernel network stack for x-kernel, which combines driver-level network devices, protocol stack, socket objects, poll and wakeup mechanisms, Unix domain sockets, netlink, and optional vsock support into a unified `SocketOps` interface. It is mainly responsible for protocol state, routing, RX/TX progress, and socket semantics. It uses crate-local IPv4, UDP, and ICMPv4 data paths to handle UDP send and receive, fragmentation, and error reporting. smoltcp supplies TCP, raw IP, IPv6, and staged interface polling.
 
-打开的 socket 统一使用 `SocketFileOps`，其 `fsync/fdatasync` 显式返回 `EINVAL`；
-网络发送完成不提供文件持久化语义，也不继承通用文件操作的兼容性成功空操作。
+## Background
 
-## 背景
+x-kernel needs socket semantics that can serve both POSIX syscalls and in-kernel clients. `knet` owns protocol state, packet queues, routing, and progress scheduling, while its surrounding subsystems supply device access, task scheduling, filesystem operations, and caller context.
 
-x-kernel 运行在 `no_std` 内核环境中，无法直接使用 Linux 内核网络栈或标准库网络类型。
-当前实现由 crate 内 IPv4、UDP 和 ICMPv4 数据路径处理 UDP 收发、分片与差错报告，smoltcp 继续处理 TCP、raw IP、IPv6 和 DNS，并提供兼容期 interface poll 模型。
+The POSIX network layer in `posix/net` handles syscall arguments, user-memory access, file descriptors, and ABI conversion. `kvfs` owns pathname resolution and access checks, and `anon_inodefs` creates socket files. `kclass` supplies registered network and vsock device handles; concrete drivers own hardware and virtqueue operations. `kirq` supplies the generic softirq mechanism, while `ktask`, `kwork`, and `kpoll` supply timer callbacks, task-context polling, and readiness registration. `knet` determines how these facilities advance network work.
 
-## 范围
+## Scope
 
-涉及的源文件：
+The source layout below includes protocol implementations and colocated tests.
 
 ```text
 net/knet/
 ├── Cargo.toml
 └── src/
-    ├── lib.rs
-    ├── control.rs
-    ├── poller.rs
     ├── device/
-    │   ├── mod.rs
     │   ├── ethernet.rs
     │   ├── loopback.rs
-    │   ├── net_rx.rs
-    │   └── vsock.rs
+    │   ├── mod.rs
+    │   └── net_rx.rs
     ├── link/
     │   ├── buf.rs
     │   ├── mod.rs
@@ -40,595 +32,885 @@ net/knet/
     │   ├── mod.rs
     │   ├── rtnetlink.rs
     │   ├── socket.rs
+    │   ├── tests.rs
     │   └── wire.rs
     ├── socket/
-    │   ├── mod.rs
     │   ├── file.rs
     │   ├── general.rs
+    │   ├── mod.rs
     │   ├── options.rs
-    │   └── state.rs
+    │   ├── state.rs
+    │   ├── test_options.rs
+    │   └── test_state.rs
     ├── stack/
     │   ├── fragment.rs
     │   ├── ingress.rs
     │   ├── ipv4.rs
-    │   ├── mod.rs
-    │   ├── service.rs
-    │   ├── router.rs
     │   ├── listen_table.rs
+    │   ├── mod.rs
+    │   ├── router.rs
+    │   ├── service.rs
     │   └── wrapper.rs
     ├── transport/
-    │   ├── mod.rs
-    │   ├── tcp.rs
     │   ├── udp/
     │   │   ├── input.rs
     │   │   ├── mod.rs
     │   │   ├── output.rs
     │   │   ├── pcb.rs
-    │   │   ├── relay.rs
     │   │   ├── registry.rs
-    │   │   ├── state.rs
+    │   │   ├── relay.rs
     │   │   ├── socket.rs
+    │   │   ├── state.rs
     │   │   └── wait.rs
+    │   ├── mod.rs
     │   ├── raw.rs
+    │   ├── tcp.rs
     │   └── udp_err.rs
     ├── unix/
+    │   ├── stream/
+    │   │   ├── channel.rs
+    │   │   └── listener.rs
     │   ├── dgram.rs
-    │   ├── stream.rs
-    │   └── stream/
-    │       ├── channel.rs
-    │       └── listener.rs
-    └── vsock/
-        ├── bridge.rs              # vsock-TIPC bridge（vsock_tipc_bridge feature）
-        ├── bridge_connection.rs   # bridge 单连接状态
-        ├── bridge_port_map.rs     # host↔TIPC 固定端口映射
-        ├── connection_manager.rs  # 统一连接管理器与原始传输 owner
-        └── stream.rs              # AF_VSOCK stream socket 实现
+    │   └── stream.rs
+    ├── vsock/
+    │   ├── bridge.rs
+    │   ├── bridge_connection.rs
+    │   ├── bridge_port_map.rs
+    │   ├── connection_manager.rs
+    │   └── stream.rs
+    ├── consts.rs
+    ├── control.rs
+    ├── ip.rs
+    ├── lib.rs
+    ├── poller.rs
+    ├── unix.rs
+    └── vsock.rs
 ```
 
-测试辅助代码位于 `socket/test_options.rs`、`socket/test_state.rs`、`netlink/tests.rs`，
-IPv4、分片重组和 UDP 的回归测试与对应实现放在同一模块内。
+## Architecture
 
-## 架构
+```mermaid
+%%{init: {
+  "theme": "base",
+  "flowchart": {
+    "htmlLabels": false,
+    "curve": "basis",
+    "nodeSpacing": 25,
+    "rankSpacing": 45
+  },
+  "themeVariables": {
+    "fontFamily": "\"Trebuchet MS\", Verdana, Arial, sans-serif",
+    "fontSize": "15px",
+    "primaryColor": "#F5F2EC",
+    "primaryTextColor": "#493728",
+    "primaryBorderColor": "#CFC8BD",
+    "lineColor": "#9A9187",
+    "clusterBkg": "#FAF9F6",
+    "clusterBorder": "#D8D1C7",
+    "edgeLabelBackground": "#FAF9F6",
+    "textColor": "#493728",
+    "nodeTextColor": "#493728",
+    "clusterTextColor": "#493728"
+  },
+  "themeCSS": ".edgeLabel rect, .edgeLabel .labelBkg, .edgeLabel .background { fill: #FAF9F6 !important; stroke: none !important; } .edgeLabel, .edgeLabel p, .edgeLabel span { background-color: #FAF9F6 !important; color: #493728 !important; } .edgeLabel text, .cluster-label text { fill: #493728 !important; stroke: none !important; } .cluster rect { rx: 8px; ry: 8px; }"
+}}%%
+flowchart TB
+    CALLER("posix/net · kernel clients")
 
-```text
-core/kruntime
-   │ init_network
-   v
-┌──────────────────────────┐
-│ Service                  │
-│  ├─ smoltcp Interface    │
-│  ├─ Router               │
-│  ├─ IngressProcessor     │
-│  └─ reusable batches     │
-└──────────┬───────────────┘
-           │
-           v
-┌──────────────────────────┐
-│ Router                   │
-│  ├─ RouteTable           │
-│  ├─ LoopbackDevice       │
-│  └─ EthernetDevice       │
-└──────┬──────────────┬────┘
-       │ UDP / ICMPv4 │ TCP / raw / IPv6 / DNS
-       v              v
-┌──────────────────┐  ┌──────────────────────────┐
-│ UDP PCB registry │  │ SocketSetWrapper         │
-│ and socket queues│  │  └─ smoltcp SocketSet    │
-└────────┬─────────┘  └──────────┬───────────────┘
-         │                       │
-         └───────────┬───────────┘
-                     v
-┌──────────────────────────┐
-│ SocketOps implementations│
-│ TCP / UDP / raw / Unix   │
-│ netlink / vsock          │
-└──────────────────────────┘
+    subgraph KNET["knet"]
+        API("Socket API · SocketOps")
+
+        subgraph SOCKETS["Socket implementations"]
+            TCP("TCP / raw IP
+smoltcp sockets")
+            UDP("UDP
+knet PCB / queues")
+            PACKET("AF_PACKET
+Ethernet frames")
+            UNIX("Unix
+Local IPC")
+            NETLINK("netlink
+uevents / rtnetlink")
+            VSOCK("vsock · optional
+Guest-host streams")
+        end
+
+        subgraph IP["IP processing"]
+            SMOL("smoltcp
+IPv4 / IPv6")
+            IPV4("knet IPv4 / ICMPv4
+Reassembly / UDP delivery
+Error handling")
+        end
+
+        ROUTER("Router
+Routes / TX fragmentation
+RX-TX queues")
+
+        subgraph DEVICE["Devices · NetDevice"]
+            LOOP("LoopbackDevice")
+            ETH("EthernetDevice
+Ethernet / ARP")
+        end
+    end
+
+    NIC("kclass network device
+NIC driver")
+    VIRTIO("kclass vsock device
+virtio-vsock driver")
+
+    CALLER --> API
+    API --> TCP & UDP & PACKET & UNIX & NETLINK & VSOCK
+    TCP --> SMOL
+    UDP --> IPV4
+    SMOL --> ROUTER
+    IPV4 --> ROUTER
+    PACKET -->|link TX| ROUTER
+    NETLINK -.->|rtnetlink configuration| ROUTER
+    ROUTER --> LOOP & ETH
+    ETH --> NIC
+    VSOCK --> VIRTIO
 ```
 
-| 组件 | 职责 |
-|------|------|
-| `init_network` | 创建 loopback 与首个 Ethernet 设备，建立默认路由，初始化网络全局状态，并启动 kwork-backed 后台 poller |
-| `poller` | 通过 `kwork::BudgetedPoller` 的四态状态机串行化执行者，使用 dynamic kwork queue 或 socket assist 预算推进 RX、smoltcp timer 和 TX |
-| `Service` | 持有加锁的 smoltcp `Interface`、`Router`、`IngressProcessor`、可复用 batch、poll timeout 和 RX waker 注册入口 |
-| `Router` | 管理设备列表、IPv4 地址、配置路由、地址派生路由、RX 设备游标、smoltcp ingress queue、control/data TX queue、IPv4 输出分片、next-hop 选择和 budget dispatch |
-| `control` | 持有跨 rtnetlink、legacy socket ioctl 和设备注销路径的 `network_config_lock`，并提供接口查询、IPv4 地址配置和 IPv4 路由配置辅助操作 |
-| `IngressProcessor` | 在 Router 锁外校验和重组 IPv4 输入，执行 crate 内 UDP 分流、UDP error 与 TCP listen snoop，并生成 ICMPv4 control packet |
-| `NetDevice` | 抽象 loopback 和 Ethernet 设备后端，持有接口名、MTU、管理 up 状态、link snapshot 和设备邻居状态，通过 `PacketBuf` 转移报文所有权，并使用 crate 内地址类型和 `MonotonicInstant` 表达设备边界 |
-| `PacketBuf` | 指针大小的引用计数报文句柄，保存报文数据、协议偏移、接口索引、包类型、校验状态、已校验传输层元数据和当前所有者；共享后的写操作通过写时复制保持各句柄状态独立 |
-| `link::wire` | 使用 `zerocopy` 校验和构造 Ethernet 与 Ethernet/IPv4 ARP 头部 |
-| `stack::ipv4` | 使用 `etherparse` 校验和构造 IPv4 与 ICMPv4 头部，并执行输出分片 |
-| `stack::fragment` | 按源地址、目的地址、标识、协议和接口重组本地 IPv4 分片，并限制队列数量、内存和存活时间 |
-| `transport::udp` | 维护 UDP PCB registry、接收队列、bind 与 connect 状态、校验和、socket option、异步错误和 IPv4 收发，并提供持久化 `UdpDatagramRelay` |
-| `SocketSetWrapper` | 串行化 smoltcp socket set 与 TCP deferred-close 元数据访问，并在新增 socket 时通知等待者 |
-| `ListenTable` | 管理 TCP listen backlog、SYN 队列、accept 队列和 accept waker |
-| `GeneralOptions` | 统一管理 nonblock、reuseaddr、超时和设备绑定 |
-| `SocketOps` | 上层 socket syscall 使用的统一操作接口 |
-| `netlink` | 提供 AF_NETLINK socket、kobject uevent 和有限 rtnetlink 协议适配，查询各 owner 的实时快照并把 mutation 交给对应 owner |
-| `unix` | 提供 Unix domain stream 与 datagram transport；pathname 地址通过 kvfs 查找或创建 socket inode |
-| `vsock` | 在 `vsock` feature 下提供 virtio-vsock stream 支持；`connection_manager.rs` 负责从 kclass 注册 raw transport、驱动轮询、维护连接表/监听表/credit/bridge 事件队列，`stream.rs` 实现 AF_VSOCK，`bridge.rs` 在 `vsock_tipc_bridge` 下作为 `VSOCK_CONN_MANAGER` 消费者复用同一连接管理器 |
+Solid arrows show the main API and packet-path relationships; the dotted arrow
+shows rtnetlink configuration through `control` and the owning components.
+`Service` coordinates IP processing and `Router`; `poller` advances RX, protocol
+timers, and TX through kwork or socket-assist polling. AF_PACKET receives frame
+subscriptions from `EthernetDevice`, while Unix and vsock use their own transports.
 
-`SocketOps::connect` 通过 `ConnectOptions` 接收本次调用的 nonblocking 状态，POSIX 层从
-socket 文件的 `O_NONBLOCK` 标志生成该选项。协议实现据此保留各自的 Linux 错误语义：
-TCP 建连仍在进行时返回 `EINPROGRESS`，Unix stream 监听队列已满时返回 `EAGAIN`。
+| Component | Responsibility |
+|---|---|
+| posix/net · kernel clients | Call the socket API from POSIX syscalls or kernel code. |
+| Socket API · SocketOps | Provides common operations across socket implementations. |
+| TCP / raw IP | Implements TCP and raw IP sockets using smoltcp. |
+| UDP | Manages UDP PCBs and queues, using knet's IPv4 path for packet I/O. |
+| AF_PACKET | Receives Ethernet frame subscriptions and sends frames through Router. |
+| Unix | Provides local stream and datagram communication. |
+| netlink | Delivers kobject uevents and handles supported rtnetlink queries and configuration changes. |
+| vsock | Provides optional guest-host stream communication through virtio-vsock. |
+| smoltcp | Provides IPv4/IPv6 processing for the smoltcp socket path. |
+| knet IPv4 / ICMPv4 | Validates and reassembles IPv4 packets, delivers UDP input, and handles ICMPv4 errors and responses. |
+| Router | Selects routes, fragments outgoing IPv4 packets, and dispatches RX/TX queues across devices. |
+| LoopbackDevice | Returns locally transmitted packets to the receive path. |
+| EthernetDevice | Adapts kclass network devices to knet's NetDevice interface and handles Ethernet and ARP. |
+| kclass network device · NIC driver | Exposes the registered NIC and performs hardware packet I/O. |
+| kclass vsock device · virtio-vsock driver | Exposes the registered vsock device and transports guest-host packets. |
 
-### Ethernet RX 调度边界
+## Calling Constraints and Execution Context
 
-驱动向上提供 NIC 能力时仍通过 `kclass` / `driver_net` 发布 `NetDevice`。
-`knet` 在创建 `EthernetDevice` 时为该设备创建独立的 RX `PollSet`，
-并通过 `driver_net::NetRxScheduler` 把一个 IRQ-safe 调度能力 attach 给驱动。
-NIC 硬中断 handler 只负责 ack 设备中断并调用 `schedule_rx()`；
-`schedule_rx()` 标记对应设备有 RX work，并 raise `kirq::softirq::SoftirqVec::NetRx`。
-当前 `NetRx` softirq action 对 Ethernet 仍是保守 fallback 形态：它只消费已 pending
-的设备 RX source，唤醒对应设备 RX `PollSet`，并调度 `knet-poller` dynamic kwork
-执行 sleepable 协议推进；普通 socket 轮询路径也可以在被唤醒后执行一次 assist。
-Loopback 走单独的 Linux 对齐路径：xmit 在关闭 BH 前给完整 IPv4 UDP 盖上接收元数据，
-把同一 `PacketBuf` 放入共享 `NET_RX_QUEUE` 的 `pending_udp` 并 raise `NetRx`，
-`local_bh_enable` 在发送路径上跑 `NetRx`，已盖戳的 UDP 直接进入 PCB。
-`NetRx` 只 drain `pending_udp`，不查找 `LoopbackDevice`。
-TCP、ICMP、IPv6、分片和未命中 socket 的 UDP 留在 `deferred`，由任务 poller `poll_rx` 取出。
-这与 Linux NAPI 的最终形态仍不同：Linux `NET_RX_SOFTIRQ` 会在
-`net_rx_action()` 中直接按 budget drain NAPI poll list。X-Kernel 后续要
-达到同类形态，需要先补齐 Ethernet 非阻塞 RX ingress 或 workerqueue 承接层，因为当前
-`Service` / `SocketSet` 和 TCP listen table 仍使用可睡眠锁。
-如果驱动不支持 `NetRxScheduler` attach，`EthernetDevice` 不会注册专用 RX
-`PollSet`，等待路径回退到 `Service` 的 timeout 聚合 waker，避免等待一个
-永远不会被驱动唤醒的 source。如果 `NetRx` softirq vector 无法注册，
-`EthernetDevice` 同样不创建专用 RX source，并保留 timeout polling fallback；
-这属于 fail-closed 行为，而不是创建一个不可达的异步等待源。
+`knet` runs in kernel context, but different code paths have different execution-context requirements. Callers must follow the constraints below.
 
-这个边界避免把网络 source 语义放进 `kirq`：
-`kirq` 只提供通用 softirq 机制，`driver_net` 表达网络设备能力，
-`knet` 决定 RX work 如何唤醒和推进。
+* **Initialization order**
 
-## 调用约束 / 执行上下文
+  `init_network` must complete before Internet sockets access `SERVICE`, `SOCKET_SET`, or `LISTEN_TABLE`, or routing and protocol processing begin. Unix sockets use their own transport and binding state; vsock initialization is handled separately by `init_vsock`. It initializes `SERVICE`, `SOCKET_SET`, `LISTEN_TABLE`, and the initial Router state. The dynamic workqueue used by `knet-poller` is started only after these objects are initialized.
 
-`knet` 运行在内核上下文中，
-但并非所有路径都适用于任意执行环境。
-调用者需要满足以下约束：
+* **vsock startup and callbacks**
 
-- **依赖初始化顺序**：在创建 socket、访问路由状态、
-  或推进协议栈之前，必须先完成 `init_network`，
-  以初始化 `SERVICE`、`SOCKET_SET`、`LISTEN_TABLE`
-  和 Router 初始状态。`knet-poller` 的 dynamic workqueue 在这些对象完成初始化后启动。
-- **普通协议推进不应在硬中断上下文执行**：
-  `poller::assist_once`、socket send/recv/connect/accept、
-  netlink mutation 等路径会获取 `Mutex` / `RwLock`
-  并推进较重的数据路径，应在普通任务上下文中运行。
-- **IRQ 路径只做通知**：
-  设备中断回调应只负责 ack 设备中断、登记 RX pending 并调度
-  `NetRx` softirq，不应直接执行完整的协议推进或阻塞式 socket 语义。
-- **NetRx softirq 可交付 loopback UDP，但不得调用 `poller::assist_once`**：
-  `NetRx` 运行在不可睡眠上下文。Ethernet 路径只消费 pending RX source
-  并唤醒对应设备 RX `PollSet`，随后调度 `knet-poller` work 在 kwork 任务
-  上下文执行受批次轮数上限约束的数据面推进。
-  Loopback 发送侧在关闭 BH 前完成 UDP 校验，并把地址与 payload range
-  写入现有 `PacketBuf` 的控制元数据；
-  同一 action 只从 `pending_udp` 取出这些已盖戳句柄，经 `SpinNoIrq` PCB registry 移入已预留容量的
-  接收队列并唤醒 socket waiter，因此 action 的 UDP 投递热路径不执行堆分配。
-  TCP、ICMP、IPv6、分片和未命中 socket 的 UDP 留在 `deferred`，由任务 poller
-  通过 `poll_rx` 取出。
-  不得从 softirq 调用 `poller::assist_once` 或获取 `Service` / `SocketSet`
-  的可睡眠锁。
-- **允许阻塞的路径依赖 poll/waker 语义**：
-  阻塞式 socket 操作依赖 `PollSet`、waker
-  和 timeout 注册机制。`Pollable::register` 只能通过调用方提供的
-  `PollContext` 注册源；调用方必须让对应 `PollRegistrations`
-  跨 `Pending` 存活，并在注册后复查 readiness，以同时保证取消清理
-  和关闭 check/register 竞态。
-  Unix stream 的阻塞 `connect` 在 listener backlog 满时通过
-  `event-listener` 等待容量，并用 `SO_SNDTIMEO` 约束等待上限，
-  依赖调度器与可中断任务上下文。
-- **不要求固定当前进程线程才能访问全局状态**：
-  `SERVICE`、`SOCKET_SET` 和 Router
-  的共享访问主要依赖全局锁和原子状态，
-  但 syscall 语义相关路径仍由 `posix/net`
-  负责提供进程文件描述符与凭据语境。netlink `send` 和 socket file
-  `write` 在操作入口取得当前调用者的凭据快照，socket 不缓存权限。
-- **pathname Unix socket 需要文件系统与凭据语境**：
-  用户态 `bind` / `connect` 必须在具有当前线程和 fs context 的任务中调用；
-  不具有当前用户任务的内核调用者必须使用 `bind_with_cred`
-  显式传入凭据，并保证调用环境具有可用的 fs context。
-- **可重入性受全局锁约束**：
-  允许多执行路径并发进入 crate，
-  但同一时刻对 `Service`、`SocketSet`
-  或 listener backlog 的关键访问会被串行化。
+  `init_vsock` installs the available raw transport and registers availability/removal callbacks. `start_vsock_bridge` must run after all scheduler run queues are initialized because it starts bridge tasks. Device availability and removal callbacks take sleepable locks. `publish_kobject_uevent`, `send_link_frame`, and relay operations also allocate or acquire sleepable locks and belong in task context. The periodic `Service::handle_timer_tick` callback uses atomic deadline checks, waiter notification, and IRQ-safe poller scheduling.
 
-## 状态机
+* **Normal protocol processing runs in task context**
 
-### TCP socket 状态
+  Paths such as `poller::assist_once`, socket `send` / `recv` / `connect` / `accept`, and netlink mutations may acquire `Mutex` or `RwLock` objects and may execute relatively heavy data-plane work. These paths must run in normal task context.
 
-`TcpSocket` 使用 `StateLock` 记录用户可见状态，并通过 smoltcp socket 状态完成协议推进。
+* **IRQ handlers only signal RX work**
 
-```text
-Idle ──bind/connect/listen──> Busy
-Busy ──connect pending──────> Connecting
-Busy ──listen ok───────────> Listening
-Connecting ──smoltcp established──> Connected
-Listening ──accept child──────────> Listening
-Connected ──shutdown/close────────> Closed
-Busy ──operation error────────────> previous state
+  A device interrupt handler should only acknowledge the device interrupt, mark RX work as pending, and schedule the `NetRx` softirq. It must not run full protocol processing or blocking socket operations directly.
+
+* **`NetRx` may deliver loopback UDP, but must not call `poller::assist_once`**
+
+  `NetRx` runs in a non-sleepable context.
+
+  For Ethernet devices, it only consumes pending RX sources, wakes the corresponding device RX `PollSet`, and schedules `knet-poller`. The actual data-plane processing then runs in kwork task context and is bounded by the configured number of poll rounds.
+
+  Loopback UDP uses a more direct path. Before BH is disabled, the transmit path validates the UDP packet and stores the source/destination information and payload range in the existing `PacketBuf` control metadata. The same `NetRx` action then drains only these prepared handles from `pending_udp`, looks up the PCB through the `SpinNoIrq` registry, moves the packet into a receive queue with reserved capacity, and wakes the socket waiter. The hot UDP delivery path therefore performs no heap allocation.
+
+  TCP, ICMP, IPv6, fragmented packets, and UDP packets that do not match a socket remain in `deferred`. They are later drained by the task poller through `poll_rx`.
+
+  Code running in softirq context must not call `poller::assist_once` or acquire sleepable locks owned by `Service` or `SocketSet`.
+
+* **Blocking operations depend on poll and waker semantics**
+
+  Blocking socket operations rely on `PollSet`, wakers, and timeout registration.
+
+  `Pollable::register` may register sources only through the caller-provided `PollContext`. The corresponding `PollRegistrations` must remain alive while the operation is in the `Pending` state. The caller must also recheck readiness after registration. This preserves cancellation cleanup and closes the race between the readiness check and source registration.
+
+  A blocking Unix stream `connect` waits for listener backlog capacity through `event-listener` when the backlog is full. The wait is bounded by `SO_SNDTIMEO` and therefore requires scheduler support and an interruptible task context.
+
+* **Global state is not tied to a fixed current process or thread**
+
+  Shared access to `SERVICE`, `SOCKET_SET`, and Router state is mainly protected by global locks and atomic state. Syscall-specific semantics are still provided by `posix/net`, which supplies the process file-descriptor context and caller credentials.
+
+  Netlink `send` and socket-file `write` take a snapshot of the current caller credentials when the operation begins. Credentials are not cached in the socket itself.
+
+* **Pathname Unix sockets require filesystem and credential context**
+
+  Userspace `bind` and `connect` operations for pathname Unix sockets must run in a task that has a current thread and a valid filesystem context.
+
+  Kernel callers without a current userspace task must use `bind_with_cred` to provide credentials explicitly, and the calling environment must still provide a valid filesystem context.
+
+* **Concurrency is limited by global serialization points**
+
+  Multiple execution paths may enter the crate concurrently. Critical access to `Service`, `SocketSet`, and listener backlog state is serialized by their corresponding locks.
+
+
+## State Machines
+
+### TCP Socket State
+
+`TcpSocket` stores `socket::state::State` in `StateLock`. `Idle` permits initial setup, `Busy` serializes a transition, `Connecting` waits for the handshake, `Connected` represents an established endpoint, `Listening` owns a listener entry, and `Closed` records local full shutdown or connection failure. smoltcp maintains the separate TCP wire-protocol state; peer closure alone does not update this local enum.
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+    "fontSize": "15px",
+    "background": "#FAF9F6",
+    "primaryColor": "#F5F2EC",
+    "primaryBorderColor": "#CFC8BD",
+    "primaryTextColor": "#2E2B28",
+    "lineColor": "#9A9187"
+  }
+}}%%
+
+stateDiagram-v2
+    direction LR
+
+    [*] --> Idle
+
+    Idle --> Busy : bind / connect / listen
+
+    Busy --> Idle : bind succeeds
+    Busy --> Connecting : connect starts
+    Busy --> Listening : listen ok
+    Busy --> PreviousState : operation error
+
+    Connecting --> Connected : smoltcp established
+
+    Connecting --> Closed : poll_connect observes failure
+
+    Listening --> Listening : accept child
+    Listening --> Busy : shutdown_inner
+    Busy --> Closed : listener shutdown succeeds
+
+    Connected --> Closed : shutdown Both / drop
+    Closed --> [*]
+
+    state "Previous state" as PreviousState
+
+    classDef initialState fill:#F7E9E2,stroke:#D97757,color:#5C3428,stroke-width:1.5px;
+    classDef activeState fill:#FBFAF8,stroke:#CFC8BD,color:#2E2B28,stroke-width:1px;
+    classDef connectedState fill:#F3F0EA,stroke:#B8AA99,color:#2E2B28,stroke-width:1.2px;
+    classDef closedState fill:#EEE9E1,stroke:#BDAF9F,color:#514A43,stroke-width:1.2px;
+    classDef rollbackState fill:#FFF8F2,stroke:#D9B99B,color:#6A4A36,stroke-width:1px;
+
+    class Idle initialState;
+    class Busy,Connecting,Listening activeState;
+    class Connected connectedState;
+    class Closed closedState;
+    class PreviousState rollbackState;
 ```
 
-| 从 | 到 | 触发条件 |
-|----|----|----------|
-| `Idle` | `Busy` | `StateLock::lock` 赢得状态转换 |
-| `Busy` | `Connecting` | `connect` 成功提交到 smoltcp |
-| `Busy` | `Listening` | `listen` 注册到 `ListenTable` |
-| `Connecting` | `Connected` | `poll_connect` 观察到 smoltcp `Established` |
-| `Connected` | `Closed` | shutdown 或底层状态进入关闭路径 |
-| `Busy` | 原状态 | `StateGuard::transit` 内部操作返回错误 |
+| From | To | Trigger |
+|---|---|---|
+| `Idle` | `Busy` | `bind`, `connect`, or `listen` acquires `StateLock::lock`. |
+| `Busy` | `Idle` | `bind` succeeds and records the local endpoint. |
+| `Busy` | `Connecting` | `connect` starts the smoltcp connection. |
+| `Busy` | `Listening` | `listen` registers the socket in `ListenTable`. |
+| `Connecting` | `Connected` | `poll_connect` observes smoltcp `Established`. |
+| `Connecting` | `Closed` | `poll_connect` observes a state other than `SynSent` or `Established`. |
+| `Connected` | `Closed` | `shutdown_inner` handles `Shutdown::Both`, including the file-drop path. A directional shutdown only changes its shutdown flag. |
+| `Listening` | `Busy` | `shutdown_inner` acquires the listener state lock. |
+| `Busy` | `Closed` | Listener shutdown removes its entry and bound endpoint. |
+| `Busy` | Previous state | The closure passed to `StateGuard::transit` returns an error. |
 
-### Unix stream listener 状态
+Accepted children start in `Connected`; `accept` leaves the listening socket in `Listening`.
 
-```text
-Unbound ──bind──> Bound ──listen──> Listening
-Bound ──connect──> Connected
-Listening ──enqueue/accept──> Listening
-Listening ──shutdown read──> ReceiveShutdown
-Bound / Listening / Connected ──drop──> Closed
+### UDP Socket State
+
+`UdpSocketState::lifecycle` is an `RwLock<UdpSocketLifecycle>` initialized to `Init`. Its setters define these local transitions:
+
+| Update | Resulting state |
+|---|---|
+| `set_local_endpoint(Some(...))` | `Bound`, with a local endpoint recorded. |
+| `set_local_endpoint(None)` | `Init`, with the local endpoint cleared. |
+| `set_peer_endpoint(Some(...))` | `Connected`, with peer filtering enabled. |
+| `set_peer_endpoint(None)` | `Bound` if a local endpoint remains, otherwise `Init`. |
+| `shutdown(Shutdown::Both)` | `Closed`; directional shutdown updates its atomic flag without changing the lifecycle. |
+
+These setters assign the result from their arguments and current endpoint fields. The lifecycle records socket setup and readiness, independently of the PCB's registry membership.
+
+### Unix Stream Listener Lifecycle
+
+The following diagram uses descriptive lifecycle labels, not Rust enum variants. `ListenerState` stores `is_listening`, `is_receive_shutdown`, pending requests, and capacity reservations; the socket binding and optional channel distinguish unbound, bound, and connected endpoints. `listen` enables reception, read shutdown rejects new requests while retaining queued ones, and `close` clears listening state and drains the queue.
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+    "fontSize": "15px",
+    "background": "#FAF9F6",
+    "primaryColor": "#F5F2EC",
+    "primaryBorderColor": "#CFC8BD",
+    "primaryTextColor": "#2E2B28",
+    "lineColor": "#9A9187"
+  }
+}}%%
+
+stateDiagram-v2
+    direction TB
+
+    [*] --> Unbound
+    Unbound --> Bound : bind
+    Unbound --> Connected : connect
+
+    Bound --> Connected : connect
+    Bound --> Listening : listen
+
+    Listening --> ReceiveShutdown : shutdown read
+
+    note right of Listening
+        enqueue / accept
+        stays Listening
+    end note
+
+    Bound --> Closed : drop
+    Connected --> Closed : drop
+    Listening --> Closed : drop
+    ReceiveShutdown --> Closed : drop
+
+    Closed --> [*]
+
+    classDef initialState fill:#F7E9E2,stroke:#D97757,color:#5C3428,stroke-width:1.4px;
+    classDef normalState fill:#FBFAF8,stroke:#D8D1C7,color:#3A3632,stroke-width:1px;
+    classDef activeState fill:#F5F2EC,stroke:#CFC8BD,color:#2E2B28,stroke-width:1.1px;
+    classDef closedState fill:#EEE9E1,stroke:#BDAF9F,color:#514A43,stroke-width:1.2px;
+
+    class Unbound initialState;
+    class Bound normalState;
+    class Listening,Connected,ReceiveShutdown activeState;
+    class Closed closedState;
 ```
 
-`Listening` socket 不能转为 `Connected`。读取方向关闭后保留已经排队的连接，
-阻塞 `accept` 排空队列后返回 `EINVAL`，非阻塞 `accept` 在空队列上返回 `EAGAIN`。
-`Drop` 关闭 listener queue、释放待处理连接并唤醒等待连接或接受连接的任务。
+### vsock Connection State
 
-### rtnetlink 控制面
+With `vsock` enabled, `connection_manager::ConnectionState` records protocol state under each connection's mutex. `Idle` is a bound endpoint, `Listening` owns a listen queue, `Connecting` awaits the peer response, `Connected` permits data transfer, and `Closed` records shutdown or disconnection.
 
-```text
-RTM_NEWLINK ──> Service ──> Router ──> NetDevice link owner
-                                             │
-RTM_GETLINK <──────────── live LinkSnapshot ─┘
+| Origin | Result | Local trigger |
+|---|---|---|
+| New bound endpoint | `Idle` | `VsockStreamTransport::bind` creates the manager entry. |
+| Bound `Idle` endpoint | `Listening` | `listen` registers a listen queue and updates the connection. |
+| New outbound connection | `Connecting` | Stream `connect` or `connection_manager::create_bridge_connection` creates an outbound entry. |
+| Incoming connection request | `Connected` | The manager accepts a request on a listening or bridge port and creates a child entry. |
+| `Connecting` | `Connected` | A `VsockTransportEventKind::Connected` event updates the connection and wakes waiters. |
+| Existing connection | `Closed` | Peer disconnection, raw-transport detachment, or stream shutdown closes the entry and wakes affected waiters. |
 
-init_network ──> Router.ipv4_addrs ──> local / connected routes
-                       │                    │
-RTM_NEWADDR / DELADDR ┘                    ├─> smoltcp Interface / IngressProcessor
-                       │                    └─> NetDevice address projections
-RTM_GETADDR <──────── Router address snapshots
-DELADDR 最后持有者 ────────────────────────> Router 删除失效 prefsrc 路由
-设备移除 ── network_config_lock ──> Service ──> Router 删除设备、地址、路由和邻居
+`VsockStreamTransport` also uses the shared `StateLock` for API admission. Bind performs `Idle -> Busy -> Idle`, listen performs `Idle -> Busy -> Listening`, and connect performs `Idle -> Busy -> Connecting`; a failed guarded operation restores the previous state. Accepted transports start in `Connected`. Subsequent handshake completion and shutdown update the manager's `ConnectionState`; I/O and readiness read that state separately from the transport's admission lock.
 
-init_network / RTM_NEWROUTE / RTM_DELROUTE / SIOCADDRT / SIOCDELRT ──> Router routes
-RTM_GETROUTE <──────────────────────────────────────────────────────── Router route snapshot
-RTM_NEWNEIGH ────────────────────────────────> NetDevice neighbor cache
-RTM_GETNEIGH ────────────────────────────────> 后续范围
+With `vsock_tipc_bridge`, `BridgeConnectionState` tracks the TIPC side in `bridge_connection.rs`:
+
+| Origin | Result | Local trigger |
+|---|---|---|
+| New host-originated entry | `VsockOnly` | `BridgeConnection::new` creates an entry before TIPC attachment. |
+| New TIPC-originated entry | `TipcOnly` | `new_tipc_only` attaches the accepted TIPC channel while outbound vsock is pending. |
+| `VsockOnly` | `TipcConnecting` | `connect_tipc` attaches the channel returned by `ipc_port_connect_async`. |
+| `TipcConnecting` | `Active` | `on_tipc_ready` receives TIPC readiness. |
+| `TipcOnly` | `Active` | `on_connected` receives outbound vsock completion. |
+| `Active` or `TipcSendBlocked` | `TipcSendBlocked` | `tipc_try_send` receives `WouldBlock` while sending the staged record. |
+| `Active` or `TipcSendBlocked` | `Active` | `tipc_try_send` finds no pending bytes or sends the complete staged record. |
+
+`VsockOnly` waits for the dynamic service name on port 0; `TipcSendBlocked` retains one record for retry. `Invalid`, `TipcClosed`, and `Closed` are declared but unused variants. Cleanup removes the entry and closes its channel rather than transitioning through those variants.
+
+### Rtnetlink Control Plane
+
+The rtnetlink control plane provides the interface for querying and modifying network configuration through netlink messages. It handles operations on links, IPv4 addresses, routes, and neighbor state, reads live snapshots from the corresponding network owners, and forwards configuration changes to `Service`, `Router`, or `NetDevice` as appropriate.
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+    "fontSize": "15px",
+    "background": "#FAF9F6",
+    "primaryColor": "#F5F2EC",
+    "primaryBorderColor": "#CFC8BD",
+    "primaryTextColor": "#2E2B28",
+    "lineColor": "#9A9187",
+    "edgeLabelBackground": "#FAF9F6"
+  }
+}}%%
+
+flowchart LR
+
+    CONFIG["init_network<br/>rtnetlink / ioctl"]
+    SERVICE["Service"]
+    ROUTER["Router"]
+
+    LINK["Link state"]
+    ADDR["IPv4 addresses"]
+    ROUTE["IPv4 routes"]
+    NEIGH["Neighbor state"]
+
+    QUERY["RTM_GETLINK<br/>RTM_GETADDR<br/>RTM_GETROUTE"]
+
+    CONFIG --> SERVICE
+    SERVICE --> ROUTER
+
+    ROUTER --> LINK
+    ROUTER --> ADDR
+    ROUTER --> ROUTE
+    ROUTER --> NEIGH
+
+    ADDR -->|"derive"| ROUTE
+
+    LINK --> QUERY
+    ADDR --> QUERY
+    ROUTE --> QUERY
+
+    classDef entry fill:#F7E9E2,stroke:#D97757,stroke-width:1.2px,color:#5C3428;
+    classDef core fill:#EFEAE2,stroke:#B8AA99,stroke-width:1.3px,color:#2E2B28,font-weight:600;
+    classDef state fill:#FBFAF8,stroke:#D8D1C7,stroke-width:1px,color:#3A3632;
+    classDef query fill:#F2F4F1,stroke:#BFC6BC,stroke-width:1px,color:#364238;
+
+    class CONFIG entry;
+    class SERVICE,ROUTER core;
+    class LINK,ADDR,ROUTE,NEIGH state;
+    class QUERY query;
+
+    linkStyle default stroke:#9A9187,stroke-width:1.15px;
 ```
 
-| 从 | 到 | 触发条件 |
-|----|----|----------|
-| 设备 link 配置 | 更新后的设备 link 配置 | `RTM_NEWLINK` 经 `Service::update_device_link` 更新目标 `NetDevice` |
-| 设备 link 配置 | `RTM_NEWLINK` response | `RTM_GETLINK` dump 读取全部 `LinkSnapshot`，单对象查询按接口索引或名称读取匹配快照 |
-| 初始 IPv4 地址条目 | `Router::ipv4_addrs` | `init_network` 通过 `Router::add_ipv4_addr` 注册，Router 同时生成 local 和 connected 路由 |
-| IPv4 地址条目 | smoltcp、IngressProcessor 和设备地址投影 | 地址加入、删除或所属设备移除时由 `Service` 刷新所有派生视图 |
-| 最后一个 IPv4 地址持有者 | `Router` 配置路由 | 地址删除时移除以该地址为 `prefsrc` 的配置路由 |
-| 已移除设备 | `Router` 路由与设备邻居 | `unregister_netdev` 持有 `network_config_lock`，Router 删除该接口的路由和邻居并重编号后续接口索引 |
-| `RTM_GETADDR` | Router 地址快照 | rtnetlink 直接读取 `Service::ipv4_addr_snapshots`，请求携带接口索引时只返回该设备的地址 |
-| 初始路由 | `Router` | `init_network` 直接调用 `Router::add_rule` |
-| `RTM_NEWROUTE` / `RTM_DELROUTE` / `SIOCADDRT` / `SIOCDELRT` | `Router` | 控制面在 Router owner 内完成校验和 mutation |
-| `RTM_NEWNEIGH` | 目标 `NetDevice` | rtnetlink 通过 `Service` 和 `Router` 把更新交给设备邻居表 |
+| From | To | Trigger |
+|---|---|---|
+| Device link configuration | Updated device link configuration | `RTM_NEWLINK` updates the target `NetDevice` through `Service::update_device_link`. |
+| Device link configuration | `RTM_NEWLINK` response | An `RTM_GETLINK` dump reads all `LinkSnapshot` values; a single-object query reads the matching snapshot by interface index or name. |
+| Initial IPv4 address entry | `Router::ipv4_addrs` | `init_network` registers the address through `Router::add_ipv4_addr`; Router also creates the corresponding local and connected routes. |
+| IPv4 address entry | smoltcp, `IngressProcessor`, and device address projections | `Service` refreshes all derived views when an address is added, removed, or its owning device is removed. |
+| Last owner of an IPv4 address | Router configured routes | When the address is removed, configured routes using that address as `prefsrc` are also removed. |
+| Removed device | Router routes and device neighbor state | `unregister_netdev` holds `network_config_lock`; Router removes routes and neighbors associated with the interface and renumbers subsequent interface indices. |
+| `RTM_GETADDR` | Router address snapshot | rtnetlink reads `Service::ipv4_addr_snapshots` directly and returns only the specified device's addresses when the request includes an interface index. |
+| Initial route | `Router` | `init_network` calls `Router::add_rule` directly. |
+| `RTM_NEWROUTE` / `RTM_DELROUTE` / `SIOCADDRT` / `SIOCDELRT` | `Router` | The control plane validates and applies route changes within the Router owner. |
+| `RTM_NEWNEIGH` | Target `NetDevice` | rtnetlink forwards the update through `Service` and `Router` to the device neighbor table. |
 
-### NAPI 风格推进状态
+### Network Data-Plane Poller
 
-```text
-IDLE ──notify──────────────> SCHEDULED
-  ^                              │
-  │                              │ acquire
-  │                              v
-  └──finish without work────── RUNNING ──notify──> RUNNING_PENDING
-                                 │                       │
-                                 └──finish with work─────┴──finish──> SCHEDULED
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+    "fontSize": "15px",
+    "background": "#FAF9F6",
+    "primaryColor": "#F5F2EC",
+    "primaryBorderColor": "#CFC8BD",
+    "primaryTextColor": "#2E2B28",
+    "lineColor": "#9A9187"
+  }
+}}%%
+
+stateDiagram-v2
+    direction LR
+
+    IDLE --> SCHEDULED : notify
+    SCHEDULED --> RUNNING : acquire
+    RUNNING --> RUNNING_PENDING : notify
+    RUNNING --> IDLE : finish without work
+    RUNNING --> SCHEDULED : finish with work
+    RUNNING_PENDING --> SCHEDULED : finish
+
+    classDef idleState fill:#F7E9E2,stroke:#D97757,color:#5C3428,stroke-width:1.4px;
+    classDef normalState fill:#FBFAF8,stroke:#D8D1C7,color:#3A3632,stroke-width:1px;
+    classDef activeState fill:#F5F2EC,stroke:#CFC8BD,color:#2E2B28,stroke-width:1.1px;
+    classDef pendingState fill:#FFF8F2,stroke:#D9B99B,color:#6A4A36,stroke-width:1px;
+
+    class IDLE idleState;
+    class SCHEDULED normalState;
+    class RUNNING activeState;
+    class RUNNING_PENDING pendingState;
 ```
 
-| 当前状态 | 操作 | 下一状态 | 唤醒行为 |
-|----------|------|----------|----------|
-| `IDLE` | `notify` | `SCHEDULED` | queue `knet-poller` work |
-| `SCHEDULED` | `notify` | `SCHEDULED` | 已有唤醒保持有效 |
-| `SCHEDULED` | kwork callback 或 assist 获取执行权 | `RUNNING` | 当前执行者运行一轮或一批有界轮次 |
-| `RUNNING` | `notify` | `RUNNING_PENDING` | 当前执行者完成时负责后续唤醒 |
-| `RUNNING_PENDING` | `notify` | `RUNNING_PENDING` | pending 状态保持 |
-| `RUNNING` | 完成且没有立即工作 | `IDLE` | 无唤醒 |
-| `RUNNING` | 完成且仍有立即工作 | `SCHEDULED` | queue `knet-poller` work 进入下一轮 |
-| `RUNNING_PENDING` | 完成 | `SCHEDULED` | queue `knet-poller` work 进入下一轮 |
-
-`SCHEDULED` 表示已发布待推进工作，`RUNNING` 表示唯一执行者持有执行权，
-`RUNNING_PENDING` 记录执行期间到达的新通知。完成路径通过一次 CAS 同时归还执行权
-并发布 `IDLE` 或 `SCHEDULED`，通知与完成并发时由同一原子修改序列保留事件。
-`SCHEDULED` 状态由 `knet-poller` dynamic kwork 或 socket assist 竞争批次执行权。
-Loopback UDP 独立于 poller 执行权，发送路径在 BH 窗口内完成 xmit 与 `NetRx` 交付。
-`Interface::poll_at` 与 TCP deferred close 共用协议 timer 源，IPv4 重组队列使用独立 timer 源，
-到期后调度 poller 并唤醒正在等待 socket readiness 的任务。
-
-## 算法流程
-
-### 网络初始化
-
-1. `init_network` 创建 `Router`。
-2. 添加 `LoopbackDevice`，由 `Router` 注册 `127.0.0.1/8` 地址并生成 local、connected 路由。
-3. 从 `DeviceContainer<NetDevice>` 取首个 NIC，包装成 `EthernetDevice`，注册默认 IPv4 路由。
-4. 创建 `Service`，初始化内部 `Interface`、`Router`、`IngressProcessor` 和可复用 batch。
-5. Router 直接持有初始路由，设备持有各自的邻居表；IPv4 地址投影由 Router 地址条目生成，link 初始状态由设备构造器建立。
-6. 初始化全局 `SOCKET_SET`、`LISTEN_TABLE` 和 UDP PCB 及异步错误 registry。
-7. 启动 `knet-poller` dynamic workqueue。
-8. Ethernet 硬中断只 raise `NetRx` softirq；softirq 唤醒对应设备 RX `PollSet` 并调度 `knet-poller` work。
-
-### RX 推进
-
-1. `NetRx` softirq 在设备 RX pending 后调用 `NetworkPoller::notify(PollReason::Rx)`，调度 `knet-poller` work；socket recv 和 readiness 路径通过 `poller::assist_once` 尝试执行一次已有工作；TCP、UDP 和 raw TX 生产路径通过 `notify(PollReason::Tx)` 发布工作。TCP 从可编码为零窗口的低余量接收缓冲区消费数据时通过 `notify(PollReason::RxWindow)` 主动重开对端窗口。
-2. 普通 `notify` 在 `IDLE` 上发布 `SCHEDULED` 并 queue `knet-poller` work。执行期间的新工作进入 `RUNNING_PENDING`；kwork callback 和 assist 只有一个能够通过 `SCHEDULED` 到 `RUNNING` 的 CAS。
-3. IPv4 重组 timer 到期后发布独立 pending 状态，`Service` 按 timer budget 消费到期队列，再按 TX budget dispatch 已排队的 control 和 data packet，使 loopback TCP/ICMP TX 在同一轮进入 `NET_RX_QUEUE`；本轮后续 TX dispatch 复用剩余预算。Loopback UDP 不依赖这一轮：`prepare_and_send_ipv4_packet` 对 loopback 目的地址直接 xmit，`send_ip_packet` 在关闭 BH 前盖戳并入 `NET_RX_QUEUE`，raise `NetRx` 后 BH 恢复时把完整 UDP 数据报送入 PCB。
-4. `Router::drain_rx_budgeted_into` 按 RX budget 从设备轮转拉取 `PacketBuf`，`next_rx_device` 在设备间保持公平并随设备删除修正。
-5. `IngressProcessor` 在 Router 和 smoltcp socket-set 锁外校验 IPv4 头、长度、校验和与本地目的地址，并完成 IPv4 分片重组。完整 UDP 数据报直接进入 crate 内 UDP PCB 分流，未命中 socket 的单播 UDP 触发 ICMPv4 Port Unreachable。
-6. TCP、raw IP、ICMP 和 IPv6 packet 保存在可复用 accepted batch 中。按 smoltcp socket-set、Router 的顺序取得两把锁后，`prepare_smoltcp_ingress` 更新 TCP listener 状态并将 batch 转入有界 smoltcp ingress queue；只有 control batch 时跳过 socket-set。锁竞争期间保留 raw、accepted 和 control batch，当前轮返回 `has_more`，后续轮次继续交接。
-7. `Service` 执行 `poll_maintenance`，按 RX budget 逐个调用 `poll_ingress_single`，并调用有界的 `poll_egress`。达到预算或时间边界后，剩余 ingress 保持 FIFO 顺序并进入后续轮次；`ListenTable::refresh_acceptors` 随后刷新收到新报文或仍有 SYN child 的 listener，并唤醒已经可接受连接的等待者。等待中的 SYN child 不进入 `PollProgress::has_more`，后续推进仍由 RX、已有 ingress 或协议 timer 调度。
-8. `Router::dispatch_budgeted` 使用本轮剩余 TX budget 发送协议阶段新增的 packet，随后使用剩余 RX budget 再拉取一次设备队列。该尾部 RX 阶段让 loopback TCP/ICMP 完成 TX 与 smoltcp 交接，同时维持 assist 的单轮边界。
-9. Router、smoltcp socket-set 或 Interface 的共享 mutex 发生竞争时，poller 通过 `try_lock` 直接退让并结束当前轮。已经到期的 IPv4 重组事件遇到 IngressProcessor 竞争时保持 pending 并设置 `has_more`，不中止本轮 TX 与协议推进；尚未到期或不存在重组队列时不获取该锁。RX 交接竞争仍结束当前轮并保留 batch。
-10. `Interface::poll_at` 与 orphan `FIN_WAIT_2` 共用协议 deadline 原子源，IPv4 重组队列通过独立原子源发布最早 deadline 和 pending 状态；`register_timer_callback(TIMER_SAMPLE_PERIOD)` 周期采样两个来源，到期后通过 `notify(PollReason::Timer)` 发布工作。协议 deadline 在轮次末尾使用新的单调时间判断，轮内已经跨过的 delayed-ACK 或重传期限立即进入 `PollProgress::has_more`。
-11. `PollProgress::has_more` 只汇报当前可立即处理的 RX、ingress、TX、锁竞争重试或已到期 timer 工作。每轮 `Service::poll_budgeted` 使用 1 ms 软时间上限，IPv4 重组队列按 timer budget 分批过期，设备 RX、stack ingress、stack egress 和 Router TX 每完成 32 个工作项后检查时间。协议 maintenance 和一次 smoltcp egress pass 始终执行，以维持 timer 与协议输出进度。kwork callback 或 assist 获得批次执行权后最多连续推进四轮，达到轮数上限或清空立即工作后归还执行权，剩余 backlog 通过 `SCHEDULED` 状态进入下一批。
-
-### TX 路由
-
-1. TCP connect、send 和 close，raw send 以及 UDP data queue 提交完成后发布真实 TX 通知；调用方可随后通过 `assist_once` 协助执行已调度的一轮。TCP recv 只在消费前的 smoltcp 接收缓冲区余量低于最大窗口缩放量子时发布 `RxWindow` 通知，覆盖未缩放零窗口和缩放后仍编码为零的窗口。达到缩放量子后的窗口增长随 RX 或已登记的协议 timer poll 推进，避免每次应用读取都创建后台工作。TCP 文件关闭不会立即删除仍处于协议关闭过程中的 handle。
-2. crate 内 UDP 在 Router mutex 内选择处于管理 up 状态的输出设备、源地址和路由 MTU；路由缺失或输出设备管理 down 时返回 `ENETUNREACH`。写入 UDP 与 IPv4 头后，loopback 目的地址立即 `transmit_ipv4_now`；其余目的地址提交到 data TX queue。`transmit_ipv4_now` 忽略 `dispatch_ipv4_packet` 的 RX-ready 返回值：该 `bool` 是 poller 的 `poll_next` 提示，不是发送成败；共享 `NetRx` 队列满时丢包仍返回成功，对齐 Linux `loopback_xmit` 在 `NET_RX_DROP` 时返回 `NETDEV_TX_OK`。smoltcp 生成的 IP 包进入同一 data TX queue，`IngressProcessor` 生成的 ICMPv4 错误进入 control TX queue。入站 ICMPv4 错误携带入接口索引查找 UDP PCB，通过 `SO_BINDTODEVICE` 绑定设备的 socket 只接收来自该设备的错误。
-3. `IP_MTU_DISCOVER` 决定 UDP IPv4 头部的 DF 标志。超出路由 MTU 且允许分片的包由 `fragment_output_packet` 拆分，DF 包返回 `EMSGSIZE`。
-4. `Router::dispatch_budgeted` 优先接管 control packet，再按 IP 版本解析源地址和目的地址；IPv4 输出先按实际长度更新 `total_len` 和头部校验和，并将已校验的源地址随报文传给 `NetDevice`。
-5. 广播或组播包复制到所有设备；`SO_BINDTODEVICE` 会把受限广播限制在绑定网卡上。`0.0.0.0` 到 `255.255.255.255` 的受限广播允许在设备尚未分配 IPv4 地址时直接发送，用于 DHCP 初始化流量。未设置 `SO_BROADCAST` 时，受限广播和本地接口的定向广播发送返回 `EACCES`。
-6. 单播包通过 `RouteTable::lookup` 选择最长前缀路由。
-7. Ethernet 设备先查 ARP neighbor cache，命中后通过 `link::wire` 封装 Ethernet frame。
-8. 未命中时发送 ARP request，并把 IP 包放入 `pending_tx` 等待 neighbor 解析。
-
-当前实现保留 smoltcp TCP、raw socket 和 IPv6 推进。UDP、IPv4 分片重组、输出分片和 ICMPv4 UDP 差错报告使用 crate 内实现。
-`PacketBuf`、`link::wire` 和 `stack::ipv4` 提供设备与 crate 内 IPv4/UDP 数据路径共用的报文表示和 parser/emitter。`PacketBuf` 对应 Linux `sk_buff` 的报文生命周期角色：报文进入网络栈时创建引用计数句柄，后续队列只移动或克隆该句柄；需要修改共享报文时执行写时复制。
-路由表和设备接口使用 `crate::ip` 地址类型，设备时间使用 `ktime::MonotonicInstant`。
-`Router`、`Service` 和初始化入口在 smoltcp 兼容边界完成地址与时间转换。
-
-### TCP listen 和 accept
-
-1. `TcpSocket::listen` 把本地 endpoint 注册到 `ListenTable`。
-2. `IngressProcessor` snoop 首个 SYN 包，并调用 `ListenTable::incoming_tcp_packet`。
-3. `ListenTable` 为新连接创建一个 smoltcp TCP socket，放入 SYN 队列。
-4. 后续 poll 观察到连接可接受后移动到 accept 队列。
-5. `TcpSocket::accept` 取出 `AcceptedTcp`，构造新的 connected `TcpSocket`。
-6. POSIX 层通过 `AcceptOptions` 传入监听文件的 nonblocking 状态；accept 队列为空时，
-   nonblocking 调用返回 `WouldBlock`，由用户态 poll/epoll 负责等待下一次可读事件。
-
-### Unix pathname bind 和 connect
-
-1. 用户态 `SocketOps::bind` 在操作入口获取一次当前线程的 `Arc<Cred>` 快照，并计算
-   `0777 & !umask`，随后调用 `bind_with_cred`。
-2. `bind_with_cred` 使用同一份 `&Cred` 和明确 mode，通过 `parent_at` 与 `Path::mknod`
-   排他创建 socket inode；任意已有路径都映射为 `EADDRINUSE`，不会复用已有 socket inode。
-3. kvfs 负责检查每一级目录的 search 权限、父目录的 write/search 权限，并以
-   `fsuid` / `fsgid` 初始化新 inode 的属主。
-4. 不具有当前用户任务的内核调用者显式传入凭据和 mode；例如 devfs 创建 `/dev/log`
-   时传入 `initial_cred()` 与 `0755`，不尝试读取不存在的当前线程凭据。
-5. pathname `connect` 和 datagram `sendto` 在操作入口获取凭据；kvfs 使用该快照完成
-   全路径查找，并要求最终 socket inode 具有 `MAY_WRITE` 后才查询内存 binding。
-6. abstract 地址不进入 VFS，因此不执行 pathname DAC 检查。
-
-### Unix stream listen、connect 和 accept
-
-1. `listen` 把 backlog 转为 `min(backlog + 1, LISTEN_QUEUE_SIZE)` 个待处理名额。
-   该计数对应 Linux 6.8 `unix_recvq_full_lockless` 在入队前检查现有队列长度是否大于 backlog 的规则。
-2. `connect` 从 binding 中克隆 `ListenerQueue` 后立即释放 binding slot 锁。
-   abstract binding 表和 pathname 文件系统上下文锁也在进入 transport 前释放。
-   非阻塞调用在队列满时返回 `EAGAIN`。阻塞调用通过 `capacity_available` 等待
-   `accept`、backlog 增加、shutdown 或 listener 关闭，等待受 `SO_SNDTIMEO` 约束：
-   未设置或超时值为 0 时无限等待，有限超时到期后重试一次并在仍无容量时返回 `EAGAIN`。
-   等待可被信号打断。
-3. 队列先预留名额，再分配两个 64 KiB ring。预留由 `ListenerReservation` 管理，
-   连接被中断或源 socket 状态检查失败时自动归还名额。
-4. 源 socket 已经连接时返回 `EISCONN`，源 socket 已进入监听状态时返回 `EINVAL`。
-   pathname 或 abstract 地址没有存活的 stream listener 时返回 `ECONNREFUSED`。
-5. `accept` 从 FIFO 队列取出请求并归还一个待处理名额。读取方向 shutdown 会唤醒
-   `accept` 和等待容量的 `connect`，已经排队的请求仍按 FIFO 交付。
-6. 零长度 stream `recv` 在接收 ring 中存在数据时返回 0 且不消费数据；空 ring 继续遵循
-   阻塞、`EAGAIN`、EOF 和待处理错误语义。
-
-### rtnetlink 请求
-
-1. POSIX send 路径和 socket file write 路径先区分协议，仅在 netlink 分支取得当前
-   调用者的 `Cred` 快照，通过 `Socket::send_with_cred` 传给 `NetlinkSocket`。
-2. `NlMsgHeader::read` 校验每条 netlink message 的 header 长度。批次拆分按
-   `NLMSG_ALIGN(nlmsg_len)` 推进；剩余不足一个 header、`nlmsg_len` 小于 header
-   或大于剩余字节时停止，已处理消息不回滚，也不要求尾部填充为零。
-3. 仅含查询的批次逐条生成 response；仅含 mutation 的批次在检查完整批次的
-   response queue 空间后逐条执行；混合查询和 mutation 的批次在修改状态前返回
-   syscall `EOPNOTSUPP`。
-4. 每条 mutation 使用本次发送携带的凭据检查权限。跨 socket mutation 与设备移除通过 `network_config_lock` 串行化，地址存在性判断、地址更新和依赖的 Router 路由清理处于同一事务作用域。无权限请求生成带 `EPERM`
-   的 `NLMSG_ERROR`，response 入队后发送入口返回已消费的请求长度。
-5. 带 `NLM_F_DUMP` 的 `RTM_GETLINK` 从设备实时快照生成 multi-part response；单对象查询优先按 `ifi_index`、其次按 `IFLA_IFNAME` 返回一个匹配快照，成功且请求带 `NLM_F_ACK` 时在 `RTM_NEWLINK` 后追加 `NLMSG_ERROR(error=0)`。`RTM_NEWLINK` 在整组名称、MTU 和 flags 校验通过后直接更新目标设备。
-6. `RTM_GETADDR` 从 Router 地址快照生成 multi-part response，请求携带 `ifa_index` 时只返回该设备的地址；`RTM_NEWADDR` 和 `RTM_DELADDR` 直接调用 Router 地址 mutation，失败时返回 netlink error。重复地址策略在 Router 锁内判定；最后一个同值地址删除后，`RTM_DELADDR` 同时清理 Router 中以该地址为 `prefsrc` 的配置路由。
-7. `RTM_GETROUTE` 和 route mutation 直接访问 Router，neighbor mutation 直接访问目标设备的邻居表，create/replace 判定与更新在同一 Router 临界区完成，带 `NLM_F_ACK` 时返回 ack。未识别的 route attribute 按 Linux `rtm_to_fib_config` 跳过，不返回 `EOPNOTSUPP`。
-8. 传统 ioctl `SIOCGIFADDR`、`SIOCSIFADDR`、`SIOCSIFNETMASK`、`SIOCSIFBRDADDR`、`SIOCADDRT` 和 `SIOCDELRT` 同样进入 Router / 设备 owner。`SIOCGIFADDR` 在单次 Router 锁内按接口名解析设备并读取主地址，未知设备返回 `ENODEV`，无地址返回 `EADDRNOTAVAIL`。`SIOCSIFADDR` 的 classful 前缀对齐 Linux 6.8 `inet_abc_len`：仅 `0.0.0.0` 和有限广播使用前缀 0，其余 `0.x.x.x` 走 class A `/8`。地址设置直接更新 Router 中的主地址条目，其余地址保持不变；`SIOCSIFADDR 0.0.0.0` 只删除主地址，供 DHCP deconfig 流程使用。`SIOCSIFNETMASK` 直接更新主地址前缀并保留 scope 和自定义 broadcast。`SIOCDELRT` 在未给出 `rt_dev`、未设置网关或网关为 `0.0.0.0` 时按 Linux `fib_nh_match` 通配对应字段，因此 BusyBox 的 `route del default gw 0.0.0.0 dev eth0` 可以删除旧默认路由。`SIOCSIFFLAGS` 当前只应用 `IFF_UP`，其余接口标志不改变设备状态。
-9. netlink 数据报接收遵循 `MSG_PEEK` 与 `MSG_TRUNC` 语义，短缓冲区复制可容纳部分并通过输出 flags 报告截断。iproute2 先用零长度缓冲与这两个 flags 探测完整消息长度，再分配缓冲读取消息；dump 结束的 `NLMSG_DONE` 携带值为 0 的整数状态载荷，供 iproute2 检查完成状态。
-
-## 并发模型
-
-- 全局 `SERVICE` 是 `LazyInit<Service>`。`Service` 内部分别使用 mutex 保护 smoltcp `Interface`、`Router`、`IngressProcessor` 和可复用 batch。poller 对前三类共享状态使用 `try_lock`，竞争时保留 batch 并返回立即工作；可复用 batch 只由取得全局推进权的执行者访问。网络 timer deadline 使用 `AtomicU64` 保存，周期采样回调只执行原子检查、waiter 唤醒和 poller 通知。
-- `NetworkPoller` 通过 `kwork::BudgetedPoller` 保存 `IDLE`、`SCHEDULED`、`RUNNING` 和 `RUNNING_PENDING` 四态执行权。kwork 后台批次预算为 512 个 RX packet、256 个 TX packet 和 32 个 timer event，socket assist 预算为 16、16 和 8。每轮受 1 ms 软时间上限约束，每个批次最多连续执行四轮，每次 assist 最多执行一轮；达到批次上限后 queue 下一批并归还执行权。
-- RX 设备拉取和 TX dispatch 位于 Router 锁内，IPv4 校验、过滤和 UDP 分流位于 Router 与 smoltcp socket-set 锁外。TCP snoop 在 accepted batch 已同时取得 Router 与 socket-set 后执行，避免 listener side effect 与 batch 交接分离。smoltcp ingress queue 有固定容量，`poll_ingress_single` 每次消费一个 packet，预算、时间边界或共享锁竞争留下的 packet 在后续轮次继续推进。
-- 全局 `SOCKET_SET` 内部使用 `Mutex<SocketSetState>`，其中的 smoltcp socket set 与 TCP deferred-close 元数据共享同一所有权锁。关闭、登记、协议推进和回收不会跨两个 mutex 交接 handle。
-- `UDP_PCB_REGISTRY` 按端口分为 256 个 bucket，每个 bucket 使用 `SpinNoIrq`，因为 `NetRx` 会在 softirq 中 lookup；每个 UDP PCB 的接收队列和 connected peer 同样是 `SpinNoIrq`，bind/connect 的 sleepable 状态更新放在 bucket 锁外。接收队列保存指针大小的 `PreparedUdpPacket`，其内部仍是报文进入网络栈时创建的 `PacketBuf` 句柄。数据报校验、地址与 payload range 解析发生在 loopback 发送侧进入 BH 前或普通 task ingress 中，结果写入同一报文的控制元数据；PCB 创建时按 1024 槽预留 `VecDeque` 容量，对齐 Linux `__udp_enqueue_schedule_skb` 在 `sk_receive_queue.lock` 下只 `__skb_queue_tail` 已有 `skb`。`enqueue` 在 softirq 与 `SpinNoIrq` 内只做占用检查和已有句柄拼接，满队列分支先释放队列锁，再回收当前报文；`MSG_PEEK` 只在锁内增加 `PacketBuf` 引用计数，payload 复制在 `SpinNoIrq` 外完成。共享 `NET_RX_QUEUE` 也使用 `SpinNoIrq`，由 loopback xmit、`NetRx` 和 task `poll_rx` 共用；`pending_udp` 与 `deferred` 都只保存指针大小的 `PacketBuf`，前者供 `NetRx` 按 budget 顺序取出盖戳 UDP，后者供任务 poller 取出其他报文。占用按两条队列长度与 in-flight 合计，避免在 PCB 交付期间被生产者填满腾出的槽。未命中 PCB 的 UDP 必须仍由该路径唯一持有句柄，清除元数据后放入 `deferred`。
-- `Ipv4Reassembler` 位于 `Router` 内，并由 `SERVICE` mutex 串行访问。
-- `LISTEN_TABLE` 用 `Mutex<HashMap<...>>` 管理 listener；每个 entry 的 `accept_poll`
-  放在 entry 级 `Mutex` 之外，backlog 队列仍由该 `Mutex` 保护。`register_accept_waker`
-  先无锁注册到 `accept_poll`，再短持锁做 readiness recheck，避免在队列锁内做
-  `Waker::clone` / `PollSet` 工作，同时保留 register-recheck。poller 刷新收到新报文或
-  SYN 队列非空的 entry，确保 child 在后续 ingress 或 timer poll 中进入可接受状态后从
-  SYN 队列移入 accept 队列；`accept_poll` 唤醒发生在 entry 锁释放后。
-- TCP 状态转换使用 `StateLock` 的 atomic CAS，失败时返回当前状态。
-- socket option 和 shutdown 标志使用 atomics，跨线程读写只表达配置或关闭状态。
-- Unix stream 的 `channel: Mutex<Option<Channel>>` 串行化同一 endpoint 发起的 connect 最终提交、send、recv、shutdown 和 channel 释放。
-- Unix stream listener 的 `ListenerState` 在独立 mutex 下保存 FIFO pending queue、
-  容量预留数、backlog 上限、监听状态和读取 shutdown 状态。`request_available`
-  与 `capacity_available` 分别唤醒 `accept` 和阻塞 `connect`。binding slot 锁只用于克隆
-  listener 引用，不跨容量等待；固定锁序为 `channel`、listener handle、`ListenerState`。
-- Unix stream 每个 endpoint 的 `tx_order: SpinNoPreempt<()>` 是对应发送方向的共享排序点。本端 write shutdown、对端 read shutdown、write index 发布和对端空队列 EOF 判定都经过该锁。固定锁序为 `channel` mutex 后取得单个 `tx_order`，两个方向的顺序锁不会同时持有。
-- Unix stream 的 listener event 通知在 `ListenerState` 和源 socket `channel` 锁外执行；用户数据复制和 `PollSet` 唤醒在 `tx_order` 外执行。send 先写入未发布的 vacant 区域，再在锁内复检关闭状态并推进 write index；recv 读取为空后在锁内复查 occupied 长度和关闭状态；shutdown 完成状态发布并复制 peer endpoint 引用后释放 `channel` mutex，再执行 waiter 唤醒。
-- Unix stream 每个 endpoint 分别持有 readable、writable 和 connection-state 三组 `PollSet`。写入只唤醒 peer readable waiter，读取跨过发送缓冲低水位时只唤醒 peer writable waiter，半关闭只唤醒受影响方向，完整关闭通过 connection-state waiter 通知双方。
-- Router 直接持有配置路由、地址派生路由和动态选源状态，设备直接持有邻居表，netlink 仅承担协议解析、实时快照编码和 owner 调用。`control::network_config_lock` 串行化不同 socket 的控制面 mutation、legacy socket ioctl mutation 和 `unregister_netdev`。每个 socket 的发送事务、rx queue 和 subscriber 列表使用独立 `Mutex`。发送事务锁串行化同一 socket 的容量预检、mutation 执行和 response 入队。response 在 rx queue 锁外生成，只在容量检查和入队时持锁；锁顺序固定为发送事务锁、`network_config_lock`、Router、ingress、Interface、netlink rx queue，未涉及的锁按该序列跳过。
-- `GeneralOptions` 使用唯一的 `bound_dev_if: AtomicI32` 保存设备绑定。UDP 接收匹配与发送、TCP/raw 的 RX 设备选择通过 Relaxed 读取取得设备编号，单字段读取允许观察并发更新前或更新后的值。绑定与解绑通过原子交换更新，实际变化后调用 `device_binding_changed: PollEvent` 广播通知；事件版本的 Release/Acquire 发布先前的标量更新。交换后尚未通知的写入会在通知时唤醒已注册 waiter。RX 注册先读取事件版本，再读取设备编号并注册设备源和配置事件，最后复查版本；注册窗口内的变化触发当前 waiter 重查，等待期间的变化触发重新注册。每轮 `PollRegistrations` 替换旧设备注册，取消或结束等待同时撤销配置事件订阅。重复写入相同设备编号保持静默。
-- TCP 与 raw IP 的 RX waker 由 `GeneralOptions::rx_device_mask` 选择设备。显式 `SO_BINDTODEVICE` 选择对应设备，默认与解绑状态选择全部设备。socket 地址与路由变化保持 RX 选择独立，报文交付由协议接收路径过滤。`Service::register_rx_waker` 使用调用方传入的同一个 `PollContext` 注册聚合 `timeout_poll` 和支持 interrupt-driven RX 的 Ethernet RX poll source；当前该 poll source 由 `NetRx` softirq 在设备 pending 后唤醒，TCP 与 raw IP 的 waiter 可以通过该 source 被唤醒，后台协议推进则由同一 softirq 调度的 `knet-poller` work 执行。registration 由跨越 `Pending` 的 `PollRegistrations` 统一管理。loopback 和未 attach `NetRxScheduler` 的 Ethernet 设备仍使用 `timeout_poll` 的聚合 waker，多任务广播由 `timeout_poll` 完成；设备层只接收 `Service` 提供的聚合 source waker。
-- UDP 纯接收等待只订阅 `UdpSocketWaiters` 的 socket 事件，接收队列入队、异步错误和读关闭分别唤醒对应 waiter。地址绑定和 `SO_BINDTODEVICE` 在 UDP lookup 中过滤报文，绑定变化期间原有接收订阅保持有效。Ethernet RX softirq 独立调度 `knet-poller`，loopback 完整 UDP 在 `NetRx` 或发送路径的 task fallback 中入队；其余 loopback 工作由发送方的 TX 通知推进，协议及分片重组 timer 到期后独立通知后台 poller。接收 waiter 因此与设备 RX 广播及聚合 `timeout_poll` 解耦，同一设备上其他 socket 的流量也保持隔离。发送等待继续订阅网络进展事件，包含读写两个方向的等待保留 TX 所需的设备和 timer 订阅。所有 socket 事件注册由 `PollRegistrations` 持有，并在注册后复查就绪状态。
-- 每次 `Interface::poll` 也会刷新独立的协议 timer，使 TCP 重传等 deadline 不依赖阻塞中的 socket waiter。
-
-## 设计决策
-
-### UDP 与 IPv4 数据路径迁出 smoltcp
-
-UDP PCB、bind 冲突检查、收发队列、IPv4 校验、分片重组、输出分片和 ICMPv4 差错均由 crate 内类型管理。
-TCP、raw IP、IPv6 和 DNS 继续通过 smoltcp socket set 推进，协议推进依赖 NetRx softirq 调度的 `knet-poller` work、TX/timer 后台 poller 调度和显式 `poller::assist_once` assist。
-该边界让 UDP 不再依赖 smoltcp socket handle，同时保留现有 TCP 和 raw socket 行为。
-
-### NAPI 风格预算推进
-
-NetRx softirq、socket TX 生产路径、协议 timer 和 socket assist 共享同一个 `NetworkPoller`。`notify` 使用状态低位发布 pending 工作，`SCHEDULED` 到 `RUNNING` 的 CAS 提供单执行者约束，完成 CAS 同时归还执行权并发布下一状态。执行期间到达的通知把状态变为 `RUNNING_PENDING`，完成路径据此发布 `SCHEDULED` 并 queue `knet-poller` work。assist 在 `IDLE`、`RUNNING` 和 `RUNNING_PENDING` 上直接返回，不创建事件，也不等待执行权。
-
-Loopback UDP 不经过 poller 所有权交接：发送路径对齐 Linux `dev_queue_xmit`（BH off）→ `loopback_xmit` → `__netif_rx` → `local_bh_enable` 跑 `NET_RX_SOFTIRQ`。完整 IPv4 UDP 在 BH 窗口内进入 PCB；TCP/ICMP/IPv6 仍由 poller 的 TX-then-RX 轮次交接。
-
-RX、TX 与 timer 使用独立预算。`Service` 使用 smoltcp 分阶段 API 约束 stack ingress 和 egress，并使用 1 ms 软时间上限控制单轮占用。TX budget 在协议推进前后共享，RX budget 在主 RX 和尾部 RX 之间共享；该顺序让 loopback TCP/ICMP 在一次 assist 内完成设备往返。Router、Interface 和 socket-set 竞争会结束当前轮并设置 `has_more`；只有已经发布 pending 的 IPv4 过期事件才尝试 IngressProcessor 锁，竞争时保留 pending 且继续本轮 TX。到期队列按 timer budget 分批消费，剩余事件进入后续轮次。执行者继续沿四态状态机释放推进权。control TX 优先于 data TX，避免 ICMP 错误和协议控制流量长期滞后。TCP send 可写快路径向 smoltcp socket buffer 写入数据并发布 TX 通知，连续发送由 poller owner 在有界批次内完成协议推进和 TX dispatch。TCP recv 在消费前接收缓冲区余量低于最大窗口缩放量子时发布 `RxWindow` 通知，释放 socket-set mutex 后由 poller 推进窗口更新；达到缩放量子后的接收窗口增长复用 RX 和已登记的 timer 推进。TCP 和 raw socket 直接向 smoltcp 注册聚合 send waker；Router data TX queue 的可用 packet slot 实际增加时，`PollProgress::tx_capacity_changed` 触发 poller TX waiter 唤醒。协议与 deferred-close deadline、IPv4 重组 deadline 使用独立原子源，周期采样回调到期后唤醒 socket waiter，并以 `PollReason::Timer` 通知 poller。
-
-### 控制面状态所有权
-
-link 配置属于设备：接口名、MTU、管理 up 状态、operstate 和硬件地址通过 `NetDevice::link_snapshot` 统一导出，`RTM_GETLINK` 和 `RTM_NEWLINK` 直接访问该来源。AF_PACKET 热路径在单个 `SERVICE` 锁临界区内通过无分配的 `LinkSendSnapshot` 校验 up 状态、MTU 和硬件地址并发送，设备存在性检查使用 `has_device`，路由 MTU 查询直接读取匹配设备。设备配置或移除改变有效 MTU 时重建 smoltcp `Interface`，使缓存的 `DeviceCapabilities` 与设备集合一致；未改变有效 MTU 的配置更新保留当前 `Interface` 及其运行时缓存。
-
-IPv4 地址条目由 `Router` 保存。每个条目包含设备索引、IPv4 CIDR、scope 和可选的 `ifa_broadcast` 覆盖值；未覆盖时广播地址由 CIDR 推导。加入条目时检查设备、单播地址和 smoltcp 地址容量。legacy ioctl 的地址和 netmask 更新在该 owner 内定位并修改主地址条目，保留同设备的其他地址；netmask 更新保留 scope，并只在旧 broadcast 属于掩码推导值时重新推导。Router 为每个条目生成 `/32` local 路由，并按地址网络生成 connected 路由；地址删除同时移除派生路由、失效首选源路由和设备 pending TX。`Service` 将 Router 地址投影到 smoltcp `Interface`、`IngressProcessor` 和设备，Ethernet 根据设备地址处理 ARP、定向广播和待解析报文。配置路由由 Router 持有，`RTM_NEWROUTE` / `SIOCADDRT` 在 Router 内校验网关必须落在出接口 IPv4 子网且不是定向广播。Ethernet 设备直接保存邻居表，路由和邻居 mutation 均访问各自 owner。设备移除由 `unregister_netdev` 在 `network_config_lock` 下交给 Router，统一清理路由、地址和设备邻居并重编号后续接口索引。
-
-### pathname Unix socket 显式传递凭据
-
-Linux 可从任务上下文隐式读取 `current_cred()`，但 knet 也服务于启动期内核调用者。
-因此用户态入口只在操作开始时获取一次凭据快照，pathname VFS 路径继续显式接收 `&Cred`；
-内核调用者通过 `bind_with_cred` 选择明确的凭据。
-凭据不保存在 Unix socket、pathname lookup 状态或 dentry 中，避免凭据生命周期与路径状态耦合。
-`sock_alloc_file` 也显式接收 `Arc<Cred>`，只把它交给 `VfsFile::f_cred`；socket 对象不保存
-第二份 credential，也不在 knet 内部读取当前 task。
-
-### rtnetlink 每次发送传递凭据
-
-netlink socket 可以跨进程传递，创建 socket 时保存的凭据无法代表后续发送者。
-POSIX send 和 socket file write 在各自入口区分协议，仅在 netlink 分支获取一次
-当前凭据快照，随后通过 `Socket::send_with_cred` 显式传给 rtnetlink 权限检查。
-普通协议继续使用 `SocketOps::send`，调用者凭据不会扩大到不依赖权限的传输实现。
-没有当前用户任务的内核调用者通过 `send_with_cred` 显式选择凭据。
-
-### 设备 mask 驱动 RX 唤醒
-
-每个 socket 根据 `SO_BINDTODEVICE` 派生 RX 设备 mask，默认与解绑状态选择全部设备。
-等待 RX 时只向相关设备注册 waker，同时注册 smoltcp poll timeout。
-smoltcp `poll_at` 使用传入 timestamp 的同一 epoch 返回期限；兼容边界在
-`SmoltcpInstant` 与 `MonotonicInstant` 之间直接映射时间点。过期的 smoltcp deadline
-因此仍是过期的单调 deadline，不再计算有符号 delay，也不会经过 `as u64` 窄化。
-显式设备绑定收窄设备 RX 订阅；默认状态接受额外的无关设备唤醒，并由实际 readiness 决定用户可见事件。地址绑定、连接与路由变化保持设备选择独立。UDP 已在 demux 检查绑定设备，TCP/raw 的绑定设备过滤及 IPv6 scope 完整语义仍属单独的协议兼容性工作。
-
-### 后续 Ethernet NetRx direct progress 里程碑
-
-Loopback IPv4 UDP 已经由 `NetRx` 直接交付 PCB。Ethernet 以及需要 smoltcp 的
-协议仍不在 softirq 中推进。那部分应作为独立里程碑实现：
-
-1. hardirq 仍只做设备 ack 和 `NetRxScheduler::schedule_rx()`；
-2. `NetRx` softirq 先按 NAPI-like source state 认领 Ethernet RX work；
-3. 若需要 sleepable 网络栈路径，softirq 只投递 workerqueue work，不直接调用
-  `poller::assist_once`；
-4. worker 或全链路 nonblocking ingress 负责按 budget 推进 `Router` /
-   `Service` receive path，并在数据入 socket queue 后唤醒 socket waiter；
-5. 该里程碑必须同时定义 RX buffer ownership、budget/repoll、cancel/flush 和
-   device teardown 语义。
-
-在该里程碑开始前，Ethernet `NetRx` 保持 per-device RX `PollSet` wake source
-角色，同时通过 `knet-poller` work 承接 sleepable fallback progress；普通 socket
-polling waiter 也可能是该 source 的消费者。
-
-### TCP listen 表独立于 smoltcp listener socket
-
-监听 socket 和 accepted child socket 分开管理。
-`ListenTable` 根据收到的 SYN 创建 child smoltcp socket，把待完成连接放入 backlog 队列。
-这个设计让 POSIX accept 语义集中在 knet 内部，代价是 listen table 必须 snoop TCP 首包、清理 aborted child，并在 child 保留于 SYN 队列期间随每次实际网络推进重新检查状态。SYN 队列本身不会请求连续 poll，协议 deadline 到期前不会形成空转。
-
-### Unix stream 按 readiness 类别隔离 waiter
-
-Unix stream 的双向 channel 为两端保存独立的 `StreamEndpoint`，endpoint 通过 atomic 记录本地读写关闭状态和待处理连接错误，并通过 `StreamPollSets` 分别维护 readable、writable 和 connection-state waiter。监听状态与 pending queue 由 `ListenerQueue` 保存，连接请求到达后复用 endpoint readable 集合。读取事件只注册到 readable，写入事件只注册到 writable，仅请求连接状态的 waiter 注册到 connection-state，避免同一方向重复占用多个固定容量集合。数据进入 ring buffer 时只通知对端读取者，接收端读取数据使发送缓冲占用量从容量四分之一以上降到四分之一以下时通知对端写入者。连接的接收和发送方向均关闭或 endpoint 被释放时同时通知三个集合，使所有受连接状态影响的等待者重新检查 readiness。
-
-每个 `StreamEndpoint` 还保存本端发送方向的 `tx_order`。send 只在该锁内提交 write index，shutdown 只在对应方向锁内发布关闭状态，peer recv 只在同一锁内完成空队列和 EOF 的最终判定。该顺序保证已经发布的数据先于 EOF 被观察，关闭状态先取得方向锁时后续 send 返回 `BrokenPipe`。阻塞 send 已发布部分数据后遇到关闭时返回已发送字节数。非阻塞 send 在已有发送进度时返回部分字节数，零进展且 ring buffer 已满时返回 `WouldBlock`；连接存在且双方对应方向保持打开时，零长度发送返回 0。绑定只保留 Unix 地址，`listen` 单独开启连接接收；listener queue 的硬上限为 `LISTEN_QUEUE_SIZE`，每个请求的 ring 只在容量预留成功后分配。监听端关闭读取方向后拒绝新连接，并保留已入队连接供 `accept` 取出。
-
-### Ethernet ARP pending queue
-
-Ethernet 设备为未解析 next-hop 保留 `pending_tx`。
-同一个 next-hop 的 ARP 回复到达后，设备按队头顺序发送等待中的 IP 包。
-当前队列存在 head-of-line blocking，长时间 unresolved 的 next-hop 会阻塞后续 pending 包。
-
-### vsock-TIPC bridge
-
-`vsock_tipc_bridge` feature 打开时，`bridge` 是 `VSOCK_CONN_MANAGER` 的消费者，与 AF_VSOCK 共用同一个连接管理器，但不再直接操作 `VsockDevice`：
-
-- `net/knet` 的 `init_vsock()` 从 kclass 拿到原始 virtio-vsock 设备后，
-  通过 `connection_manager::register_vsock_dev()` 把它安装到 `VSOCK_CONN_MANAGER`；
-- `VSOCK_CONN_MANAGER` 同时负责：
-  - 维护连接表、监听表、credit、bridge 事件队列；
-  - 驱动原始 RX virtqueue 轮询（`poll_event()`）；
-  - 对非桥接端口执行 accept/force_close、把数据写入连接接收缓冲、更新 credit；
-  - 对桥接端口/桥接连接把高层事件（`ConnectionRequest`/`Connected`/`Received`/`Disconnected`/`CreditUpdate`）
-    推入 bridge event queue，由 `bridge::rx_task` 通过 `pop_bridge_event()` 消费；
-- AF_VSOCK 通过 `connection_manager` 的 socket-facing helper 调用 manager，
-  不再经过任何 device facade；
-- `bridge::init()` 向 `VSOCK_CONN_MANAGER` 注册 `BRIDGE_PORT_MAP` 端口（0-4），
-  由 manager 监听并把桥接事件排队；
-- bridge 通过 `VSOCK_CONN_MANAGER` 的 bridge API 发送/接收/关闭连接：
-  `listen_bridge_port`、`send_bridge`、`recv_bridge`、`create_bridge_connection`、
-  `disconnect_bridge`、`abort_bridge`。
-
-host-to-TA 方向使用固定端口映射：
-
-- port 0：动态 service-name handshake（见下节）。
-- port 1：`com.android.trusty.keymint`
-- port 2：`com.android.trusty.gatekeeper`
-- port 3：`com.android.trusty.vsock.forwarder`
-- port 4：`com.android.trusty.widevine.transact`
-
-#### Port 0 动态 handshake 协议
-
-Trusty-compatible dynamic bridge 在 host 连上 vsock port 0 后按 record 语义工作：
-
-1. Host 发送**第一个 vsock record**：UTF-8 TIPC service path（无 NUL 终止），长度不超过 `IPC_PORT_PATH_MAX`。
-2. Guest bridge 对该 path 调用 `ipc_port_connect_async(..., WAIT_FOR_PORT | ASYNC)`：
-   - 若 service **尚未 publish**，channel 保持 `Connecting`，**不**向 host 回包；等 TA publish 且 TIPC READY 后再继续。
-   - 若 service **已存在**或随后 publish 成功，bridge 在 TIPC READY 后向 host 发送单字节状态码 `[0]`，此后双方按 record 转发 payload。
-3. 下列情况 guest 发送 `[1]` 并关闭 vsock（**明确拒绝**，不同于“等待 publish”）：
-   - service name 非法（UTF-8 / 长度 / 内容校验失败）；
-   - 读取 service name record 失败；
-   - TIPC channel 在 `TipcConnecting` 阶段收到 `HUP` / `ERROR`（例如 port 存在但拒绝连接）。
-4. Host 侧（`libtrusty`）在发出 service name 后阻塞读取状态字节；应设置 recv 超时（`TRUSTY_VSOCK_TIMEOUT_SEC`，默认 60s）。超时或 EOF 视为连接失败。收到 `[1]` 映射为 `-EIO`。
-5. 若 service **永远不存在**，guest 会一直等待 publish，host 在 recv 超时后失败——负例测试依赖该超时，而非 `[1]`。
-
-固定端口（1–4）在 vsock 连接建立时即 `WAIT_FOR_PORT | ASYNC` 连到预置 TIPC service，不使用上述单字节 handshake。
-
-TA-to-host 方向发布 `com.android.trusty.vsock.forwarder` TIPC port，并把 accepted channel 连接到 host CID 2 port 0。
-反向连接由 `VSOCK_CONN_MANAGER::create_bridge_connection()` 申请一个临时端口并发送 vsock connect，
-bridge 在收到 `Connected` 事件后把 channel 加入 handle set。
-
-vsock `Received(conn_id, len)` 事件由 bridge 以 record 语义处理：
-bridge 分配 `len` 大小的临时 buffer 并调用 `recv_bridge(conn_id, &mut buf[..len])` 读完整 record，然后把该 record 作为一个 TIPC message。
-如果 TIPC send 返回 `WouldBlock`，bridge 只保留一条 pending record 并等待 `SEND_UNBLOCKED` 后重试。
-TIPC 到 vsock 方向按 `get_msg -> read_msg -> put_msg -> send_bridge` 转发；
-`send_bridge` 在 vsock credit 耗尽时阻塞等待 `CreditUpdate`（通过 `tx_wait_queue`），
-连接关闭时返回错误由调用方处理。
-bridge v1 只转发 bytes，不转发 TIPC handles 或 memrefs。
-
-`bind()` 在 `vsock_tipc_bridge` 开启时拒绝显式绑定 `BRIDGE_PORT_MAP` 端口（ephemeral 分配本就跳过这些端口）。
-
-反向（TIPC→vsock）连接由 manager 的 `allocate_port()` 分配临时端口，不在 `BRIDGE_PORT_MAP` 中；
-`accept_reverse_tipc()` 在 `create_bridge_connection()` 之后插入 `BridgeConnection`，生命周期事件仍由 manager 推入 bridge 队列。
-
-## Drop / 资源释放
-
-- `SocketSetWrapper::remove` 按 smoltcp handle 移除 socket。
-- TCP 文件对象 Drop 时先对 smoltcp socket 发起协议关闭。已经进入 `Closed` 且没有待发送复位报文的 handle 立即删除；接收队列存在未读数据时改用 abort 并保留 handle，直到 poller 发出 RST。其余 handle 转移到 deferred-close registry，继续参与 poller 推进、payload 发送、FIN、ACK 和重传。poller 在协议进入 `Closed` 后回收 handle。脱离文件对象引用的连接进入 `FIN_WAIT_2` 后启动 60 秒回收期限，并把该 deadline 合并到协议 poll timer；其他关闭状态不附加统一期限。
-- TCP listener 关闭时，`ListenTable::unlisten` 标记 entry closed，drain child handles，并从 `SOCKET_SET` 删除。
-- Unix stream listener 在 `Drop` 中先关闭 `ListenerQueue` 并唤醒等待任务，再清空 bind slot、释放 pending connection request 和对应 ring。
-- Unix stream channel 被 `Option<Channel>` 持有。shutdown 在对应方向锁内更新 endpoint 的读写关闭状态并唤醒受影响方向。`Channel::drop` 在释放 ring producer 和 consumer 前发布双向关闭状态并唤醒双方 connection-state waiter；peer 的 `recv` 先消费已发布数据，缓冲区耗尽后返回 EOF，`poll` 报告 `RDHUP`。关闭端丢弃自身接收队列中的未读数据时，对端记录一次 `ConnectionReset`，由 `recv` 或 `SO_ERROR` 消费。
-- UDP socket Drop 时从 PCB registry 注销，PCB 销毁时释放接收队列与异步错误队列。
-- Ethernet RX buffer 在 `poll_rx` 完成 frame 处理后调用 driver `recycle_rx` 归还。
-
-### UDP 临时端口随机化
-
-UDP 的端口零绑定以及首次 connect、send 自动绑定从内核 `entropy` ChaCha20 池读取新的 32 位随机值，用于选择 `49152–65535` 内的起点和奇数步长。候选迭代最多遍历全部 16384 个端口，每个端口访问一次，冲突检查与注册仍在对应 bucket 锁内完成。
-
-随机数读取发生在获取 bucket 自旋锁之前，调用路径要求可睡眠的任务上下文。分配先调用 `try_seed_from_hardware` 尝试播种，再检查 `is_ready`；熵尚未就绪时返回 `EAGAIN`，socket 保持未绑定，调用方可稍后重试。该策略同时适用于阻塞和非阻塞 socket。指定非零端口的显式绑定保持原有行为。
+| Current State | Operation | Next State | Wake-up Behavior |
+|---|---|---|---|
+| `IDLE` | `notify` | `SCHEDULED` | Queues `knet-poller` work. |
+| `SCHEDULED` | `notify` | `SCHEDULED` | The existing wake-up remains valid. |
+| `SCHEDULED` | A kwork callback or assist acquires execution ownership | `RUNNING` | The current executor runs one round or a bounded batch of rounds. |
+| `RUNNING` | `notify` | `RUNNING_PENDING` | The current executor is responsible for scheduling follow-up work when it finishes. |
+| `RUNNING_PENDING` | `notify` | `RUNNING_PENDING` | The pending state is preserved. |
+| `RUNNING` | Finishes with no immediate work remaining | `IDLE` | No wake-up is issued. |
+| `RUNNING` | Finishes with immediate work remaining | `SCHEDULED` | Queues `knet-poller` work for the next round. |
+| `RUNNING_PENDING` | Finishes | `SCHEDULED` | Queues `knet-poller` work for the next round. |
+
+`SCHEDULED` means that pending work has been published for further processing. `RUNNING` means that a single executor currently owns the right to run the poller, while `RUNNING_PENDING` records new notifications that arrive during execution. On completion, a single CAS returns execution ownership and publishes either `IDLE` or `SCHEDULED`. When `notify` races with completion, the event is preserved through the same atomic state-transition sequence.
+
+In the `SCHEDULED` state, the dynamic kwork of `knet-poller` and socket assist compete for execution ownership of the next batch. Loopback UDP does not depend on poller ownership; its transmit path completes xmit and `NetRx` delivery within the BH-disabled window.
+
+`Interface::poll_at` and TCP deferred close share the protocol timer source, while the IPv4 reassembly queue uses a separate timer source. When a timer expires, it schedules the poller and wakes tasks waiting for socket readiness.
+
+## Algorithms
+
+### Network Initialization
+
+`init_network` always creates loopback with `127.0.0.1/8`. It also attaches one registered NIC when available, using the configured IPv4 address and default gateway. Router address entries generate local and connected routes; `Service::new` synchronizes the IPv4 views used by smoltcp and ingress.
+
+**Algorithm 1. Network Initialization**
+
+**Input:** Registered NIC handles and IPv4 configuration.
+
+**Output:** Initialized network service, sockets, and poller.
+
+| Line | Operation |
+|---:|:---|
+| 1 | **Procedure** `init_network()` |
+| 2 | &emsp;`nics = kclass.net_devices()` |
+| 3 | &emsp;`router = Router.new()` |
+| 4 | &emsp;`lo = router.add_device(LoopbackDevice.new())` |
+| 5 | &emsp;`router.add_ipv4_addr(lo, 127.0.0.1/8, host_scope)` |
+| 6 | &emsp;**if** `nics.pop()` yields `nic`: |
+| 7 | &emsp;&emsp;`eth = router.add_device(EthernetDevice.new("eth0", nic))` |
+| 8 | &emsp;&emsp;`router.add_ipv4_addr(eth, configured_ipv4, universe_scope)` |
+| 9 | &emsp;&emsp;`router.add_default_route(eth, configured_gateway)` |
+| 10 | &emsp;&emsp;`subscribe_network_unregister(nic.id)` |
+| 11 | &emsp;`SERVICE.init_once(Service.new(router))` |
+| 12 | &emsp;`SOCKET_SET.init_once(SocketSetWrapper.new())` |
+| 13 | &emsp;`LISTEN_TABLE.init_once(ListenTable.new())` |
+| 14 | &emsp;`init_udp_registry()` |
+| 15 | &emsp;`network_poller.start()` |
+| 16 | &emsp;`register_timer_callback(TIMER_SAMPLE_PERIOD, SERVICE.handle_timer_tick)` |
+
+Source: [`init_network`](../src/lib.rs) and [`Service::new`](../src/stack/service.rs). The pseudocode abbreviates address and route construction.
+
+### RX Progress
+
+Ethernet RX notifications use `NetRx` to wake RX poll sources and schedule `knet-poller`. Prepared loopback UDP packets have a separate softirq delivery path; deferred loopback packets enter task-context polling. Socket assist executes one already-scheduled round. Background work and assist acquire the same execution right through `SCHEDULED -> RUNNING`; notifications received during execution are retained as `RUNNING_PENDING`.
+
+Each `Service::poll_budgeted` round first attempts pending IPv4 reassembly expiration and flushes retained ingress/control batches. It then dispatches queued TX, drains device RX, advances smoltcp, and uses the remaining TX and device-RX budgets for a second pass. Device RX and smoltcp ingress each have a separate allowance of `budget.rx_packets`.
+
+Device draining rotates its starting position across devices, consuming each device until it is empty or the batch budget is exhausted. IPv4 validation, destination filtering, reassembly, and UDP delivery run after releasing Router. Unmatched unicast UDP can generate ICMP port-unreachable responses; unsupported unicast IPv4 protocols can generate protocol-unreachable responses. ICMP errors are inspected for UDP before eligible packets enter the smoltcp batch. IPv6 enters that batch directly.
+
+The following pseudocode summarizes the round. Failed shared-state `try_lock` acquisitions retain pending batches and return `has_more = true`. Contention during reassembly expiration only defers that timer work, allowing the round to continue. Reusable batch mutexes and nested listener operations still use blocking locks.
+
+**Algorithm 2. RX Progress**
+
+**Input:** RX budget $B_{\mathrm{rx}}$, TX budget $B_{\mathrm{tx}}$, timer budget $B_{\mathrm{timer}}$, and retained packet batches.
+
+**Output:** Progress counters and the immediate-work flag `has_more`.
+
+| Line | Operation |
+|---:|:---|
+| 1 | **Procedure** `poll_budgeted(budget)` |
+| 2 | &emsp;start = monotonic_time() |
+| 3 | &emsp;lock reusable RX, accepted, and control batches |
+| 4 | &emsp;try to expire pending IPv4 fragments within $B_{\mathrm{timer}}$ |
+| 5 | &emsp;flush retained batches, or return retry |
+| 6 | &emsp;tx_done = dispatch queued TX within $B_{\mathrm{tx}}$ |
+| 7 | &emsp;drain_device_rx($B_{\mathrm{rx}}$ unless time limit reached) |
+| 8 | &emsp;`try_lock` socket set, then Router, then Interface; otherwise return retry |
+| 9 | &emsp;`Interface.poll_maintenance()` |
+| 10 | &emsp;**if** time limit has not been reached: |
+| 11 | &emsp;&emsp;poll smoltcp ingress within $B_{\mathrm{rx}}$ |
+| 12 | &emsp;call `Interface.poll_egress()` at least once |
+| 13 | &emsp;**repeat** while progress continues, within $\max(B_{\mathrm{tx}}, 1)$ passes and the soft time limit |
+| 14 | &emsp;reap deferred TCP closes and read `Interface.poll_at()` |
+| 15 | &emsp;release Interface; refresh TCP acceptors; release socket set |
+| 16 | &emsp;dispatch queued TX within remaining TX budget if time remains |
+| 17 | &emsp;release Router |
+| 18 | &emsp;**if** time and device-RX budget remain: |
+| 19 | &emsp;&emsp;drain_device_rx(remaining device-RX budget) |
+| 20 | &emsp;publish the earliest protocol / deferred-close deadline |
+| 21 | &emsp;`try_lock` Router, or return retry |
+| 22 | &emsp;**return** progress with `has_more` for pending RX, ingress, TX, immediately due protocol work, or pending reassembly expiration |
+| 23 | **Procedure** `drain_device_rx(remaining)` |
+| 24 | &emsp;process retained RX batch and flush accepted/control batches |
+| 25 | &emsp;**while** budget and time remain: |
+| 26 | &emsp;&emsp;`try_lock` Router, or return retry |
+| 27 | &emsp;&emsp;pull a bounded batch, limited by smoltcp ingress capacity |
+| 28 | &emsp;&emsp;release Router |
+| 29 | &emsp;&emsp;`try_lock` IngressProcessor, or retain batch and return retry |
+| 30 | &emsp;&emsp;validate/filter IPv4, reassemble fragments, deliver UDP, collect ICMP responses and packets accepted for smoltcp |
+| 31 | &emsp;&emsp;release IngressProcessor |
+| 32 | &emsp;&emsp;flush accepted/control batches, or return retry |
+| 33 | &emsp;&emsp;**stop** when device draining reports no more work |
+| 34 | **Procedure** `flush accepted/control batches` |
+| 35 | &emsp;`try_lock` socket set if accepted batch is nonempty |
+| 36 | &emsp;`try_lock` Router; on failure retain both batches and return retry |
+| 37 | &emsp;prepare TCP listeners and enqueue accepted packets |
+| 38 | &emsp;enqueue control packets; drop a control packet if its TX queue is full |
+| 39 | &emsp;release acquired locks |
+
+The 1 ms limit is a soft bound checked between work batches. Maintenance and one egress call still run after bulk RX/TX reaches this limit, provided the required locks are acquired. Packets waiting in retained batches and FIFO queues remain for later rounds. The tail RX pass queues accepted smoltcp packets for a later round.
+
+A background callback runs at most four rounds, each with fresh budgets; assist runs at most one. Completion reschedules immediate work or notifications received during execution. The periodic timer callback checks protocol and reassembly deadlines, wakes waiters, and publishes timer work. Future deadlines alone do not set `has_more`.
+
+Sources: [`poller`](../src/poller.rs), [`Service`](../src/stack/service.rs), [`IngressProcessor`](../src/stack/ingress.rs), and [`Router`](../src/stack/router.rs).
+
+### TX Routing
+
+UDP builds IPv4 packets in knet; TCP and raw sockets submit packets through smoltcp. UDP sends routed to loopback bypass the poller TX queue. Other UDP sends enter the data queue after fragmentation and capacity checks. smoltcp output enters the data queue, including loopback traffic, while generated ICMPv4 errors use the control queue. AF_PACKET sends link frames through Router directly to the selected device.
+
+**Algorithm 3. TX Routing**
+
+**Input:** UDP payload, destination, source/interface binding, and TX budget $B_{\mathrm{tx}}$.
+
+**Output:** Transmitted or queued packets, errors, and dispatch progress.
+
+| Line | Operation |
+|---:|:---|
+| 1 | **Procedure** `send_udp(payload, destination, bound_source, bound_interface)` |
+| 2 | &emsp;lock Router |
+| 3 | &emsp;check broadcast permission and select an active output route |
+| 4 | &emsp;source = bound_source if set, otherwise route-selected source |
+| 5 | &emsp;**if** output device is not loopback: |
+| 6 | &emsp;&emsp;check data-queue capacity for the expected packet count |
+| 7 | &emsp;build UDP checksum and IPv4 header |
+| 8 | &emsp;choose DF from `IP_MTU_DISCOVER` and route MTU |
+| 9 | &emsp;fragment oversized IPv4 output; return `EMSGSIZE` if DF forbids it |
+| 10 | &emsp;**if** output device is loopback: |
+| 11 | &emsp;&emsp;dispatch fragments immediately |
+| 12 | &emsp;**else**: |
+| 13 | &emsp;&emsp;enqueue all fragments with the bound interface, or return `WouldBlock` |
+| 14 | &emsp;release Router |
+| 15 | &emsp;notify(Tx); assist_once() |
+| 16 | **Procedure** `dispatch_budgeted(tx_budget)` |
+| 17 | &emsp;**repeat** up to $B_{\mathrm{tx}}$ times: |
+| 18 | &emsp;&emsp;packet = pop control queue first, otherwise data queue |
+| 19 | &emsp;&emsp;**stop** if both queues are empty |
+| 20 | &emsp;&emsp;**if** IPv4: |
+| 21 | &emsp;&emsp;&emsp;prepare IPv4 length/checksum fields |
+| 22 | &emsp;&emsp;&emsp;**if** limited broadcast: |
+| 23 | &emsp;&emsp;&emsp;&emsp;validate source and replicate to interfaces allowed by binding |
+| 24 | &emsp;&emsp;&emsp;**else**: |
+| 25 | &emsp;&emsp;&emsp;&emsp;look up longest-prefix route |
+| 26 | &emsp;&emsp;&emsp;&emsp;validate bound interface and local source |
+| 27 | &emsp;&emsp;&emsp;&emsp;send through route device to gateway or destination |
+| 28 | &emsp;&emsp;**else if** IPv6 multicast: |
+| 29 | &emsp;&emsp;&emsp;replicate to all devices |
+| 30 | &emsp;&emsp;**else if** IPv6 unicast: |
+| 31 | &emsp;&emsp;&emsp;look up route, verify source, and send through route device |
+| 32 | &emsp;**return** processed count and whether TX or resulting RX work remains |
+
+IPv4 limited broadcast is replicated subject to interface binding. Other IPv4 destinations, including multicast and directed broadcast, use route lookup. IPv6 multicast is replicated to all devices in this dispatch path. These rules differ from a general multicast fan-out policy.
+
+`EthernetDevice` currently accepts IPv4 output only. It checks link state, source, and MTU, then sends limited and directed broadcasts to the Ethernet broadcast address. Other next hops use the ARP cache: a valid entry permits immediate transmission; an unresolved or expired entry triggers an ARP request when needed and retains the packet in bounded `pending_tx`. A full pending queue drops the packet. IPv6 remains available in the smoltcp and loopback paths, while the Ethernet adapter drops IPv6 output.
+
+Sources: [`UDP send`](../src/transport/udp/socket.rs), [`Service::prepare_and_send_ipv4_packet`](../src/stack/service.rs), [`Router`](../src/stack/router.rs), and [`EthernetDevice::send_ip_packet`](../src/device/ethernet.rs).
+
+## Concurrency Model
+
+Concurrency is organized around a single owner for protocol progress, with finer-grained locks protecting socket, queue, and control-plane state.
+
+### Protocol Progress
+
+The global `SERVICE` is a `LazyInit<Service>`. Separate mutexes protect the smoltcp `Interface`, the `Router`, the `IngressProcessor`, and each reusable RX, accepted-packet, and control-packet batch. The poller acquires the first three with `try_lock`. If any of these locks is contended, the poller retains the batch and reports that work remains immediately available. These batches are accessed only by the executor that owns the global protocol-progress right.
+
+`NetworkPoller` represents this execution right with the four states maintained by `kwork::BudgetedPoller`: `IDLE`, `SCHEDULED`, `RUNNING`, and `RUNNING_PENDING`. A kwork background batch may process 512 RX packets, 256 TX packets, and 32 timer events. A socket-assisted batch uses smaller budgets of 16, 16, and 8. Every round also has a 1-ms soft time limit. Background batches run at most four consecutive rounds, while one assistance call runs at most one round. When a background batch reaches its round limit, it queues another batch and releases the execution right.
+
+Protocol and IPv4 reassembly deadlines use separate `AtomicU64` fields. The periodic sampling callback is deliberately small: it checks the atomic deadline, wakes waiters, and notifies the poller. Each successful staged smoltcp poll refreshes the protocol timer through `Interface::poll_at`, so TCP retransmission and similar deadlines continue to advance even when socket waiters are blocked.
+
+The global `SOCKET_SET` wraps `SocketSetState` in a single mutex. The smoltcp socket set and TCP deferred-close metadata share this ownership lock, so socket registration, protocol progress, close, and reclamation never transfer a handle between two mutexes. TCP transition admission uses atomic compare-and-swap through `StateLock::lock`, returning the observed state if admission fails; `StateGuard::transit` publishes the result or restores the previous state with an atomic store. Socket options and shutdown flags use atomics only for configuration and shutdown state shared across threads.
+
+### Receive Path and UDP Queues
+
+The Router lock covers RX device pulls and TX dispatch. IPv4 validation, filtering, and UDP demultiplexing run after both the Router lock and the smoltcp socket-set lock have been released. TCP snooping runs once the accepted batch holds both locks, keeping listener side effects within the same batch handoff. The smoltcp ingress queue has fixed capacity, and each call to `poll_ingress_single` consumes one packet. Packets left behind because a budget or time limit was reached, or because a shared lock was contended, remain available for a later round.
+
+`UDP_PCB_REGISTRY` contains 256 port-based buckets. Each bucket uses `SpinNoIrq` because `NetRx` performs PCB lookups in softirq context. The receive queue and connected peer of each PCB use the same lock type. Sleepable bind and connect state updates remain outside the bucket lock.
+
+Before a packet enters a PCB queue, the loopback send path validates the datagram before entering BH context, or the ordinary ingress path validates it in task context. Address and payload-range parsing occurs at the same stage, and the results are stored in the packet's control metadata. The receive queue then stores only a pointer-sized `PreparedUdpPacket`, which retains the `PacketBuf` handle created when the packet entered the stack.
+
+Each PCB reserves 1,024 `VecDeque` slots at creation. This follows the Linux `__udp_enqueue_schedule_skb` pattern, where `__skb_queue_tail` inserts an existing `skb` while holding `sk_receive_queue.lock`. Accordingly, `enqueue` performs only an occupancy check and inserts an existing handle while running in softirq context under `SpinNoIrq`. If the queue is full, it releases the queue lock before reclaiming the packet. `MSG_PEEK` increments the `PacketBuf` reference count under the lock and copies the payload after releasing it.
+
+The shared `NET_RX_QUEUE` is also protected by `SpinNoIrq` and is used by loopback transmit, `NetRx`, and task-context `poll_rx`. Its `pending_udp` and `deferred` queues both contain pointer-sized `PacketBuf` values. `NetRx` removes already-annotated entries from `pending_udp` under its budget for UDP delivery; the task poller removes other packets from `deferred`. Capacity accounting includes both queue lengths and all in-flight packets, so producers cannot consume slots that are temporarily vacant while a packet is being delivered to a PCB. If a UDP packet matches no PCB, this path retains unique ownership, clears the packet metadata, and moves it to `deferred`.
+
+`IngressProcessor::ipv4_reassembler` owns reassembly queues and is protected by `Service::ingress`, a `Mutex<IngressProcessor>`. The global `SERVICE` is a `LazyInit<Service>` with separate component locks.
+
+The UDP socket lifecycle and local endpoint use separate `RwLock`s, while the peer endpoint uses `SpinNoIrq` for softirq lookup. The asynchronous-error queue has its own mutex; error status, shutdown flags, and receive-error enablement use atomics. Socket-local waiter sets report data, errors, write readiness, and shutdown independently of device RX notifications.
+
+### TCP and Unix Stream Synchronization
+
+`LISTEN_TABLE` stores listeners in a `Mutex<HashMap<...>>`, and each listener entry uses its own mutex for the backlog queue. The entry's `accept_poll` sits outside that mutex. `register_accept_waker` first registers with `accept_poll` without taking the entry lock, then briefly locks the entry to recheck readiness. This preserves the register-and-recheck sequence without running `Waker::clone` or other `PollSet` operations under the queue lock.
+
+The poller revisits an entry after a new packet arrives or whenever its SYN queue is nonempty. A child that becomes acceptable during a later ingress or timer poll can then move from the SYN queue to the accept queue. `accept_poll` wakes its waiters only after the entry lock has been released.
+
+TCP's `bound_endpoint` mutex protects one socket's local binding. `TCP_BOUND_ENDPOINTS` uses a mutex to serialize port-conflict accounting, and the ephemeral-port cursor is separately mutex-protected. Raw socket local and peer addresses and TTL use `RwLock`s; their smoltcp buffers remain under `SOCKET_SET`.
+
+`ABSTRACT_BINDINGS` and `PATH_BINDINGS` use separate mutexes for Unix address lookup. Each `BindEntry` contains independently locked stream and datagram binding slots. `UnixDomainSocket` protects its local and peer addresses with mutexes. Datagram transports protect the receiver and binding slot with mutexes and the connected peer and local address with `RwLock`s; `async_channel` and poll sets handle queued delivery and notifications.
+
+Unix stream synchronization is divided by responsibility:
+
+- Each endpoint stores its channel in `channel: Mutex<Option<Channel>>`. This mutex serializes the final commit of `connect`, along with `send`, `recv`, `shutdown`, and channel release on the same endpoint.
+- Each listener keeps its FIFO pending queue, reserved-capacity count, backlog limit, listening state, and read-shutdown state in `ListenerState` under a separate mutex. `request_available` wakes `accept`, while `capacity_available` wakes blocked `connect` calls. The binding-slot lock is held only long enough to clone the listener reference and is released before any capacity wait. The fixed lock order is `channel`, listener handle, and `ListenerState`.
+- Each endpoint uses `tx_order: SpinNoPreempt<()>` as the ordering point for one transmit direction. Local write shutdown, peer read shutdown, write-index publication, and peer-side EOF detection on an empty queue all pass through this lock. Code acquires the `channel` mutex before a single `tx_order`, and never holds the ordering locks for both directions at once.
+
+`send` first writes into an unpublished vacant region, then takes `tx_order` to recheck shutdown state and publish the new write index. If `recv` observes an empty queue, it rechecks the occupied length and shutdown state under the same ordering lock. `shutdown` publishes the completed state and clones the peer endpoint reference while holding the `channel` mutex, then releases the mutex before waking waiters. Listener-event notifications likewise occur outside both `ListenerState` and the source socket's `channel` lock, while user-data copies and `PollSet` wakeups occur outside `tx_order`.
+
+Readable, writable, and connection-state events use separate `PollSet` instances for each endpoint. A write wakes the peer's readable waiters. A read wakes the peer's writable waiters when buffer occupancy crosses the send-buffer low-water mark. A half-close wakes the affected direction, and a full close notifies both endpoints through their connection-state waiters.
+
+### Packet and vsock Synchronization
+
+`PACKET_HANDLERS` protects weak socket registrations with a mutex and tracks the active count atomically. Each packet socket uses an `RwLock` for its binding, a mutex for its bounded RX queue, and a separate `recv_lock` to serialize receive/peek operations across payload copying. Packet and drop statistics use atomic counters. Frame publication snapshots active sockets before accessing their queues.
+
+`VSOCK_DEV` protects the installed class-device handle, and `VSOCK_CONN_MANAGER` protects transport ownership, connection/listener maps, bridge ports, and queued events. Each `Connection` and `ListenQueue` has a separate mutex. Stream transports protect their connection references with mutexes and serialize sends with `tx_lock`; the manager never acquires that send lock. Paths that need nested device, manager, and connection access follow `VSOCK_DEV -> VSOCK_CONN_MANAGER -> Connection`. Sends snapshot transport and credit state and release manager/connection guards before driver I/O or credit waits.
+
+`POLLER_STATE` protects the vsock polling reference count and running flag; the idle backoff uses an atomic counter. The bridge has separate mutexes for connections, deferred RX events, and published ports. Atomic flags coordinate startup, and an atomic token counter identifies TIPC handle-set entries. TIPC handle sets, poll sets, and wait queues notify bridge workers and socket waiters.
+
+### Control Plane and RX Wakeups
+
+The Router owns configured routes, address-derived routes, and dynamic source-selection state. Each device owns its neighbor table. Netlink handles protocol parsing and live-snapshot encoding, then calls the appropriate owner.
+
+`control::network_config_lock` serializes control-plane mutations across sockets, legacy socket-ioctl mutations, and `unregister_netdev`. Each netlink socket has mutexes for its send transaction and RX queue and an `RwLock` for its local address. The global `UEVENT_SUBSCRIBERS` mutex protects weak subscriber references, and `UEVENT_SEQNUM` atomically allocates event sequence numbers. The send-transaction lock covers capacity preflight, mutation execution, and response enqueueing for one socket. Responses are generated outside the RX-queue lock; that lock is taken only to check capacity and enqueue the result. The fixed acquisition order is the send-transaction lock, `network_config_lock`, Router, ingress, Interface, and netlink RX queue, omitting any lock that the operation does not use.
+
+`GeneralOptions` stores device binding in `bound_dev_if: AtomicI32`. UDP lookup and transmission and TCP/raw RX-device selection read this field with Relaxed ordering. Binding and unbinding use an atomic exchange; an actual change notifies `device_binding_changed: PollEvent`, whose Release/Acquire version ordering publishes the preceding field update. Repeated writes of the same interface index remain silent.
+
+RX registration reads the event version, reads the interface index, registers device sources and the binding-change event, then rechecks the version. Changes during registration trigger a readiness recheck; changes while waiting trigger registration renewal. Each new `PollRegistrations` replaces the old device registrations, and cancellation or completion removes the binding-change subscription.
+
+TCP and raw IP use `GeneralOptions::rx_device_mask` to select RX devices. Explicit `SO_BINDTODEVICE` selects the specified device; default and unbound states select all devices. Address binding, connection state, and route changes are independent of this selection, while the protocol receive path filters packet delivery.
+
+`Service::register_rx_waker` uses the caller's `PollContext` to register the aggregate `timeout_poll` and any Ethernet RX poll source that supports interrupt-driven RX. When a device becomes pending, the `NetRx` softirq wakes the corresponding poll source and schedules `knet-poller` work for background protocol progress. TCP and raw IP waiters can also wake through that source. `PollRegistrations` keeps these registrations alive across the `Pending` state.
+
+Loopback devices and Ethernet devices without an attached `NetRxScheduler` continue to use the aggregate `timeout_poll` waker, which supports broadcast wakeups to multiple tasks. The device layer does not retain raw caller wakers or register a separate, inequivalent task waker outside `Service`.
+
+UDP receive-only waits subscribe to socket events in `UdpSocketWaiters`. Receive enqueueing, asynchronous errors, and read shutdown wake the corresponding waiters. UDP lookup applies address and device-binding filters, so existing receive subscriptions remain valid across binding changes. Ethernet RX softirq independently schedules `knet-poller`; prepared loopback UDP is enqueued by `NetRx` or the send path's task-context fallback. Sender TX notifications advance other loopback work, and protocol and reassembly deadlines independently notify the background poller. Receive-only waits therefore remain independent of device RX broadcasts and aggregate `timeout_poll` notifications. Send waits continue to subscribe to network-progress events, and combined read/write waits retain the device and timer subscriptions needed for TX. `PollRegistrations` owns all socket-event registrations, followed by a readiness recheck.
+
+Ethernet RX source registration is protected by `NET_RX_SOURCES: SpinNoIrq<NetRxSources>`. Each source publishes pending work through an atomic flag, and the IRQ-safe scheduler keeps only a weak source reference. Device teardown detaches the scheduler and unregisters the source. Source identifiers and softirq availability also use atomics.
+
+## Design Decisions
+
+### UDP and IPv4 Data Paths
+
+Crate-local types own UDP PCBs, bind-conflict checks, send and receive queues, IPv4 validation, fragment reassembly, output fragmentation, and ICMPv4 errors. TCP, raw IP, and IPv6 use the smoltcp socket set, driven by `knet-poller` and explicit `poller::assist_once` calls. This boundary keeps UDP independent of smoltcp socket handles while preserving TCP and raw-socket semantics.
+
+### Budgeted Processing
+
+The `NetRx` softirq, socket TX paths, protocol timers, and socket assist share one `NetworkPoller`. Its four-state atomic state machine publishes pending work and grants execution to a single owner through a `SCHEDULED -> RUNNING` CAS. Notifications received during execution set `RUNNING_PENDING`, causing completion to schedule another batch. Assist only consumes scheduled work; it neither creates events nor waits for ownership.
+
+Loopback UDP is delivered directly to the PCB within the transmit path's bottom-half window, following the Linux sequence from `dev_queue_xmit` through `loopback_xmit` and `__netif_rx` to softirq processing at `local_bh_enable`. TCP, ICMP, and IPv6 use the poller's TX-then-RX rounds.
+
+RX, TX, and timers have separate budgets, and each `Service` round has a 1 ms soft time limit. Staged smoltcp APIs bound ingress and egress work. TX stages share one budget, as do the main and final RX stages, allowing loopback TCP and ICMP to complete a device round trip within one assist. Control traffic takes priority over data traffic. Router, Interface, or socket-set contention ends the round with `has_more` set. IPv4 reassembly processing acquires the `IngressProcessor` lock only for pending expiry events; contention preserves those events while TX continues. Expiry events are processed under the timer budget across successive rounds.
+
+TCP sends fill the smoltcp buffer and notify the poller, which advances the protocol and dispatches TX in bounded batches. TCP receives publish `RxWindow` when free buffer space before the read is below the maximum window-scaling quantum; subsequent window growth uses RX and timer processing. TCP and raw sockets register aggregate send wakers with smoltcp, while `PollProgress::tx_capacity_changed` wakes poller TX waiters when Router data-queue slots become available. Separate atomic deadline sources track protocol and deferred-close timers and IPv4 reassembly. Periodic sampling wakes socket waiters and notifies the poller when deadlines expire.
+
+### Control-Plane State Ownership
+
+Devices own link configuration and expose interface names, MTUs, administrative and operational states, and hardware addresses through `NetDevice::link_snapshot`. `RTM_GETLINK` and `RTM_NEWLINK` access this device-owned state directly. The AF_PACKET send path obtains an allocation-free `LinkSendSnapshot` under the Router lock, validates it after releasing that lock, and reacquires the Router lock through `Service::send_link_frame` for transmission. Snapshot validation and dispatch are separate critical sections. Device-existence checks use `has_device`, and route MTU queries read the matching device directly. Configuration changes or device removal rebuild the smoltcp `Interface` only when the effective MTU changes, keeping cached `DeviceCapabilities` consistent with the device set while otherwise preserving runtime caches.
+
+`Router` owns `Ipv4AddrEntry` values with `dev`, `addr`, `scope`, and optional `broadcast` fields. The broadcast override is exposed as `ifa_broadcast` in rtnetlink. Broadcast addresses default to the CIDR-derived value. Insertion validates the device, unicast address, and smoltcp address capacity. Legacy address and netmask ioctls update the primary entry while preserving other addresses on the device. Netmask updates retain the scope and recompute the broadcast address only when its previous value was mask-derived.
+
+Each address produces a `/32` local route and a connected route for its network. Address removal clears derived routes, routes whose preferred source becomes invalid, and the device's pending TX. `Service` projects Router addresses into the smoltcp `Interface`, `IngressProcessor`, and devices; Ethernet uses them for ARP, directed broadcasts, and packets awaiting neighbor resolution.
+
+Configured routes belong to `Router`, where `RTM_NEWROUTE` and `SIOCADDRT` require gateways to lie within the output interface's IPv4 subnet and exclude directed-broadcast addresses. Ethernet devices own their neighbor tables, so route and neighbor mutations operate through their respective owners. `unregister_netdev` holds `network_config_lock` while Router removes the device's routes, addresses, and neighbors and renumbers subsequent interface indices.
+
+### Credentials for Unix Pathname Sockets
+
+Linux implicitly reads credentials from the task context through `current_cred()`. Since knet serves both user tasks and kernel callers during boot, it passes credentials explicitly. User-facing entry points take one credential snapshot at the start of an operation and pass `&Cred` through subsequent VFS path lookups. Kernel callers specify credentials through `bind_with_cred`.
+
+Credentials follow the call path, keeping their lifetime separate from Unix sockets, path-lookup state, and dentries. `sock_alloc_file` explicitly receives `Arc<Cred>` and stores it in `VfsFile::cred`; the socket object retains only its own state. Entry points obtain the current task's credentials, and knet uses the supplied credentials throughout the operation.
+
+### Credentials for rtnetlink Sends
+
+Netlink sockets can be passed between processes, so permission checks use the credentials of each sender. POSIX send and socket-file write identify the protocol at entry. The netlink branch takes one current-credential snapshot and passes it through `Socket::send_with_cred` to rtnetlink permission checks. Other protocols continue to use `SocketOps::send`, keeping credential propagation confined to paths that require authorization. Kernel callers outside a user-task context specify credentials explicitly through `send_with_cred`.
+
+### Device Masks for RX Wakeups
+
+TCP and raw IP derive their RX device mask from `SO_BINDTODEVICE`. Explicit binding narrows device subscriptions; default and unbound states select all devices. Waiters register with those devices and the smoltcp poll timeout, then use actual readiness to determine user-visible events. Address binding, connection state, and route changes leave device selection independent. UDP receive-only waits use socket-local events after demultiplexing applies the device-binding filter.
+
+smoltcp's `poll_at` returns a deadline with the same epoch as the supplied timestamp, allowing the compatibility layer to map `SmoltcpInstant` directly to `MonotonicInstant`. This mapping preserves expired deadlines without signed-delay calculations or `as u64` conversions.
+
+### TCP Listener and Connection Management
+
+knet manages listening sockets separately from accepted child connections. `ListenTable` creates a child smoltcp socket when a SYN arrives and places the pending connection in the backlog queue, keeping POSIX accept semantics within knet.
+
+The listener table therefore snoops initial TCP packets, cleans up aborted children, and rechecks connections in the SYN queue whenever the network makes progress. Network events and protocol deadlines drive subsequent polling. Pending connections in the SYN queue do not themselves request continuous polling, avoiding busy loops before a protocol deadline expires.
+
+### Unix Stream Waiters and Send Ordering
+
+A bidirectional Unix stream channel stores a separate `StreamEndpoint` for each end. Each endpoint uses atomics to track local read/write shutdown state and pending connection errors, while `StreamPollSets` maintains separate readable, writable, and connection-state waiter sets. `ListenerQueue` holds listener state and pending connections, notifying the endpoint's readable waiters when a connection request arrives.
+
+Read events register with the readable set, write events with the writable set, and waiters interested only in connection state with the connection-state set. Each waiter uses the corresponding fixed-capacity set, avoiding duplicate registrations for the same direction. Writing data to the ring buffer notifies peer readers. Reading data notifies peer writers when send-buffer occupancy falls from above one-quarter capacity to below that threshold. When both connection directions close or an endpoint is released, all three sets are notified so that waiters can recheck readiness.
+
+Each `StreamEndpoint` uses `tx_order` to coordinate data publication and shutdown in its send direction. Send commits the write index under this lock, shutdown publishes closure under the corresponding direction lock, and peer recv uses the same lock for its final empty-queue and EOF checks. This ordering ensures that the receiver observes published data before EOF. If shutdown acquires the direction lock first, subsequent sends return `BrokenPipe`.
+
+A blocking send that encounters shutdown after making progress returns the number of bytes sent. A nonblocking send also returns a partial count after making progress, and returns `WouldBlock` only when no data has been sent and the ring buffer is full. A zero-length send returns 0 when the connection exists and the corresponding directions remain open at both ends.
+
+Bind records the Unix address, and `listen` enables connection reception. The listener queue is capped at `LISTEN_QUEUE_SIZE`; each request allocates its ring buffers only after reserving queue capacity. Shutting down the listener's read direction rejects new connections while preserving queued connections for `accept`.
+
+### Ethernet ARP Pending Queue
+
+Ethernet devices use `pending_tx` to hold IP packets awaiting next-hop address resolution. Once the corresponding ARP reply arrives, the device sends waiting packets in queue order. This introduces head-of-line blocking: a next hop that remains unresolved blocks subsequent queued packets.
+
+### vsock-TIPC Bridge
+
+When `vsock_tipc_bridge` is enabled, `bridge` and AF_VSOCK share `VSOCK_CONN_MANAGER`. The connection manager owns access to the raw `VsockDevice`, and the bridge uses its interfaces to manage connections and data.
+
+During initialization, `net/knet`'s `init_vsock()` obtains the raw virtio-vsock device from kclass and registers it with `VSOCK_CONN_MANAGER` through `connection_manager::register_vsock_dev()`. The manager maintains connection and listener tables, credits, and the bridge event queue, and polls the raw RX virtqueue through `poll_event()`. For ordinary ports, it performs accept and force_close operations, writes data into connection receive buffers, and updates credits. For bridge ports and connections, it queues `ConnectionRequest`, `Connected`, `Received`, `Disconnected`, and `CreditUpdate` events for `VsockBridge::rx_task` to consume through `pop_bridge_event()`.
+
+AF_VSOCK accesses the manager through socket-facing helpers in `connection_manager`. `bridge::init()` registers ports 0–4 from `BRIDGE_PORT_MAP`, which the manager listens on while queueing bridge events. Bridge operations use `listen_bridge_port`, `create_bridge_connection`, `send_bridge`, `recv_bridge`, `disconnect_bridge`, and `abort_bridge` to listen, create connections, exchange data, and close connections.
+
+Host-to-TA connections use the following port mapping:
+
+| Port | TIPC service |
+|---|---|
+| 0 | Service name supplied through a dynamic handshake |
+| 1 | `com.android.trusty.keymint` |
+| 2 | `com.android.trusty.gatekeeper` |
+| 3 | `com.android.trusty.vsock.forwarder` |
+| 4 | `com.android.trusty.widevine.transact` |
+
+#### Dynamic Handshake on Port 0
+
+The Trusty-compatible dynamic bridge uses record semantics for the handshake and data forwarding after the host connects to vsock port 0.
+
+1. The host sends the first vsock record containing a UTF-8 TIPC service path without a NUL terminator, limited to `IPC_PORT_PATH_MAX` bytes.
+2. The guest bridge calls `ipc_port_connect_async(..., WAIT_FOR_PORT | ASYNC)` with that path. If the service has not been published, the channel remains `Connecting` and the handshake response waits until the TA publishes the service and TIPC becomes ready. An existing service also requires TIPC readiness before the bridge sends the single-byte status `[0]`. Both sides then forward data as records.
+3. The guest sends `[1]` and closes vsock if service-name validation fails for UTF-8, length, or content; reading the service-name record fails; or the TIPC channel receives `HUP` or `ERROR` during `TipcConnecting`. These cases indicate connection rejection, such as an existing port refusing the connection.
+4. After sending the service name, host-side `libtrusty` blocks waiting for the status byte. `TRUSTY_VSOCK_TIMEOUT_SEC` sets the receive timeout, which defaults to 60 seconds. A timeout or EOF indicates connection failure; `[1]` maps to `-EIO`.
+5. If the service is never published, the guest continues waiting and the host eventually fails on receive timeout. The corresponding negative test expects this timeout.
+
+Fixed ports 1–4 connect to their predefined TIPC services using `WAIT_FOR_PORT | ASYNC` when the vsock connection is established, without the single-byte handshake.
+
+In the TA-to-host direction, the bridge publishes the `com.android.trusty.vsock.forwarder` TIPC port and connects accepted channels to host CID 2, port 0. `connection_manager::create_bridge_connection()` obtains an ephemeral port through the manager's `allocate_port()` and initiates the vsock connection; `accept_reverse_tipc()` then inserts a `BridgeConnection`. Ephemeral ports lie outside `BRIDGE_PORT_MAP`, and the manager routes lifecycle events to the bridge queue. On receiving `Connected`, the bridge adds the channel to the handle set.
+
+The bridge processes `Received(conn_id, len)` through `recv_exact_record`, which rejects lengths above `IPC_CHAN_MAX_BUF_SIZE`, allocates a buffer of length `len`, and repeatedly calls `recv_bridge` until the record is complete. A zero-byte read before completion is an error. The completed record is sent as one TIPC message. If TIPC send returns `WouldBlock`, the bridge retains that single pending record and retries after `SEND_UNBLOCKED`.
+
+Data flows from TIPC to vsock through `get_msg -> read_msg -> put_msg -> send_bridge`. When vsock credits are exhausted, `send_bridge` blocks on `tx_wait_queue` until `CreditUpdate`. Connection closure returns an error for the caller to handle. Bridge v1 forwards only bytes; TIPC handles and memory references are outside its scope.
+
+With `vsock_tipc_bridge` enabled, `bind()` rejects explicit binding to ports in `BRIDGE_PORT_MAP`, and ephemeral port allocation skips these reserved ports.
+
+## Supported Scope and Limitations
+
+| Area | Support and limits |
+|---|---|
+| Internet / UDP | Configuration and native UDP support IPv4 only; IPv6 UDP endpoints return `EAFNOSUPPORT`. smoltcp IPv6 support does not extend these interfaces. |
+| UDP ephemeral binding | Port-zero bind and automatic binding on first connect or send select randomized candidates in `49152–65535` using kernel entropy. If entropy is not ready, both blocking and nonblocking sockets return `EAGAIN` and remain unbound. Explicit nonzero-port binding retains its existing behavior. |
+| Device binding | UDP demultiplexing checks the bound device. TCP/raw bound-device packet filtering and complete IPv6 scope semantics remain separate compatibility work. |
+| DNS | smoltcp DNS support is compiled in; knet exposes no public resolver API. |
+| AF_PACKET | Ethernet raw/datagram sockets with byte- and frame-bounded queues; filters `PACKET_OTHERHOST`. Membership changes, connect, peer queries, shutdown, listen, and accept are unsupported. |
+| rtnetlink operations | Supports link queries/updates, IPv4 address and route queries/add/delete, and IPv4 neighbor updates. Other message types return `NLMSG_ERROR` with `EOPNOTSUPP`; neighbors accept only incomplete/permanent states with no flags. |
+| Netlink sockets | Route sockets reject multicast subscriptions, userspace-peer destinations, and mixed query/mutation batches. Connect, peer queries, and shutdown are unsupported. |
+| Socket options | Options unhandled by the selected protocol return `ENOPROTOOPT`. |
+| Unix datagrams | Receive queues use unbounded `async_channel` queues. |
+| vsock / TIPC bridge | Stream transport only; the bridge forwards bytes, excluding TIPC handles and memory references. |
+| Ethernet progress | Failed RX-scheduler attachment falls back to timeout polling. ARP pending traffic is subject to head-of-line blocking. |
+| Device attachment | Initialization attaches at most one NIC. vsock accepts one raw transport; a second registration returns `AlreadyExists`. |
+
+Implementation details: [packet.rs](../src/link/packet.rs), [rtnetlink.rs](../src/netlink/rtnetlink.rs), and [netlink/socket.rs](../src/netlink/socket.rs).
+
+## Drop and Resource Release
+
+| Resource / trigger | Cleanup and remaining state |
+|---|---|
+| TCP file close | Removes a `Closed` handle immediately when no reset is pending. Unread RX data causes abort, with the handle retained until RST is sent. Other handles remain in deferred close while the poller completes transmission and closure. Detached connections receive a 60-second reclamation deadline only in `FIN_WAIT_2`. |
+| TCP listener close | Marks the listener closed, drains child handles, and removes them from `SOCKET_SET`. |
+| Unix stream listener drop | Closes the listener queue, wakes waiters, clears the binding slot, and releases pending requests and ring buffers. |
+| Unix stream shutdown / channel drop | Publishes directional closure and wakes affected waiters; channel drop closes both directions before releasing buffers. Peer recv drains published data before EOF, and poll reports `RDHUP`. Discarded unread data records one peer `ConnectionReset`, consumed by recv or `SO_ERROR`. |
+| UDP socket / PCB drop | Unregisters the socket from the PCB registry; PCB destruction releases receive and asynchronous-error queues. |
+| Raw socket drop | Shuts down both directions and removes the smoltcp handle. |
+| Packet socket drop | Releases queues and decrements the active-handler count. Later registration or publication prunes expired weak entries. |
+| Netlink socket drop | Releases receive state with the last strong reference. Binding updates or event publication prune weak uevent subscriptions. |
+| Unix datagram drop | Clears the binding slot, releases the peer channel, and wakes peer waiters. |
+| Unix pathname socket close | Releases the transport binding; the inode remains under VFS ownership. |
+| Ethernet RX completion | Returns the frame buffer through the driver's `recycle_rx` interface. |
+| Ethernet device removal | Detaches the RX scheduler and unregisters its RX source. `unregister_netdev` removes Router routes, addresses, and device state under `network_config_lock`. |
+| vsock transport removal | Clears device/transport state, closes tracked connections, wakes connection/listener/credit waiters, clears listen and bridge-event queues, and resets polling references. Existing socket references retain connection entries until cleanup. |
+| vsock stream drop | Shuts down the connection and removes its manager entry. |
+| Bridge connection close | Removes the bridge entry and TIPC handle-set registration, closes the channel, and disconnects vsock. Disconnect/abort wakes credit waiters before removing the manager entry. Reverse TIPC ports remain registered for the global bridge runtime's lifetime. |
