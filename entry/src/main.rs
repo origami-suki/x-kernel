@@ -342,10 +342,13 @@ fn kernel_main() {
                 cred.clone(),
             )?;
             let mut pos = 0;
-            file.write_from(cov.as_slice(), &mut pos)?;
+            if file.write_from(cov.as_slice(), &mut pos)? != cov.len() {
+                return Err(kvfs::VfsError::Io);
+            }
             file.fsync(false)
         })();
 
+        let is_written = write_result.is_ok();
         if let Err(e) = write_result {
             error!("Failed to write coverage data: {:?}", e);
         } else {
@@ -355,8 +358,12 @@ fn kernel_main() {
             );
         }
 
-        if let Err(e) = kvfs::sync_filesystems() {
-            error!("Failed to flush filesystem: {:?}", e);
+        match kvfs::sync_filesystems() {
+            Ok(()) if is_written => {
+                unittest::ktest_println!("=== UNITTEST_STATUS: COVERAGE_PERSISTED ===");
+            }
+            Ok(()) => {}
+            Err(e) => error!("Failed to flush filesystem: {:?}", e),
         }
     } else {
         info!("No coverage data to write.");

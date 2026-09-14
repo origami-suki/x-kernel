@@ -8,11 +8,12 @@ use alloc::{sync::Arc, task::Wake};
 use core::{
     fmt,
     future::poll_fn,
+    marker::PhantomData,
     pin::pin,
     task::{Context, Poll, Waker},
 };
 
-use kerrno::KError;
+use kerrno::{KError, KResult};
 use kpoll::{PollRegisterError, PollRegistrations};
 use kspin::{NoPreemptIrqSave, SpinNoIrq};
 
@@ -36,6 +37,28 @@ impl KWaker {
             woke: SpinNoIrq::new(false),
         })
     }
+
+    // The caller retains a strong task reference across this handshake.
+    fn park(&self) {
+        {
+            let mut woke = self.woke.lock();
+            if *woke {
+                *woke = false;
+                return;
+            }
+        }
+
+        let mut rq = current_run_queue::<NoPreemptIrqSave>();
+        let mut woke = self.woke.lock();
+        if *woke {
+            *woke = false;
+            return;
+        }
+
+        // Publish Blocked before dropping the latch lock, so a concurrent
+        // wake either prevents parking or observes a task it can unblock.
+        rq.blocked_resched(woke);
+    }
 }
 
 impl Wake for KWaker {
@@ -52,6 +75,82 @@ impl Wake for KWaker {
             select_wake_run_queue::<NoPreemptIrqSave>(&task).unblock_task(task, true);
         }
     }
+}
+
+/// Task-bound parking resources prepared before publishing an operation.
+///
+/// This handle is neither Send nor Sync. Only the preparing task may park;
+/// the independently owned [`Waker`] may be notified from IRQ context. Wakeups
+/// are hints, not completion results: callers must recheck their predicate.
+pub struct PreparedTaskWait {
+    task: KtaskRef,
+    kwaker: Arc<KWaker>,
+    _task_bound: PhantomData<*mut ()>,
+}
+
+impl PreparedTaskWait {
+    /// Validates the current context and allocates one reusable waker.
+    ///
+    /// Call with IRQs enabled and without any lock that forbids sleeping.
+    /// The allocation follows the kernel's infallible Arc OOM policy.
+    ///
+    /// # Errors
+    /// Returns [`KError::InvalidInput`] before allocation if no non-idle task
+    /// exists, IRQs are masked, interrupt-like context is active, or preemption
+    /// is disabled where that depth is tracked.
+    pub fn prepare() -> KResult<Self> {
+        let curr = crate::current_may_uninit().ok_or(KError::InvalidInput)?;
+        if !can_prepare_wait(&curr) {
+            return Err(KError::InvalidInput);
+        }
+        let task = curr.clone();
+        let kwaker = KWaker::new(&task);
+        Ok(Self {
+            task,
+            kwaker,
+            _task_bound: PhantomData,
+        })
+    }
+
+    /// Clones the prepared waker without allocating or registering a wait.
+    ///
+    /// It holds only a weak task reference and may outlive this handle.
+    pub fn waker(&self) -> Waker {
+        Waker::from(self.kwaker.clone())
+    }
+
+    /// Parks until a wake hint, consuming a prior hint without blocking.
+    ///
+    /// May return spuriously. No wait registration, waker allocation or signal
+    /// interruption is performed. Callers recheck their completion predicate
+    /// after every return and keep their wake source registered while needed.
+    ///
+    /// # Panics
+    /// Panics if called by another task or outside sleepable context. The
+    /// preparing task must release all locks that forbid sleeping before park.
+    pub fn park(&mut self) {
+        let curr = current();
+        assert!(
+            curr.ptr_eq(&self.task),
+            "prepared wait belongs to another task"
+        );
+        assert!(
+            can_prepare_wait(&curr),
+            "prepared wait cannot park in this context"
+        );
+        self.kwaker.park();
+    }
+}
+
+fn can_prepare_wait(task: &KtaskRef) -> bool {
+    if task.is_idle() || !karch::local_irq_enabled() || kirq::context::is_in_interrupt_context() {
+        return false;
+    }
+    #[cfg(feature = "preempt")]
+    if !task.can_preempt(0) {
+        return false;
+    }
+    true
 }
 
 /// Blocks the current task until the given future is resolved.
@@ -72,32 +171,14 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
 
     loop {
         match fut.as_mut().poll(&mut cx) {
-            Poll::Pending => {
-                {
-                    let mut woke = kwaker.woke.lock();
-                    if *woke {
-                        *woke = false;
-                        continue;
-                    }
-                }
-
-                let mut rq = current_run_queue::<NoPreemptIrqSave>();
-                let mut woke = kwaker.woke.lock();
-                if *woke {
-                    *woke = false;
-                    continue;
-                }
-
-                // blocked_resched() will set *woke = false and drop
-                // the guard internally before rescheduling. When this
-                // task is woken, woke will be set to true by the waker
-                // and we'll re-enter the loop to poll again.
-                rq.blocked_resched(woke);
-            }
+            Poll::Pending => kwaker.park(),
             Poll::Ready(output) => break output,
         }
     }
 }
+
+#[cfg(unittest)]
+mod prepared_tests;
 
 /// Error returned by [`interruptible`].
 #[derive(Debug, PartialEq, Eq)]

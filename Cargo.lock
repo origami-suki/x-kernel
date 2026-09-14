@@ -2224,12 +2224,18 @@ dependencies = [
  "karch",
  "kbuild_config",
  "kclass",
+ "kcpu_id_map",
  "kdevice",
  "kdma",
  "khal",
+ "kirq",
+ "kpoll",
  "kspin 0.2.0-rc2",
+ "ksync",
+ "ktask",
  "ktime_types",
  "lazyinit",
+ "linked_list_r4l",
  "log",
  "memaddr",
  "memspace",
@@ -3126,6 +3132,7 @@ dependencies = [
  "khal",
  "kprocess",
  "kspin 0.2.0-rc2",
+ "ksync",
  "ktask",
  "linkme",
  "memaddr",
@@ -3167,9 +3174,9 @@ dependencies = [
 
 [[package]]
 name = "kvirtiodrivers"
-version = "0.13.2"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdd7ff3fade5722308200da9827ea982e9add9c4655a5b0589849b907a2005f0"
+checksum = "1a849490b1ee4001d897784ce8203950fc3bb990b61385096b10709d707b8a2a"
 dependencies = [
  "bitflags 2.13.1",
  "enumn",
@@ -5504,6 +5511,7 @@ dependencies = [
  "kspin 0.2.0-rc2",
  "ktime_types",
  "kvirtiodrivers",
+ "linked_list_r4l",
  "log",
  "net",
  "pci",

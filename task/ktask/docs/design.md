@@ -17,6 +17,20 @@ x-kernel 将“**调度算法**”与“**任务运行时**”分离：
 
 `ktask` 通过 `kiface` 实现 `kspin::KernelGuardIf`，把 `kspin` 的 guard acquire/release 与任务抢占计数挂接，形成“临界区退出时再检查抢占”的延迟抢占模型。
 
+## 抢占检查的迭代退出
+
+`current_check_preempt_pending()` 在循环中处理 `need_resched`。
+运行队列 guard 恢复 IRQ 时可能产生新的调度请求，因此不能让该 guard 的析构
+再次递归调用抢占检查。每轮在释放 guard 前临时增加一次禁抢占计数：
+计数从 1 变成 2，guard 释放后回到 1，最后通过 `enable_preempt(false)` 回到 0。
+新请求由下一轮循环处理，不丢弃请求，也不随请求次数增长调用栈。
+
+这层临时保护只覆盖抢占检查自身的 guard 释放；普通 guard 的退出行为保持不变。
+调度返回后仍是原任务恢复执行，因此临时计数的增加和撤销归属于同一个任务，
+即使该任务曾切换或迁移到其他 CPU，也必须配对。
+UT 在任务私有的测试探针中重新发布请求，检查处理完毕、计数平衡和栈深度有界；
+该探针及测试字段不进入普通内核。
+
 ## 范围
 
 涉及的源文件：
@@ -140,6 +154,8 @@ rust_main_secondary()
 daemon 任务由 `ktask` 创建、pin 到对应 CPU，并用 IRQ-safe `PollSet` 阻塞等待
 唤醒。daemon 在普通任务上下文调用 `kirq::softirq::run_pending_softirqs()`，
 用于承接 hardirq-exit/BH-enable 直跑未覆盖或 restart budget 之外的 softirq work。
+provider 的 `needs_resched()` 只读当前任务的抢占请求，供 `kirq` 在批次边界决定
+是否提前退避；不会消费请求或调用调度器，无当前任务或未启用 preempt 时返回 false。
 daemon 每完成一轮实际 softirq work 后会主动 `yield_now()`，再回到外层 pending
 检查/等待循环；这对应 Linux `run_ksoftirqd()` 在 `__do_softirq()` 后执行
 `cond_resched()` 的调度友好语义。若等待注册因内存压力等原因失败，daemon 也会
@@ -285,6 +301,16 @@ active exception context 恢复到当前 CPU。否则旧 CPU 会一直认为自�
 
 ### 5) 阻塞/唤醒与 WaitQueue/Future
 
+- `future::PreparedTaskWait` 在发布操作前校验可睡眠上下文，并分配一个
+  `KWaker` Arc；保留一个 task 强引用供 `blocked_resched` 使用。句柄不实现
+  Send/Sync，`park()` 校验当前任务身份；跨上下文传递的是只持 task Weak 的 Waker。
+- `PreparedTaskWait::park()` 和 `block_on` 共享原有的两次 woke 检查：先检查
+  latch，再持 run-queue 锁复查，最后由 `blocked_resched` 发布 Blocked 并释放
+  latch 锁。park 不分配 waker、不注册等待、不检查 signal；调用方保留事件注册，
+  每次返回后重查谓词。虚假唤醒和旧 wake hint 不代表操作完成。
+- prepare 拒绝无任务、idle、IRQ 屏蔽、hardirq/softirq/BH-disabled，以及有
+  preempt 计数配置下的非零禁抢占深度；不能动态识别所有禁止睡眠的锁，调用方
+  仍须负责锁约束。block_on 不新增这套入口校验，保持既有行为。
 - `future::block_on` 在 `Poll::Pending` 下走 `blocked_resched()`，把当前任务置为 `Blocked`。
 - 若 waker 在 `Poll::Pending` 与提交阻塞之间触发，`block_on` 清除 wake 标志后立即重新 poll；不能先 yield，否则满载 CPU 会把已完成的 wake-before-block 竞态转换为无关 runnable task 的排队延迟。
 - 若当前任务正在执行 kwork callback，`block_on` 会在函数级边界通知 `kwork`

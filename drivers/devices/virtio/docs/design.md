@@ -78,7 +78,7 @@ Feature flags 控制编译哪些设备适配器：
 | 组件 | 职责 |
 |------|------|
 | `lib.rs` | 设备探测（`probe_mmio_device` / `probe_pci_device`）、VirtIO 错误到 `DriverError` 的转换、公共类型 re-export |
-| `blk.rs` | 将 `VirtIOBlk` 封装为实现 `BlockDevice` 的 `VirtIoBlkDev` |
+| `blk.rs` / `blk/requests.rs` | `VirtIoBlkDev` 实现 `BlockDeviceOperations`，管理准入、请求及 DMA 回收 |
 | `gpu.rs` | 将 `VirtIOGpu` 封装为实现 `DisplayDevice` 的 `VirtIoGpuDev` |
 | `input.rs` | 将 `VirtIOInput` 封装为实现 `InputDevice` 的 `VirtIoInputDev` |
 | `net.rs` | 将 `VirtIONetRaw` 封装为实现 `NetDevice` 的 `VirtIoNetDev`，管理收发缓冲区、IRQ ack 和网络 RX scheduler 调度 |
@@ -98,6 +98,11 @@ Feature flags 控制编译哪些设备适配器：
   设备探测、feature 协商、virtqueue 分配和 IRQ 注册
   通常发生在启动期或驱动注册期，
   需要底层内存分配、DMA 支持和中断设施已经可用。
+- **PCI vsock 使用轮询**：`probe_pci_device` 在驱动初始化前设置该 PCI
+  function 的 `Command::INTERRUPT_DISABLE`，禁止其 INTx 输出。收发继续由
+  vsock 轮询路径推进；不屏蔽控制器上的共享 IRQ，也不影响 blk 等设备。
+  `VirtIoVsockDev` 不上报 IRQ 编号。此策略仅覆盖 PCI INTx，不能视为
+  MMIO 或未来 MSI-X vsock 的通用中断禁用机制。
 - **普通设备操作不应在错误的中断语境中执行**：
   块设备同步 I/O、9p 请求、GPU flush、
   网络缓冲区回收等路径可能持有锁或等待设备完成，
@@ -110,7 +115,7 @@ Feature flags 控制编译哪些设备适配器：
   ack 设备中断后只调用上层通过 `driver_net::NetRxScheduler`
   attach 的 RX 调度能力，不直接运行协议栈或 socket 唤醒逻辑。
 - **设备对象的共享安全依赖 trait 约束和内部封装**：
-  非 net 设备主要通过 `&mut self` 独占访问；
+  blk 使用内部锁保护队列和请求状态；其他非 net 设备主要通过 `&mut self` 独占访问；
   net 设备依赖内部锁和 token-buffer 对应关系维持正确性。
 - **上层必须尊重 handle 生命周期**：
   例如 net 设备返回的 TX/RX handle
@@ -135,21 +140,21 @@ Uninitialized ──probe──> Probed ──try_new──> Ready ──ops─�
 | Ready | Active | 首次调用驱动操作（如 `read_block`、`send` 等） |
 | Active | Failed | 设备返回不可恢复错误 |
 
-### 块设备请求状态
+### Block Request State
 
-```
-Idle ──read_block/write_block──> Pending ──设备响应──> Complete ──返回──> Idle
-  │                                                              │
-  └────────────────────── flush ──设备响应──> Complete ───────────┘
-```
+The host uses `try_new_irq`; `try_new` remains an explicit legacy polling
+constructor, not a setup-error fallback. IRQ construction takes PrepareBlockWait, disables
+queue interrupts initially and allocates per-device request bookkeeping.
+This is explicit construction, never fallback after IRQ setup failure.
 
-| 从 | 到 | 触发条件 |
-|----|----|----------|
-| Idle | Pending | 调用 `read_block()`、`write_block()` 或 `flush()`，请求提交到 VirtIO 队列 |
-| Pending | Complete | 设备完成 I/O 操作，`virtio-drivers` 内部轮询获取结果 |
-| Complete | Idle | 返回 `DriverResult`，设备回到空闲状态 |
-
-> 块设备为同步模型：每次请求阻塞等待完成，无并发请求。
+IRQ mode uses Prepared -> Pending -> Submitted(token) -> Done(result).
+No-op flush and pre-submit errors go directly from Pending to Done.
+Completing is the critical section between descriptor reclamation and Done;
+Retired is the synchronous frame's exit, not another published enum value.
+The caller pins Request on its stack; it owns protocol fields, direct caller
+buffer identity, links and a signals Arc. BlockRequests owns a non-owning
+RawList FIFO, a descriptor-sized token index, and preallocated notification
+scratch. Software backlog follows calling concurrency, not a 16-call cap.
 
 ### GPU 设备 scanout resource 状态
 
@@ -278,36 +283,44 @@ Idle ──request──> Waiting ──设备响应──> ResponseReady ──
 3. 映射设备类型为 `DeviceKind`（通过 `as_device_kind()`）
 4. 返回 `(DeviceKind, MmioTransport)`
 
-### 块设备读写
+### Block Reads, Writes And Flushes
 
-**初始化流程**：
+The unchanged BlockDeviceOperations methods route by the constructor-selected
+wait provider. Legacy instances call the dependency's polling operations.
 
-1. `try_new(transport)` → `InnerDev::new(transport)`：协商 feature、分配 VirtIO 队列
-2. 通过 `InnerDev::readonly()` 读取协商后的 `VIRTIO_BLK_F_RO`，并经
-   `BlockDeviceOperations::is_inherently_read_only()` 交给 block core
-3. 记录 `SECTOR_SIZE`（512 字节）作为 `block_size`
+For IRQ instances:
+1. Reject read-only writes and invalid size/range, then prepare task-local wait
+   resources before exposing a request to the device.
+2. Pin the request, enqueue it under the device SpinNoIrq, and let only the FIFO
+   head call read_blocks_nb, write_blocks_nb or flush_nb.
+3. QueueFull leaves the node pending. Sleep outside the lock using admission
+   notifications; pre-submit wait errors unlink in O(1) and notify the new head.
+4. A successful submission installs the token under that same lock before any
+   completion can inspect it. A no-op flush has no token and returns immediately.
+   Both success and failure hand admission to the next head.
+5. Terminal waiting only checks Done under the device lock and uses the prepared
+   terminal source. There is no device polling and no fallible post-submit wait.
+6. The host's serialized BlockCompletionOperations pass harvests a finite used
+   batch without submitting new work. It reclaims the exact original buffers,
+   clears token/operation pointers, retains independent signals, then publishes
+   Done. All notifications run after the device lock is released.
 
-**读取流程**：
+Used-token absence/range failures and descriptor-pop failures are fatal invariant
+violations. IO_ERR/UNSUPPORTED after successful pop become ordinary driver errors.
+NotReady is ambiguous in the dependency and fails closed. The IRQ constructor
+rejects panic-unwind builds, preventing unwinding of stack nodes through live DMA.
 
-1. 调用 `read_block(block_id, buf)`
-2. 内部调用 `read_blocks(sector, out_buf)`，将读请求提交到 VirtIO 队列
-3. `virtio-drivers` 内部轮询等待设备响应
-4. 数据写入 `buf`，返回 `DriverResult`
-
-**写入流程**：
-
-1. 调用 `write_block(block_id, buf)`
-2. 在持有设备锁时检查 `InnerDev::readonly()`；只读设备直接返回 `DriverError::ReadOnly`
-3. 可写设备调用 `write_blocks(sector, in_buf)`，将写请求提交到 VirtIO 队列
-4. `virtio-drivers` 内部轮询等待设备响应
-5. 返回 `DriverResult`
-
-**刷新流程**：
-
-1. 调用 `flush()`，将 flush 请求提交到 VirtIO 队列
-2. 等待设备确认，返回 `DriverResult`
-
-> 块设备为同步模型：每次请求阻塞等待完成，无并发 I/O。
+The only new persistent allocations are the descriptor-sized token index and
+Q notification scratch, both allocated at construction. Requests are stack
+pinned and no new data buffer/copy is introduced. Existing host wait metadata,
+HAL bounce mapping and negotiated indirect-table allocations remain. The scratch
+is taken and restored by the serialized per-device callback, never grown.
+Under the device lock each occupied token contributes at most one notification;
+the pending FIFO head's admission signal is kept separately. Thus Q entries
+suffice even with indirect descriptors. At Q=16 on a 64-bit target the token
+index uses 128 bytes and notification elements use 256 bytes, excluding container
+headers and allocator overhead. The logical sector size is the protocol's fixed
+512 bytes, not per-device mutable state.
 
 ### GPU 设备 scanout resource
 
@@ -440,7 +453,10 @@ Idle ──request──> Waiting ──设备响应──> ResponseReady ──
 
 ## 并发模型
 
-- **blk / gpu / input / socket / virtio_9p**：所有操作通过 `&mut self` 独占访问，
+- **blk**: shared synchronous callers use one device SpinNoIrq for queue/state;
+  all task waits and notifications occur outside it. IRQ acknowledgement uses
+  the same lock; the host serializes per-device completion passes.
+- **gpu / input / socket / virtio_9p**：所有操作通过 `&mut self` 独占访问，
   调用者负责串行化，模块内部无锁。
 - **net**：`InnerDev` 被 `Arc<SpinNoIrq<...>>` 包裹，因为 IRQ 回调在中断上下文中
   访问设备（`ack_interrupt`），与正常收发路径并发。全局静态变量
@@ -477,3 +493,20 @@ Idle ──request──> Waiting ──设备响应──> ResponseReady ──
 `Drop`，设备资源（DMA 缓冲区、VirtIO 队列）的释放依赖 `virtio-drivers` 内部类型的
 `Drop` 实现。当设备结构体离开作用域时，`InnerDev` 的 `Drop` 会自动通知设备重置
 并释放 DMA 内存。
+
+For IRQ block instances, host activation keeps the device alive through admitted
+I/O drain, device IRQ suppression, native Irq release and reclaimer stop.
+BlockState represents Live by is_accepting with Some(transport), Closing by
+!is_accepting with Some(transport), and Closed by !is_accepting with None.
+BlockCall counts every synchronous call from entry, including wait preparation;
+its Drop decrements the count and notifies the closing task outside the lock.
+Closing rejects new calls with Io but leaves existing FIFO submission rights
+intact. begin_close receives a fresh closing-task signal; finish_close requires
+drained calls/requests and stopped callbacks, takes InnerDev under the lock and
+drops it outside the lock in task context. Retained Gendisk references own only
+inert state; cached geometry/read-only queries never require a live transport.
+No concrete driver imports ktask/kirq.
+
+Request tests live in blk/tests/requests.rs and remain a child of the requests
+module through #[path]. The blk directory holds runtime request code; requests
+does not need a separate directory solely to contain tests.

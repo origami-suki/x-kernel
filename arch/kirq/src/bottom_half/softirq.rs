@@ -28,6 +28,13 @@ pub type SoftirqAction = fn();
 /// task layer owns the sleepable daemon task that drains deferred work.
 #[kiface::interface]
 pub trait SoftirqDaemonIf {
+    /// Reports a pending scheduling request for the current task.
+    ///
+    /// Called with local IRQs disabled and the CPU pinned. This query must not
+    /// schedule, block, or consume the request. Return false before task setup
+    /// and when kernel preemption is disabled by configuration.
+    fn needs_resched() -> bool;
+
     /// Wakes the daemon serving the current CPU's pending softirq state.
     ///
     /// Implementations must be callable from IRQ-disabled context.
@@ -203,7 +210,7 @@ pub enum SoftirqRunResult {
     NoPending,
     /// At least one softirq action ran.
     Ran,
-    /// Pending work exists but current context or restart limits prevented a full run.
+    /// Pending work remains due to context, a scheduling request, or the restart limit.
     Deferred,
 }
 
@@ -284,6 +291,10 @@ pub fn run_pending_softirqs() -> SoftirqRunResult {
 ///
 /// The function is public within the crate for IRQ-tail and BH-enable paths.
 pub(crate) fn run_pending_softirqs_irqoff() -> SoftirqRunResult {
+    run_pending_softirqs_irqoff_with_resched(SoftirqDaemonIf::needs_resched)
+}
+
+fn run_pending_softirqs_irqoff_with_resched(needs_resched: impl Fn() -> bool) -> SoftirqRunResult {
     let _guard = NoPreempt::new();
     if pending_ref().load(Ordering::Acquire) & SOFTIRQ_VALID_MASK == 0 {
         return SoftirqRunResult::NoPending;
@@ -310,14 +321,17 @@ pub(crate) fn run_pending_softirqs_irqoff() -> SoftirqRunResult {
         ran_any = true;
 
         restarts_left -= 1;
-        if restarts_left == 0 {
-            let remaining = pending_ref().load(Ordering::Acquire) & SOFTIRQ_VALID_MASK;
-            if remaining != 0 {
-                record_restart_limit_hit();
-                wake_softirqd();
-                return SoftirqRunResult::Deferred;
-            }
+        let remaining = pending_ref().load(Ordering::Acquire) & SOFTIRQ_VALID_MASK;
+        if remaining == 0 {
             return SoftirqRunResult::Ran;
+        }
+        if restarts_left == 0 {
+            record_restart_limit_hit();
+        }
+        // Finish the current batch before yielding so even a busy daemon makes progress.
+        if restarts_left == 0 || needs_resched() {
+            wake_softirqd();
+            return SoftirqRunResult::Deferred;
         }
     }
 }
@@ -627,6 +641,11 @@ pub mod tests_softirq {
     static LIMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
     static ACTION_IRQ_ENABLED: AtomicUsize = AtomicUsize::new(0);
 
+    fn run_with_resched(needs_resched: impl Fn() -> bool) -> SoftirqRunResult {
+        let _guard = kspin::NoPreemptIrqSave::new();
+        super::run_pending_softirqs_irqoff_with_resched(needs_resched)
+    }
+
     fn record_order(slot: &AtomicUsize) {
         if slot.load(Ordering::Relaxed) == 0 {
             let order = ORDER_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -731,7 +750,7 @@ pub mod tests_softirq {
         let _rcu = ScopedSoftirqAction::install(SoftirqVec::Rcu, reraise_action);
 
         raise_softirq(SoftirqVec::Rcu);
-        assert_eq!(run_pending_softirqs(), SoftirqRunResult::Ran);
+        assert_eq!(run_with_resched(|| false), SoftirqRunResult::Ran);
         assert_eq!(RERAISE_CALLS.load(Ordering::Relaxed), 2);
     }
 
@@ -744,7 +763,7 @@ pub mod tests_softirq {
         raise_softirq(SoftirqVec::Sched);
         clear_softirq_diagnostics();
 
-        assert_eq!(run_pending_softirqs(), SoftirqRunResult::Deferred);
+        assert_eq!(run_with_resched(|| false), SoftirqRunResult::Deferred);
         assert!(LIMIT_CALLS.load(Ordering::Relaxed) >= 10);
         assert!(local_softirq_pending() & (1usize << SoftirqVec::Sched.as_usize()) != 0);
         assert_eq!(softirq_diagnostics().restart_limit_hits, 1);
@@ -752,7 +771,48 @@ pub mod tests_softirq {
     }
 
     #[def_test(serial)]
+    fn test_softirq_resched_finishes_batch_and_preserves_pending() {
+        let _wake_gate = begin_softirq_test();
+        RERAISE_CALLS.store(0, Ordering::Relaxed);
+        HIGH_ORDER.store(0, Ordering::Relaxed);
+        let _high = ScopedSoftirqAction::install(SoftirqVec::High, high_action);
+        let _rcu = ScopedSoftirqAction::install(SoftirqVec::Rcu, reraise_action);
+        raise_softirq(SoftirqVec::High);
+        raise_softirq(SoftirqVec::Rcu);
+        clear_softirq_diagnostics();
+
+        assert_eq!(run_with_resched(|| true), SoftirqRunResult::Deferred);
+        assert!(HIGH_ORDER.load(Ordering::Relaxed) != 0);
+        assert_eq!(RERAISE_CALLS.load(Ordering::Relaxed), 1);
+        assert!(local_softirq_pending() & (1usize << SoftirqVec::Rcu.as_usize()) != 0);
+        assert_eq!(softirq_diagnostics().daemon_wake_requests, 1);
+        assert_eq!(softirq_diagnostics().restart_limit_hits, 0);
+
+        assert_eq!(run_with_resched(|| false), SoftirqRunResult::Ran);
+        assert_eq!(RERAISE_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(local_softirq_pending(), 0);
+    }
+
+    #[def_test(serial)]
+    fn test_softirq_empty_pending_does_not_query_resched() {
+        let _wake_gate = begin_softirq_test();
+        let _high = ScopedSoftirqAction::install(SoftirqVec::High, high_action);
+        raise_softirq(SoftirqVec::High);
+        clear_softirq_diagnostics();
+
+        assert_eq!(
+            run_with_resched(|| panic!("drained work must not query rescheduling")),
+            SoftirqRunResult::Ran
+        );
+        assert_eq!(softirq_diagnostics().daemon_wake_requests, 0);
+        assert_eq!(local_softirq_pending(), 0);
+    }
+
+    #[def_test(serial)]
     fn test_softirq_deferred_in_bh_disabled_context() {
+        // Real IRQ tails also record BH-disabled deferrals on this CPU.
+        // Exclude them while checking the exact synthetic-run counters.
+        let _irq_guard = kspin::NoPreemptIrqSave::new();
         let _wake_gate = begin_softirq_test();
         HIGH_ORDER.store(0, Ordering::Relaxed);
         let _high = ScopedSoftirqAction::install(SoftirqVec::High, high_action);

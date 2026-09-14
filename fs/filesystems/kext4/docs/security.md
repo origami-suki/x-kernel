@@ -220,6 +220,12 @@ exclusive data lock 下先把 hole reservation 发布到同一个 delayed set，
 
 ## 故障模式与影响分析（FMEA）
 
+Namespace removal 对不支持的 orphan-file 格式必须在首个 metadata mutation 前
+拒绝，否则删除目录项后才遇到 `Unsupported` 会触发 fail-closed journal abort。
+共享的 eviction preflight 覆盖 unlink、rmdir、覆盖式 rename 和 final eviction；
+多硬链接且不会归零的普通 inode 不要求 orphan entry。回归检查拒绝后的目录项、
+链接数、orphan head、磁盘字节和 journal 可继续同步性。
+
 | 编号 | 故障模式 | 故障原因 | 局部影响 | 系统影响 | 严重度 | 应对措施 |
 |------|----------|----------|----------|----------|--------|----------|
 | F-01 | 对 Linux ext4 有效 feature 返回 unsupported | EA inode、bigalloc、orphan-file、inline-data write 等 feature 尚未实现 | 当前操作失败 | filesystem 仍保持可审计状态，但该能力不可用 | 3 | feature negotiation 和显式 `UnsupportedKind` |

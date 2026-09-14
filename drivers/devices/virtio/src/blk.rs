@@ -3,10 +3,13 @@
 // See LICENSES for license details.
 
 //! VirtIO block driver adapter.
-use alloc::string::String;
+use alloc::{string::String, sync::Arc};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use block::BlockDeviceOperations;
+use block::{
+    BlockDeviceOperations,
+    completion::{BlockSignals, PrepareBlockWait},
+};
 use driver_base::{Device, DeviceKind, DriverError, DriverResult};
 use kspin::SpinNoIrq;
 use virtio_drivers::{
@@ -16,6 +19,44 @@ use virtio_drivers::{
 };
 
 use crate::as_driver_error;
+
+mod requests;
+use requests::BlockRequests;
+#[cfg(unittest)]
+pub use requests::tests::{
+    Hardware as BlockTestHardware, QueueTransport as BlockTestTransport,
+    TrackedHal as BlockTestHal, block_test_disk,
+};
+
+struct BlockState<H: Hal, T: Transport> {
+    device: Option<InnerDev<H, T>>,
+    requests: Option<BlockRequests>,
+    is_accepting: bool,
+    active_calls: usize,
+    drain_notification: Option<Arc<dyn BlockSignals>>,
+}
+
+// Covers wait preparation as well as pending/submitted requests. The borrowed
+// device remains alive until the call retires, even if public lookup is removed.
+struct BlockCall<'a, H: Hal, T: Transport>(&'a VirtIoBlkDev<H, T>);
+
+impl<H: Hal, T: Transport> Drop for BlockCall<'_, H, T> {
+    fn drop(&mut self) {
+        let notification = {
+            let mut state = self.0.state.lock();
+            assert!(state.active_calls > 0);
+            state.active_calls -= 1;
+            if state.active_calls == 0 && !state.is_accepting {
+                state.drain_notification.take()
+            } else {
+                None
+            }
+        };
+        if let Some(notification) = notification {
+            notification.notify_completion();
+        }
+    }
+}
 
 /// Number of minor bits reserved for partitions of one virtio disk.
 pub const PART_BITS: u32 = 4;
@@ -67,9 +108,10 @@ fn vd_name(index: u32) -> String {
 /// blk.read_block(0, &mut buf)?;
 /// ```
 pub struct VirtIoBlkDev<H: Hal, T: Transport> {
-    device: SpinNoIrq<InnerDev<H, T>>,
-    sector_size: usize,
+    state: SpinNoIrq<BlockState<H, T>>,
+    prepare_wait: Option<PrepareBlockWait>,
     num_blocks: u64,
+    is_read_only: bool,
     name: String,
     index: u32,
 }
@@ -77,12 +119,11 @@ pub struct VirtIoBlkDev<H: Hal, T: Transport> {
 // SAFETY: VirtIoBlkDev serializes all access to the inner VirtIOBlk through
 // its own `SpinNoIrq` lock. The inner VirtIOBlk is not auto Send due to
 // PhantomData, but it is safe to transfer across threads behind that lock.
-// The lock must mask interrupts for the duration of each device access,
-// because the synchronous request path busy-polls the used ring while holding
-// the lock. On targets without per-device MSI-X (e.g. x86, where virtio falls
-// back to a shared level-triggered INTx line that the block driver never
-// acks), leaving local interrupts enabled during the poll lets the shared line
-// re-assert continuously and livelock the CPU in an interrupt storm.
+// It also protects the intrusive request links, token pointers and request
+// state in IRQ mode. Each pointer indexes a call-owned pinned node; terminal
+// publication removes all external node references before that call returns.
+// Legacy polling still masks interrupts to avoid shared-level IRQ livelock.
+// IRQ mode holds this lock only for submission/ack/reclamation, never waiting.
 unsafe impl<H: Hal, T: Transport> Send for VirtIoBlkDev<H, T> {}
 // SAFETY: shared access to the device is serialized by the IRQ-safe lock
 // described above, so immutable references may be shared across threads safely.
@@ -98,15 +139,134 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
     /// negotiation failure, queue allocation failure, DMA error).
     pub fn try_new(transport: T) -> DriverResult<Self> {
         let device = Self::init_device(transport)?;
+        Ok(Self::from_device(device, None))
+    }
+
+    /// Prepares interrupt-driven request handling without publishing the disk.
+    ///
+    /// Call in task context. The host must install its shared IRQ handler and
+    /// completion executor, then enable interrupts before allowing I/O. Setup
+    /// failure must not fall back to the polling constructor. The host retains
+    /// this device until all admitted calls and completion callbacks retire.
+    ///
+    /// # Errors
+    /// Returns initialization errors from the transport, or Unsupported when
+    /// built with unwinding: submitted stack nodes cannot unwind through DMA.
+    pub fn try_new_irq(transport: T, prepare_wait: PrepareBlockWait) -> DriverResult<Self> {
+        if cfg!(panic = "unwind") {
+            return Err(DriverError::Unsupported);
+        }
+        let mut device = Self::init_device(transport)?;
+        device.disable_interrupts();
+        Ok(Self::from_device(device, Some(prepare_wait)))
+    }
+
+    fn from_device(device: InnerDev<H, T>, prepare_wait: Option<PrepareBlockWait>) -> Self {
         let num_blocks = device.capacity();
+        let is_read_only = device.readonly();
         let index = VD_INDEX.fetch_add(1, Ordering::Relaxed);
-        Ok(Self {
-            device: SpinNoIrq::new(device),
-            sector_size: SECTOR_SIZE,
+        let requests = prepare_wait.map(|_| BlockRequests::new(device.virt_queue_size()));
+        Self {
+            state: SpinNoIrq::new(BlockState {
+                device: Some(device),
+                requests,
+                is_accepting: true,
+                active_calls: 0,
+                drain_notification: None,
+            }),
+            prepare_wait,
             num_blocks,
+            is_read_only,
             name: alloc::format!("vd{}", vd_name(index)),
             index,
-        })
+        }
+    }
+
+    /// Enables queue interrupts after the host installed IRQ/completion handling.
+    ///
+    /// # Panics
+    /// Panics if closing has begun or the transport has been destroyed.
+    pub fn enable_interrupts(&self) {
+        let mut state = self.state.lock();
+        assert!(state.is_accepting);
+        state
+            .device
+            .as_mut()
+            .expect("live block transport")
+            .enable_interrupts();
+    }
+
+    /// Suppresses queue interrupts after admitted I/O has drained during close.
+    /// This does not unregister the host IRQ action or stop an in-flight callback.
+    pub fn disable_interrupts(&self) {
+        if let Some(device) = self.state.lock().device.as_mut() {
+            device.disable_interrupts();
+            device.ack_interrupt();
+        }
+    }
+
+    /// Rejects new I/O and signals when every previously admitted call retires.
+    ///
+    /// The host serializes close, supplies a fresh closing-task notification,
+    /// then withdraws disk lookup and waits without device/registry locks. Keep
+    /// IRQ and completion processing active until the drain signal is observed.
+    /// Live is accepting with a transport; Closing retains a transport without
+    /// accepting; Closed has neither. This method does not destroy the transport.
+    ///
+    /// # Panics
+    /// Panics if another close is already draining this device.
+    pub fn begin_close(&self, notification: Arc<dyn BlockSignals>) {
+        let is_drained = {
+            let mut state = self.state.lock();
+            assert!(
+                state.is_accepting || state.device.is_none(),
+                "concurrent block close"
+            );
+            state.is_accepting = false;
+            if state.active_calls == 0 {
+                true
+            } else {
+                state.drain_notification = Some(notification.clone());
+                false
+            }
+        };
+        if is_drained {
+            notification.notify_completion();
+        }
+    }
+
+    /// Destroys a drained transport in task context, leaving retained disks inert.
+    ///
+    /// The host must first suppress device interrupts, release/synchronize its
+    /// native IRQ action and stop the device reclaimer. Never call in a callback.
+    /// Repeated calls after close are harmless. Cached geometry remains available.
+    ///
+    /// # Panics
+    /// Panics if admission is still open, calls remain active, or request
+    /// reclamation has not finished.
+    pub fn finish_close(&self) {
+        let device = {
+            let mut state = self.state.lock();
+            assert!(!state.is_accepting && state.active_calls == 0);
+            if let Some(requests) = &state.requests {
+                assert!(requests.is_drained());
+            }
+            state.device.take()
+        };
+        // Transport reset and coherent queue deallocation require task context.
+        drop(device);
+    }
+
+    fn admit_call(&self) -> DriverResult<BlockCall<'_, H, T>> {
+        let mut state = self.state.lock();
+        if !state.is_accepting {
+            return Err(DriverError::Io);
+        }
+        state.active_calls = state
+            .active_calls
+            .checked_add(1)
+            .expect("block call count overflow");
+        Ok(BlockCall(self))
     }
 
     /// Returns the discovery-order disk index retained for driver cleanup and
@@ -117,23 +277,6 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
 
     fn init_device(transport: T) -> DriverResult<InnerDev<H, T>> {
         InnerDev::new(transport).map_err(as_driver_error)
-    }
-
-    fn read_sector(&self, sector: u64, out_buf: &mut [u8]) -> DriverResult {
-        self.device
-            .lock()
-            .read_blocks(sector as usize, out_buf)
-            .map_err(as_driver_error)
-    }
-
-    fn write_sector(&self, sector: u64, in_buf: &[u8]) -> DriverResult {
-        let mut device = self.device.lock();
-        if device.readonly() {
-            return Err(DriverError::ReadOnly);
-        }
-        device
-            .write_blocks(sector as usize, in_buf)
-            .map_err(as_driver_error)
     }
 }
 
@@ -155,23 +298,56 @@ impl<H: Hal, T: Transport> BlockDeviceOperations for VirtIoBlkDev<H, T> {
 
     #[inline]
     fn block_size(&self) -> usize {
-        self.sector_size
+        SECTOR_SIZE
     }
 
     fn is_inherently_read_only(&self) -> bool {
-        self.device.lock().readonly()
+        self.is_read_only
     }
 
     fn read_block(&self, block_id: u64, buf: &mut [u8]) -> DriverResult {
-        self.read_sector(block_id, buf)
+        let _call = self.admit_call()?;
+        if let Some(prepare) = self.prepare_wait {
+            return self.read_request(block_id, buf, prepare);
+        }
+        self.state
+            .lock()
+            .device
+            .as_mut()
+            .expect("admitted block transport")
+            .read_blocks(block_id as usize, buf)
+            .map_err(as_driver_error)
     }
 
     fn write_block(&self, block_id: u64, buf: &[u8]) -> DriverResult {
-        self.write_sector(block_id, buf)
+        let _call = self.admit_call()?;
+        if let Some(prepare) = self.prepare_wait {
+            return self.write_request(block_id, buf, prepare);
+        }
+        let mut state = self.state.lock();
+        if self.is_read_only {
+            return Err(DriverError::ReadOnly);
+        }
+        state
+            .device
+            .as_mut()
+            .expect("admitted block transport")
+            .write_blocks(block_id as usize, buf)
+            .map_err(as_driver_error)
     }
 
     fn flush(&self) -> DriverResult {
-        self.device.lock().flush().map_err(as_driver_error)
+        let _call = self.admit_call()?;
+        if let Some(prepare) = self.prepare_wait {
+            return self.flush_request(prepare);
+        }
+        self.state
+            .lock()
+            .device
+            .as_mut()
+            .expect("admitted block transport")
+            .flush()
+            .map_err(as_driver_error)
     }
 }
 

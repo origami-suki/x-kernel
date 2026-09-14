@@ -200,6 +200,12 @@ block-special inode 统一安装 KVFS 的 `DefaultBlkdevFileOperations`，对应
 durability 请求传给 backend。KVFS 不维护第二张 `dev_t -> DeviceFileOps` 表；
 devfs 只投影名称与 `rdev`，loop 设备也按普通 `Gendisk` 发布。
 
+块设备文件的 byte I/O 先按当前容量裁剪。若 offset 和裁剪后的长度均按 backend
+block size 对齐，整个借用 buffer 经一次 general block 调用提交，利用既有的连续多块
+契约，避免每个 sector 都重复提交和等待；不跨文件调用合并，也不增加数据复制。
+未对齐请求保留逐块读取或 read-modify-write。一次多块调用只有整体成功或错误结果，
+KVFS 不猜测失败请求内部完成了多少 sector，不在错误后自动拆小重试写入。
+
 `FsContext` 对应 Linux `struct fs_context`，保存 `fs_type`、mount/reconfigure purpose、source、
 一页有界的 kernel-owned opaque mount data、`sb_flags`/`sb_flags_mask`、mounter credential、
 静态 operations、可选 parsed `fs_private` 和拟议 `s_fs_info`。opaque data 只借用于同步

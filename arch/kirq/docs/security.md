@@ -2,6 +2,16 @@
 
 ## 信任模型
 
+测试辅助 `ScopedHardIrqContext` 自己持有 `NoPreemptIrqSave`，先固定 CPU 并
+关闭本地 IRQ，再增加 hardirq 深度；析构时先恢复上下文计数，再恢复 IRQ 和
+抢占。仅设置 per-CPU 计数不足以模拟 hardirq，否则锁释放触发的任务切换可能
+让其他任务继承错误的中断上下文。该辅助仅在 unittest 配置编译。
+
+替换 deferred executor 的测试通过 `ScopedDeferredExecutor` 保存并恢复原入口，
+同时覆盖注册状态和 IRQ-tail 原子快路径。测试结束只清空入口会永久切断已启动的
+softirq 执行，导致真实设备已经置位的完成事件无人处理；作用域恢复在重新允许
+本地 IRQ 和抢占之前完成，不改变生产注册策略。
+
 `kirq` 不直接暴露用户态 ABI。它信任内核调用者提供的 handler 和 descriptor
 符合执行上下文约束，同时把以下边界视为外部依赖：
 
@@ -227,7 +237,10 @@ handoff；softirq pending state 使用每 CPU pending mask 和 context gating。
 pending bit 前重新关闭。`ktask` 提供 per-CPU `ksoftirqd/N`，但 `kirq` 只通过
 `SoftirqDaemonIf` 请求唤醒当前 CPU daemon，不创建任务或阻塞。hardirq、active
 softirq 和 BH-disabled context 中 raise softirq 只保留 pending bit；direct runner
-超过 restart 上限时保留 pending、记录诊断计数，并唤醒 `ksoftirqd/N`。
+每批 action 返回后，若仍有 pending 且当前任务需要调度，或达到 restart 上限，
+保留 pending 并唤醒 `ksoftirqd/N`；仅 restart 耗尽记录 restart-limit 计数。
+`SoftirqDaemonIf::needs_resched()` 只读任务请求，不清除它，也不在 IRQ-disabled
+runner 内执行调度。没有任务或未启用 preempt 时返回 false。
 `raise_softirq_irqoff()` 期望调用方已经关闭 local IRQ；若 debug/UT 路径发现误用，
 会记录诊断并临时关闭 local IRQ 后再访问 per-CPU pending/context state。
 BH-disabled state 使用 `LocalBhGuard` RAII 管理，guard 持有 `NoPreempt` 并通过类型

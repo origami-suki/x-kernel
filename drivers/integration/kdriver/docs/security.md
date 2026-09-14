@@ -53,6 +53,17 @@ device-res-xkernel / kirq / khal / kdma / memspace / driver crates
 
 ## External Boundaries and Attack Surface
 
+The block wait provider is a safe-code host adapter, not a DMA owner. It
+validates sleepable task context before source construction. A private terminal
+registration stays alive until completion or waiter drop; only the permanent
+terminal source can detach it for notification. Admission uses separate guards.
+No terminal wait failure can release a submitted caller's buffers, and spurious
+wakes only repeat the completion predicate. Signals retain no request/device
+pointer and may outlive the waiter. Notifications run outside device/registry
+locks; kpoll invokes KWaker after releasing its source lock. Infallible Arc/Box
+allocation retains kernel OOM policy. Request submission, admission cancellation
+and DMA retirement are enforced by the virtio request transaction layer.
+
 `kdriver` is a core kernel crate that processes hardware description data.
 Its attack surface primarily consists of untrusted physical addresses, IRQ numbers,
 and device identities supplied by firmware, together with runtime configuration
@@ -89,6 +100,64 @@ Threat analysis should cover:
 - Whether devres release ordering during device removal can cause use-after-free.
 
 ## Unsafe Code Inventory
+
+### Block IRQ Provider Delegation
+
+block_irq adds no unsafe code and no IRQ membership registry. Each registered
+closure owns only a Weak device and the reclaimer Arc. Activation must retain
+the strong device until the returned Irq has been dropped and the reclaimer
+has stopped. The X-Kernel provider releases only the device's action token and
+delegates escaped-callback synchronization to kirq; block does not duplicate
+that bookkeeping or mask a shared line. Current kirq synchronization waits for
+line-wide in-flight dispatches, not only this device's callback.
+
+Provider resource/capacity errors propagate without publication or fallback.
+The closure is dropped on failed registration, releasing its reclaimer clone.
+The adapter mock verifies forwarding and token ownership, not asynchronous
+release; existing kirq tests cover in-flight dispatch synchronization.
+Production activation owns the actual admitted-I/O and transport shutdown path.
+BlockActivation remains task-owned and is never captured by an IRQ callback.
+Its unique registry close action is taken outside the registry mutex and invoked
+by driver.remove before bus teardown, or by failed-probe cleanup. Device-core
+serializes removal with begin_removing; devres fallback repeats only after the
+first close has returned. IRQ registration and class publication failures run
+the same partial-owner destructor without publishing a polling-only disk.
+
+Close prepares task-bound waiters before changing state, marks Closing and
+withdraws its owned block lookup, then drains all admitted calls including FIFO
+and preparation. IRQ/reclaimer stay live through that drain. Only then does close
+suppress device interrupts, release/synchronize the native action, stop the
+reclaimer and destroy the transport. Close cannot return a recoverable error
+that permits device-core to free resources with DMA still live. Invalid context
+is fatal; no forced reset or timeout is introduced. Retained Gendisk references
+contain inert device state, not a transport whose final Drop could occur in IRQ.
+
+### Block Device Completion State
+
+`block_completion_dispatch` uses UnsafeCell<ProcessingState> to couple each stable BlockIoReclaimer's state to
+the single PENDING_DEVICES lock, rather than adding independently ordered slot locks.
+Every state access, list push and list pop holds that lock. Only the owning,
+pinned CPU consumes its finite detached batch. Queued also means detached, so
+remote requests cannot link the same device completion twice. List<Arc<BlockIoReclaimer>> retains
+the allocation; the module never manufactures raw ownership pointers.
+
+The unsafe Sync implementation relies on this lock discipline, stable Arc
+ownership, and Send+Sync devices. The fields remain private to block_completion_dispatch.
+Device upgrade/callback/drop happen outside PENDING_DEVICES, and drop precedes publishing
+Idle or notifying stop. Stop signals are independently Arc-owned and invoked
+outside the lock. Arc Drop does not stop producers; activation must explicitly
+call stop_and_wait with a fresh prepared waiter before freeing device resources.
+The task-only stop_lock serializes concurrent closers through the wait so the
+single stop_notification cannot be overwritten. IRQ/softirq never acquire it.
+The only nesting is stop_lock -> PENDING_DEVICES; callbacks never hold either.
+The provider trusts finite non-sleeping callbacks and online CPU progress.
+No user-controlled pointers or device DMA state enter this executor.
+
+State mutation is centralized in private `update_state`, except the atomic
+batch-pop/Running transition under the same lock. The closure cannot return a
+borrow into the protected state. Preparation is now an injected function, not
+a factory object; task binding, notification lifetime and allocation policy
+remain unchanged.
 
 ### 1. device-res-xkernel — DMA Allocation
 
@@ -468,7 +537,7 @@ Impact levels:
 | F-03 | One device fails probe | The driver's `probe_device` returns an error | That device unavailable | Other devices on the same bus activate normally | 4 | Log the probe error at warn level and place the device in the unclaimed list; continue with subsequent devices. |
 | F-04 | PCI BAR allocator uninitialized | `pci_bar_allocation_range()` returns `None` and a device has unassigned memory BARs | The PCI device is skipped | One PCI device unavailable | 3 | `configure_pci_device_if_needed` returns `NoMemory`, and the device is skipped. |
 | F-05 | VirtIO MMIO discovery returns no device | No VirtIO device in the region or a `MagicValue` mismatch | The MMIO region is skipped | Other platform devices unaffected | 4 | `probe_mmio_device` and then `virtio_mmio_registration` return `None`; log at trace level and skip the region. |
-| F-06 | IRQ handler registration fails | `kirq` rejects a shared action or its action limit is reached | The device cannot receive interrupts | Device unavailable or degraded to polling | 3 | `request_irq` returns `Busy`; driver probe returns an error. |
+| F-06 | IRQ handler registration fails | `kirq` rejects a shared action or its action limit is reached | The device cannot receive interrupts | Block disk is not published; no polling fallback | 3 | `request_irq` returns `Busy`; partial activation closes before probe returns an error. |
 | F-07 | PCI host bridge adoption fails | Platform bus unregistered or `adopt_active_device` fails | PCI devices have no host bridge parent | PCI endpoints are still enumerated, but the device tree is incomplete | 3 | Log a warning and continue enumeration with a parentless layout. |
 | F-08 | Static device MMIO mapping fails | Invalid `kbuild_config` address or absent hardware | The static device unavailable | Other devices on the same bus unaffected | 3 | `iomap_first_mmio` returns an error, and probe fails. |
 | F-09 | Bus-type matcher is not ready when a driver registers | `register_bus_type` runs after driver registration | No device matches the driver | Devices enter the unclaimed list | 2 | `default_bus_manager` registers bus-type matchers before bus backends; drivers are then registered in `DeviceManager::new`. |

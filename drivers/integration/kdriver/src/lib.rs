@@ -28,6 +28,15 @@ extern crate alloc;
 #[macro_use]
 extern crate log;
 
+#[cfg(feature = "block")]
+mod block_completion;
+#[cfg(feature = "block")]
+mod block_completion_dispatch;
+#[cfg(feature = "block")]
+mod block_irq;
+#[cfg(all(unittest, feature = "virtio-blk"))]
+#[path = "tests/block_requests.rs"]
+mod block_request_tests;
 mod bus;
 pub mod driver_registry;
 mod enumeration;
@@ -114,6 +123,9 @@ fn iomap_first_mmio(
 /// IRQ, and boot-console infrastructure.
 pub fn init_drivers() {
     info!("Initialize device drivers...");
+
+    #[cfg(feature = "block")]
+    block_completion_dispatch::init();
 
     // Initialize global object/metadata stores before any device is activated.
     kdevice::init_device_registry();

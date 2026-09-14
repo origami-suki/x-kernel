@@ -65,6 +65,12 @@
 
 ## 线程安全
 
+`Completion::register_owned` 仅导出单个 RAII guard，不暴露源内部状态。
+调用方必须持有该 guard 跨越等待并在注册后重查完成条件；丢弃 guard 会注销，但
+不能撤销已经摘出的迟到 wake。此入口直接复用 PollSet 的 token/Weak/锁外回调
+保证，不改变已有 PollContext 注册语义。测试覆盖 Drop 注销、完成先于注册、
+旧 guard 不取消新注册，以及 guard 不阻止 source 析构唤醒。
+
 - `PollSet: Send + Sync`：内部 `SpinNoIrq` 保护槽表。
 - `PollRegistration` / `PollRegistrations`：按所有权在单逻辑等待路径上移动；
   不要求跨线程共享同一个 owner。
@@ -75,7 +81,7 @@
 | 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
 |------|----------|----------|----------|----------|
 | T-01 | 大量 waiter 耗尽内存 | 中 | 用户并发 poll/epoll 放大 | `try_reserve` 返回 `NoMemory`；syscall 映射 `ENOMEM` |
-| T-02 | 等待结束后残留 waiter | 中 | 缺少 owner / 忘记 clear | API 强制 `PollContext`；RAII Drop 注销 |
+| T-02 | 等待结束后残留 waiter | 中 | 缺少 owner / 忘记 clear | 普通 poll 经 `PollContext`，单源 bridge 持有单个 guard；RAII Drop 注销 |
 | T-03 | ABA 误删新 waiter | 高 | slot 复用后旧 guard drop | token 含单调 `id` |
 | T-04 | IRQ wake 持锁重入死锁 | 高 | 外层锁内调用 `wake` 且回调反取锁 | wake 锁外执行；`kirq::notify` 先 clone 再 unlock；register clone / cancel drop 均在锁外 |
 | T-05 | OOM panic 代替错误返回 | 中 | 注册路径裸 `push`/`with_capacity` | 注册路径统一 `try_reserve`；已知限制仅限 `PollSet::new` 的 `Arc::new` |

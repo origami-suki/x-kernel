@@ -138,7 +138,10 @@ stdin/stderr 保持继承，交互会话不受影响。
 2. 根据已解析平台选择封闭的 QEMU 启动策略。
 3. 根据编译进内核的驱动和 CLI 选项添加设备。
 4. 以结构化参数启动 QEMU，并传播退出状态。
-5. unittest QEMU 成功退出后，从磁盘镜像提取 `default.profraw`，依次生成
+5. unittest QEMU 成功退出后，校验本轮 `qemu.log` 中的 `ALL_TESTS_PASSED` 和
+   `COVERAGE_PERSISTED` 标记。后者仅在 guest 确认覆盖率完整写入、文件 fsync 和
+   filesystem sync 后发布。缺标记或存在 `TESTS_FAILED` 时拒绝旧镜像中的 profile。
+6. 校验通过后从磁盘镜像提取 `default.profraw`，依次生成
    `default.profdata`、`coverage.txt`、`coverage.info` 和 `coverage.xml`。
 
 覆盖率产物位于 `target/<rust-target>/<profile>/`。开始生成前会删除旧

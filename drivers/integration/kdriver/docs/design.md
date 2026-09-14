@@ -39,6 +39,7 @@ drivers/integration/kdriver/
     ├── manager.rs               # DeviceManager 与统一发现流水线
     ├── enumeration.rs           # EnumerationContext，总线后端写入的描述符缓冲
     ├── resource.rs              # provider holder and DriverResult wrappers
+    ├── block_completion.rs      # block wait/signals host provider
     ├── bus/
     │   ├── mod.rs               # 总线模块 root
     │   ├── backend.rs           # BusBackend trait
@@ -60,6 +61,27 @@ drivers/integration/kdriver/
 ```
 
 ## 架构
+
+启用 `block` 时，`block_completion::prepare_block_wait` 实现 block 的等待契约，
+以 `PrepareBlockWait` 函数指针注入。
+`HostSignals` 拥有两个私有 `kpoll::Completion`：admission 使用可消耗 token，terminal
+使用永久 `complete_all`，从不 reinit。`HostBlockWaiter` 先通过 `PreparedTaskWait`
+验证任务上下文，再创建 source 并注册 terminal。独立的 terminal registration guard
+跨准入等待及虚假唤醒保存，Drop 时先撤销注册，再释放 signals 和 task 引用。
+准备函数直接返回 boxed waiter，waiter.signals() 克隆其已有的通知状态 Arc，
+terminal 只持一个
+`PollRegistration`，不使用多注册容器；admission 每轮也持有单个局部 guard。
+
+admission 每轮 check/register/recheck 后 park；terminal 仅 try_wait/park。
+两个等待源使用同一个预备 waker，不会让 admission 的注册轮次清除 terminal 注册。
+admission 在每轮返回/park 后释放该轮 guard；下一轮注册前到达的通知保留为 token。
+该 provider 已注入 virtio-blk IRQ probe。ktask/kpoll 依赖只由 block feature
+开启，不传递给具体驱动；现有文件系统仍使用相同的通用 block 接口。
+
+每次 prepare_block_wait 有五个 metadata heap object：boxed waiter、HostSignals Arc、
+两个 PollSet inner Arc、KWaker Arc。一次私有注册适配 kpoll 的 inline storage，
+无需额外扩容；不新增数据 buffer 或数据复制。已有 EEVDF wake 路径可能分配，
+不能把本层不新增 wake bookkeeping 分配描述为整个唤醒链零分配。
 
 ```text
                         init_drivers()
@@ -109,6 +131,109 @@ drivers/integration/kdriver/
 | `device-res-xkernel` | x-kernel 资源提供者实现；对接 `memspace`(iomap)、`kirq`(irq)、`kdma`(dma) |
 | VirtIO 驱动族 | 每条 VirtIO 设备类型生成 PCI/MMIO 两个 `DeviceDriver` 描述符，共享同一激活路径 |
 | Platform 驱动族 | ramdisk、AHCI、bcm2835-sdhci、sdmmc、fxmac 等平台设备驱动 |
+
+## Block Device Completion Processing
+
+`block_completion_dispatch` owns one `Arc<BlockIoReclaimer>` per device.
+Probe creates it; IRQ calls its `mark_pending()`; task-context shutdown calls
+its `stop_and_wait(&self, waiter)`. `BlockCompletionOperations` is implemented by the actual device and defines
+how to reclaim completed requests, not host scheduling or request submission.
+
+The reclaimer holds an intrusive pending_link, Weak device, ProcessingState
+(phase, is_accepting, stop_notification), and a task-only stop mutex. One global
+PENDING_DEVICES SpinNoIrq protects the per-CPU lists and all processing state.
+Idle/Queued(cpu)/Running(cpu)/RunningAgain(cpu) are the processing phases. Detachment gives
+the pinned CPU a finite batch; detached nodes remain Queued and cannot relink.
+Callbacks and notifications run outside the global lock. RunningAgain requeues
+only into the next batch. Enqueue and raise stay pinned across daemon wake.
+
+Concurrent stop callers serialize on stop_lock through the terminal wait:
+the single stop_notification cannot be overwritten. IRQ and softirq never take
+this mutex, so it adds no lock acquisition to the I/O hot path. Stop takes a
+fresh task-bound waiter prepared before teardown; no new terminal registration
+can fail after disabling processing. A later closer finds Idle and returns.
+The lock order is stop_lock -> PENDING_DEVICES, never the reverse.
+
+Arc Drop does not stop processing. Activation must explicitly finish admitted
+I/O, suppress device IRQ generation, release/synchronize its Irq, then call
+stop_and_wait before destroying the transport. The owning CPU consumes disabled
+queued entries without invoking the device. Stop waits for a running callback's
+temporary device Arc to retire. Do not call stop from the device callback.
+CPU unplug and forced callback cancellation remain out of scope.
+
+Each device allocates one reclaimer Arc with an embedded stop mutex;
+there is no per-mark allocation or data copy. Existing host scheduler wake costs
+are unchanged. Request-local waiting remains separately owned in block_completion.
+
+## Shared Block IRQ Lifecycle
+
+### DMA And Execution Context
+
+Ordinary block completion follows `complete_* -> pop_used -> Hal::unshare ->
+device_res::unmap_streaming -> kdma::unmap_dma_buffer`. The existing provider
+removes its mapping, copies reads back and returns bounce storage to the TLSF
+pool. Pool creation is on map, not unmap; pool recycling and indirect descriptor
+deallocation do not sleep in the audited implementation. Coherent virtqueue
+destruction may perform different work and remains in task-context close.
+
+This permits the Block softirq backend with the current provider. A provider
+that needs sleepable reclamation must supply a task-context backend satisfying
+the same block contracts. Neither hardirq nor softirq is sleepable.
+
+No new block data copy is introduced, but the existing DMA bounce copies remain.
+Reclaim cost depends on bytes as well as request count; finite batches and the
+softirq outer-loop reschedule check do not bound a single pass in microseconds.
+The existing scheduler's EEVDF enqueue can allocate, so allocation-free block
+bookkeeping is not a claim of allocation-free end-to-end wakeup.
+
+### Registration And Removal
+
+`request_block_irq` returns the existing `device_res::Irq` directly. Its closure
+holds a Weak device IRQ handler and the device's reclaimer Arc. It acknowledges
+only that device, marks pending only for a claimed event, and preserves the
+complete IrqEvent. An expired device returns NOT_HANDLED.
+
+Each disk requests its own shared action through XKernelResourceProvider.
+kirq owns fanout, capacity, compatibility checks and callback synchronization.
+Provider errors propagate: no block bucket, capacity workaround, local callback
+gate, extra registration owner, retry or polling fallback. In particular the
+current four-action capacity can make setup fail; changing it belongs to kirq.
+
+Dropping Irq in sleepable task context releases that action token. The existing
+provider delegates to kirq, which waits for in-flight dispatches; currently this
+is line-wide synchronization and can wait for a neighboring callback too.
+The block adapter never masks the shared line. Activation must retain a strong
+device reference through IRQ release and reclaimer stop. Callback snapshots
+never own the activation object or its synchronous destructor.
+
+IRQ adapter tests exercise per-device provider calls, token release, neighbor retention,
+claimed/unclaimed dispatch, exact event propagation, expired targets and provider
+failure. The mock has synchronous dispatch only; it does not prove concurrent
+kernel release. That synchronization is covered by kirq's own regression tests.
+driver_registry/virtio/block.rs owns DeviceId activation, rollback, publish-last
+and hardware removal on top of the virtio request lifetime.
+tests/block_requests.rs injects the real wait provider into that fake, blocks 24
+callers across two CPUs, then acknowledges simulated IRQs and drives this
+reclaimer through Block softirq. It does not publish a production IRQ disk.
+Production PCI/MMIO block activation uses try_new_irq and the real host provider.
+Missing/failed IRQ leaves no published disk. One BlockActivation owns the strong
+device, optional native Irq, reclaimer and optional Gendisk throughout setup and
+close. A task-only map stores an owned FnOnce close action to erase heterogeneous
+transport types; IRQ and request paths never consult that map. A local activation's Drop also handles
+partial setup failure. Registry and devres cleanup ownership precede publication.
+
+VirtioDriver::remove takes the unique close action before bus teardown; device
+core's begin_removing serializes remove, and its later devres cleanup repeats
+the now-idempotent lookup. Close prepares fresh task-bound drain/stop waiters,
+marks the device Closing, removes owned block lookup, waits for admitted calls,
+suppresses device interrupts, drops native Irq, stops the reclaimer, then
+destroys the transport. No registry/class spinlock spans a wait. Retained disks
+can query cached geometry but new I/O returns Io. Physical tests are grouped in
+src/tests/virtio_block_activation.rs and included beneath their owning module.
+
+Block host tests are physically grouped in src/tests/. Each unit test file is
+included under its owning module with #[path], preserving private access and
+the existing test namespace without a test-only directory per runtime module.
 
 ## 初始化路径
 
@@ -250,7 +375,7 @@ VirtIO 驱动在 PCI 和 MMIO 两条传输路径上共享同一激活入口：
 2. **MMIO 路径**：从 `DeviceLocation::Mmio` 中提取物理地址和大小，`iomap_mmio` 后执行 `probe_mmio_device`。
 3. **分发**：`dispatch_virtio_try_new` 按 `DeviceKind` 分发到对应构造器：
    - `DeviceKind::Net` → `VirtIoNet::try_new` → `kclass::publish_net`
-   - `DeviceKind::Block` → `VirtIoBlk::try_new` → `kclass::publish_block`
+   - `DeviceKind::Block` → `block::activate` → IRQ setup → `kclass::publish_block`
    - `DeviceKind::Display` → `VirtIoGpu::try_new` → `kclass::publish_display`
    - `DeviceKind::Input` → `VirtIoInput::try_new` → `kclass::publish_input`
    - `DeviceKind::Vsock` → `VirtIoSocket::try_new` → `kclass::publish_vsock`

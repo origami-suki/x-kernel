@@ -345,3 +345,47 @@ fn test_completion_recheck_observes_complete_before_register() {
     assert!(completion.try_wait());
     assert_eq!(counter.load(Ordering::SeqCst), 0);
 }
+
+#[def_test]
+fn test_completion_owned_guard_drop_unregisters() {
+    let completion = Completion::new();
+    let registration = completion.register_owned(Waker::noop()).unwrap();
+    drop(registration);
+    assert_eq!(completion.complete(), 0);
+    assert!(completion.try_wait());
+}
+
+#[def_test]
+fn test_completion_owned_recheck_and_stale_guard() {
+    let completion = Completion::new();
+    assert!(!completion.try_wait());
+    assert_eq!(completion.complete(), 0);
+    let first = completion.register_owned(Waker::noop()).unwrap();
+    assert!(completion.try_wait());
+    assert_eq!(completion.complete(), 1);
+    let second = completion.register_owned(Waker::noop()).unwrap();
+    drop(first);
+    assert_eq!(completion.complete_all(), 1);
+    assert!(!second.cancel());
+    assert!(completion.try_wait());
+}
+
+#[def_test]
+fn test_completion_owned_guard_does_not_keep_source_alive() {
+    use alloc::{sync::Arc, task::Wake};
+
+    struct CountWake(AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let counter = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(counter.clone());
+    let registration = {
+        let completion = Completion::new();
+        completion.register_owned(&waker).unwrap()
+    };
+    assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    assert!(!registration.cancel());
+}

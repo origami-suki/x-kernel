@@ -22,7 +22,7 @@ use virtio_drivers::{
         DeviceStatus, DeviceType, InterruptStatus, Transport,
         pci::{
             PciTransport as RawPciTransport, VirtioPciError,
-            bus::{ConfigurationAccess, DeviceFunction, DeviceFunctionInfo, PciRoot},
+            bus::{Command, ConfigurationAccess, DeviceFunction, DeviceFunctionInfo, PciRoot},
             virtio_device_type,
         },
     },
@@ -264,6 +264,10 @@ pub fn probe_pci_device<H: VirtIoHal, C: ConfigurationAccess>(
     let msix = None;
 
     let transport = PciTransport::new_with_msix::<H, C>(root, bdf, msix).ok()?;
+    if dev_kind == DeviceKind::Vsock {
+        let (_, command) = root.get_status_command(bdf);
+        root.set_command(bdf, command | Command::INTERRUPT_DISABLE);
+    }
     log::info!("PCI virtio device at {:?}: IRQ = {}", bdf, irq);
     Some((dev_kind, transport, irq))
 }

@@ -268,6 +268,14 @@ fn read_block_device(device: &BlockDevice, buf: &mut [u8], offset: u64) -> VfsRe
     let block_size = device.block_size();
     let length = core::cmp::min(buf.len() as u64, total_bytes - offset) as usize;
     let output = &mut buf[..length];
+    // Preserve an aligned caller extent: block backends already accept
+    // contiguous blocks, so each sector need not incur its own completion wait.
+    if offset.is_multiple_of(block_size as u64) && length.is_multiple_of(block_size) {
+        device
+            .read_block(offset / block_size as u64, output)
+            .map_err(map_block_error)?;
+        return Ok(length);
+    }
     let first_block = offset / block_size as u64;
     let first_offset = (offset % block_size as u64) as usize;
     let extent = first_offset
@@ -313,6 +321,13 @@ fn write_block_device(device: &BlockDevice, buf: &[u8], offset: u64) -> VfsResul
     let block_size = device.block_size();
     let length = core::cmp::min(buf.len() as u64, total_bytes - offset) as usize;
     let input = &buf[..length];
+    // Keep partial-sector writes on the read/modify/write path below.
+    if offset.is_multiple_of(block_size as u64) && length.is_multiple_of(block_size) {
+        device
+            .write_block(offset / block_size as u64, input)
+            .map_err(map_block_error)?;
+        return Ok(length);
+    }
     let first_block = offset / block_size as u64;
     let first_offset = (offset % block_size as u64) as usize;
     let extent = first_offset
@@ -615,6 +630,10 @@ mod tests {
         storage: Arc<Mutex<Vec<u8>>>,
         block_size: usize,
         flushes: Arc<core::sync::atomic::AtomicUsize>,
+        reads: Arc<core::sync::atomic::AtomicUsize>,
+        writes: Arc<core::sync::atomic::AtomicUsize>,
+        fail_io: Arc<core::sync::atomic::AtomicBool>,
+        fail_after_write_bytes: core::sync::atomic::AtomicUsize,
     }
 
     impl BlockDeviceOperations for MemoryBlockDevice {
@@ -627,6 +646,11 @@ mod tests {
         }
 
         fn read_block(&self, block_id: u64, buf: &mut [u8]) -> block::DriverResult {
+            self.reads
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if self.fail_io.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(DriverError::Io);
+            }
             let start = block_id as usize * self.block_size;
             let end = start + buf.len();
             buf.copy_from_slice(&self.storage.lock()[start..end]);
@@ -634,7 +658,20 @@ mod tests {
         }
 
         fn write_block(&self, block_id: u64, buf: &[u8]) -> block::DriverResult {
+            self.writes
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if self.fail_io.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(DriverError::Io);
+            }
             let start = block_id as usize * self.block_size;
+            let prefix = self
+                .fail_after_write_bytes
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if prefix != usize::MAX {
+                let written = prefix.min(buf.len());
+                self.storage.lock()[start..start + written].copy_from_slice(&buf[..written]);
+                return Err(DriverError::Io);
+            }
             let end = start + buf.len();
             self.storage.lock()[start..end].copy_from_slice(buf);
             Ok(())
@@ -656,6 +693,9 @@ mod tests {
             .collect();
         let storage = Arc::new(Mutex::new(initial.clone()));
         let flushes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let reads = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let writes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let fail_io = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let disk = Arc::new(
             block::Gendisk::new(
                 String::from("kvfs-block-test"),
@@ -666,6 +706,10 @@ mod tests {
                     storage: storage.clone(),
                     block_size: BLOCK_SIZE,
                     flushes: flushes.clone(),
+                    reads: reads.clone(),
+                    writes: writes.clone(),
+                    fail_io: fail_io.clone(),
+                    fail_after_write_bytes: core::sync::atomic::AtomicUsize::new(usize::MAX),
                 }),
             )
             .expect("valid KVFS test disk"),
@@ -681,6 +725,48 @@ mod tests {
         assert_eq!(&storage.lock()[256..1280], &input[..]);
         assert_eq!(flushes.load(core::sync::atomic::Ordering::Relaxed), 0);
 
+        use core::sync::atomic::Ordering::Relaxed;
+        reads.store(0, Relaxed);
+        writes.store(0, Relaxed);
+        let aligned = vec![0xa7; 1024];
+        assert_eq!(write_block_device(&device, &aligned, 512).unwrap(), 1024);
+        assert_eq!(writes.load(Relaxed), 1);
+        assert_eq!(reads.load(Relaxed), 0);
+        assert_eq!(&storage.lock()[512..1536], &aligned[..]);
+        let mut aligned_read = vec![0; 1024];
+        assert_eq!(
+            read_block_device(&device, &mut aligned_read, 512).unwrap(),
+            1024
+        );
+        assert_eq!(aligned_read, aligned);
+        assert_eq!(reads.load(Relaxed), 1);
+
+        let mut clipped = vec![0; 2048];
+        assert_eq!(
+            read_block_device(&device, &mut clipped, 1024).unwrap(),
+            1024
+        );
+        assert_eq!(&clipped[..1024], &storage.lock()[1024..]);
+        assert_eq!(reads.load(Relaxed), 2);
+        assert_eq!(
+            write_block_device(&device, &[0x39; 2048], 1024).unwrap(),
+            1024
+        );
+        assert_eq!(writes.load(Relaxed), 2);
+
+        fail_io.store(true, Relaxed);
+        assert_eq!(
+            read_block_device(&device, &mut aligned_read, 512).unwrap_err(),
+            KError::Io
+        );
+        assert_eq!(
+            write_block_device(&device, &aligned, 512).unwrap_err(),
+            KError::Io
+        );
+        assert_eq!(reads.load(Relaxed), 3);
+        assert_eq!(writes.load(Relaxed), 3);
+        fail_io.store(false, Relaxed);
+
         let mut tail = vec![0; 1024];
         assert_eq!(
             read_block_device(&device, &mut tail, (BLOCK_SIZE * BLOCKS - 128) as u64).unwrap(),
@@ -694,11 +780,192 @@ mod tests {
         device
             .set_disk_read_only(true)
             .expect("set test disk read-only");
+        let writes_before = writes.load(Relaxed);
+        assert_eq!(
+            write_block_device(&device, &[0; 1024], 0).unwrap_err(),
+            VfsError::from(KError::OperationNotPermitted)
+        );
+        assert_eq!(writes.load(Relaxed), writes_before);
         assert_eq!(
             write_block_device(&device, &[1], 0).unwrap_err(),
             VfsError::from(KError::OperationNotPermitted)
         );
 
         block::del_gendisk(disk.device_number()).expect("remove KVFS test disk");
+    }
+
+    struct BlockIoFixture {
+        device: Arc<BlockDevice>,
+        backend: Arc<MemoryBlockDevice>,
+    }
+
+    impl BlockIoFixture {
+        fn new(block_size: usize) -> Self {
+            use core::sync::atomic::{AtomicBool, AtomicUsize};
+            let backend = Arc::new(MemoryBlockDevice {
+                storage: Arc::new(Mutex::new(vec![0x35; block_size * 8])),
+                block_size,
+                flushes: Arc::new(AtomicUsize::new(0)),
+                reads: Arc::new(AtomicUsize::new(0)),
+                writes: Arc::new(AtomicUsize::new(0)),
+                fail_io: Arc::new(AtomicBool::new(false)),
+                fail_after_write_bytes: AtomicUsize::new(usize::MAX),
+            });
+            let disk = Arc::new(
+                block::Gendisk::new(
+                    String::from("kvfs-extent-test"),
+                    244,
+                    0,
+                    1,
+                    Box::new(backend.clone()),
+                )
+                .expect("valid extent test disk"),
+            );
+            let device = block::add_disk(disk).expect("publish extent test disk");
+            Self { device, backend }
+        }
+    }
+
+    impl Drop for BlockIoFixture {
+        fn drop(&mut self) {
+            block::del_gendisk(self.device.disk().device_number())
+                .expect("remove extent test disk");
+        }
+    }
+
+    #[def_test(serial)]
+    fn block_aligned_extents_preserve_data_and_neighbors() {
+        use core::sync::atomic::Ordering::Relaxed;
+        for block_size in [512, 4096] {
+            let fixture = BlockIoFixture::new(block_size);
+            let input: Vec<u8> = (0..block_size * 3).map(|i| (i % 251) as u8).collect();
+            let mut output = vec![0; input.len()];
+            assert_eq!(
+                write_block_device(&fixture.device, &input, block_size as u64).unwrap(),
+                input.len()
+            );
+            assert_eq!(fixture.backend.writes.load(Relaxed), 1);
+            assert_eq!(fixture.backend.reads.load(Relaxed), 0);
+            assert_eq!(
+                read_block_device(&fixture.device, &mut output, block_size as u64).unwrap(),
+                input.len()
+            );
+            assert_eq!(output, input);
+            assert_eq!(fixture.backend.reads.load(Relaxed), 1);
+            let storage = fixture.backend.storage.lock();
+            assert!(storage[..block_size].iter().all(|&b| b == 0x35));
+            assert!(storage[block_size * 4..].iter().all(|&b| b == 0x35));
+            assert_eq!(fixture.backend.flushes.load(Relaxed), 0);
+        }
+    }
+
+    #[def_test(serial)]
+    fn block_empty_eof_and_capacity_clipping_do_not_touch_outside_view() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let fixture = BlockIoFixture::new(512);
+        fixture.device.set_capacity(4).unwrap();
+        for offset in [0, 2048, u64::MAX] {
+            assert_eq!(
+                read_block_device(&fixture.device, &mut [], offset).unwrap(),
+                0
+            );
+            assert_eq!(write_block_device(&fixture.device, &[], offset).unwrap(), 0);
+        }
+        for offset in [2048, 2049, u64::MAX] {
+            assert_eq!(
+                read_block_device(&fixture.device, &mut [0; 512], offset).unwrap(),
+                0
+            );
+            assert_eq!(
+                write_block_device(&fixture.device, &[1; 512], offset).unwrap_err(),
+                KError::StorageFull
+            );
+        }
+        assert_eq!(fixture.backend.reads.load(Relaxed), 0);
+        assert_eq!(fixture.backend.writes.load(Relaxed), 0);
+        let mut output = vec![0xa9; 2048];
+        assert_eq!(
+            read_block_device(&fixture.device, &mut output, 1024).unwrap(),
+            1024
+        );
+        assert!(output[..1024].iter().all(|&b| b == 0x35));
+        assert!(output[1024..].iter().all(|&b| b == 0xa9));
+        assert_eq!(
+            write_block_device(&fixture.device, &[0x71; 2048], 1024).unwrap(),
+            1024
+        );
+        assert!(
+            fixture.backend.storage.lock()[2048..]
+                .iter()
+                .all(|&b| b == 0x35)
+        );
+        assert_eq!(fixture.backend.reads.load(Relaxed), 1);
+        assert_eq!(fixture.backend.writes.load(Relaxed), 1);
+        fixture.device.set_disk_read_only(true).unwrap();
+        assert_eq!(write_block_device(&fixture.device, &[], 0).unwrap(), 0);
+        assert_eq!(
+            write_block_device(&fixture.device, &[0; 1024], 0).unwrap_err(),
+            KError::OperationNotPermitted
+        );
+        assert_eq!(fixture.backend.writes.load(Relaxed), 1);
+    }
+
+    #[def_test(serial)]
+    fn block_unaligned_extents_preserve_read_modify_write_semantics() {
+        for (offset, len) in [(1, 1), (0, 513), (511, 1024), (513, 1023)] {
+            let fixture = BlockIoFixture::new(512);
+            let input = vec![0x72; len];
+            let mut output = vec![0; len];
+            assert_eq!(
+                write_block_device(&fixture.device, &input, offset as u64).unwrap(),
+                len
+            );
+            assert_eq!(
+                read_block_device(&fixture.device, &mut output, offset as u64).unwrap(),
+                len
+            );
+            assert_eq!(output, input);
+            let storage = fixture.backend.storage.lock();
+            assert!(storage[..offset].iter().all(|&b| b == 0x35));
+            assert!(storage[offset + len..].iter().all(|&b| b == 0x35));
+        }
+    }
+
+    #[def_test(serial)]
+    fn block_partial_backend_write_error_is_not_retried() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let fixture = BlockIoFixture::new(512);
+        fixture.backend.fail_after_write_bytes.store(512, Relaxed);
+        assert_eq!(
+            write_block_device(&fixture.device, &[0x72; 1536], 512).unwrap_err(),
+            KError::Io
+        );
+        assert_eq!(fixture.backend.writes.load(Relaxed), 1);
+        assert_eq!(fixture.backend.reads.load(Relaxed), 0);
+        let storage = fixture.backend.storage.lock();
+        assert!(storage[..512].iter().all(|&b| b == 0x35));
+        assert!(storage[512..1024].iter().all(|&b| b == 0x72));
+        assert!(storage[1024..].iter().all(|&b| b == 0x35));
+    }
+
+    #[def_test(serial)]
+    fn block_read_failure_prevents_read_modify_write() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let fixture = BlockIoFixture::new(512);
+        fixture.backend.fail_io.store(true, Relaxed);
+        let mut output = vec![0xa9; 1024];
+        assert_eq!(
+            read_block_device(&fixture.device, &mut output, 0).unwrap_err(),
+            KError::Io
+        );
+        assert!(output.iter().all(|&b| b == 0xa9));
+        assert_eq!(fixture.backend.reads.load(Relaxed), 1);
+        assert_eq!(
+            write_block_device(&fixture.device, &[0x72; 10], 1).unwrap_err(),
+            KError::Io
+        );
+        assert_eq!(fixture.backend.reads.load(Relaxed), 2);
+        assert_eq!(fixture.backend.writes.load(Relaxed), 0);
+        assert!(fixture.backend.storage.lock().iter().all(|&b| b == 0x35));
     }
 }

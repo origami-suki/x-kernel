@@ -70,12 +70,29 @@ pub fn init_current_cpu() {
 
 #[kiface::provide]
 impl kirq::softirq::SoftirqDaemonIf {
+    fn needs_resched() -> bool {
+        let current = crate::current_may_uninit();
+        task_needs_resched(current.as_ref().map(|task| -> &TaskInner { task }))
+    }
+
     fn wake_current_cpu() {
         let _guard = NoPreempt::new();
         let cpu_id = khal::percpu::this_cpu_id();
         if let Some(source) = SOFTIRQD_WAKE_SOURCES.get(cpu_id) {
             let _ = source.wake();
         }
+    }
+}
+
+fn task_needs_resched(task: Option<&TaskInner>) -> bool {
+    #[cfg(feature = "preempt")]
+    {
+        task.is_some_and(TaskInner::is_preempt_pending)
+    }
+    #[cfg(not(feature = "preempt"))]
+    {
+        let _ = task;
+        false
     }
 }
 
@@ -147,6 +164,14 @@ mod tests {
 
     static TEST_DRAIN_RUNS: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(feature = "preempt")]
+    fn resched_and_reraise_action() {
+        if TEST_DRAIN_RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+            crate::current().set_preempt_pending(true);
+            kirq::softirq::raise_softirq(kirq::softirq::SoftirqVec::Block);
+        }
+    }
+
     unsafe fn waker_clone(data: *const ()) -> RawWaker {
         RawWaker::new(data, &WAKER_VTABLE)
     }
@@ -190,6 +215,72 @@ mod tests {
 
     fn test_softirq_drain_action() {
         TEST_DRAIN_RUNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[def_test]
+    fn test_softirq_resched_without_current_task_is_false() {
+        assert_eq!(task_needs_resched(None), false);
+    }
+
+    #[cfg(not(feature = "preempt"))]
+    #[def_test]
+    fn test_softirq_resched_without_preemption_is_false() {
+        let _guard = kspin::NoPreemptIrqSave::new();
+        assert_eq!(kirq::softirq::SoftirqDaemonIf::needs_resched(), false);
+    }
+
+    #[cfg(feature = "preempt")]
+    #[def_test(serial)]
+    fn test_softirq_resched_query_preserves_task_request() {
+        let _guard = kspin::NoPreemptIrqSave::new();
+        let task = crate::current();
+        let previous = task.is_preempt_pending();
+        task.set_preempt_pending(false);
+        let before = kirq::softirq::SoftirqDaemonIf::needs_resched();
+        task.set_preempt_pending(true);
+        let after = kirq::softirq::SoftirqDaemonIf::needs_resched();
+        let preserved = task.is_preempt_pending();
+        task.set_preempt_pending(previous);
+
+        assert_eq!(before, false);
+        assert_eq!(after, true);
+        assert_eq!(preserved, true);
+    }
+
+    #[cfg(feature = "preempt")]
+    #[def_test(serial)]
+    fn test_softirq_resched_handoff_remains_drainable() {
+        use kirq::softirq::{SoftirqRunResult, SoftirqVec};
+
+        let _wake_gate = kirq::softirq::test_support::ScopedDaemonWakeGate::disabled();
+        let _action = kirq::softirq::test_support::ScopedSoftirqAction::install(
+            SoftirqVec::Block,
+            resched_and_reraise_action,
+        );
+        TEST_DRAIN_RUNS.store(0, Ordering::SeqCst);
+
+        let (result, calls, pending) = {
+            let _guard = kspin::NoPreemptIrqSave::new();
+            let task = crate::current();
+            let previous = task.is_preempt_pending();
+            kirq::softirq::raise_softirq(SoftirqVec::Block);
+            let result = kirq::softirq::run_pending_softirqs();
+            let calls = TEST_DRAIN_RUNS.load(Ordering::SeqCst);
+            let pending = kirq::softirq::local_softirq_pending();
+            task.set_preempt_pending(previous);
+            (result, calls, pending)
+        };
+
+        assert_eq!(result, SoftirqRunResult::Deferred);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            pending & (1usize << SoftirqVec::Block.as_usize()),
+            1usize << SoftirqVec::Block.as_usize()
+        );
+
+        drain_pending_softirqs_for_current_cpu();
+
+        assert_eq!(TEST_DRAIN_RUNS.load(Ordering::SeqCst), 2);
     }
 
     #[def_test(serial)]

@@ -252,6 +252,8 @@ pub struct TaskInner {
     need_resched: AtomicBool,
     #[cfg(feature = "preempt")]
     preempt_disable_count: AtomicUsize,
+    #[cfg(all(unittest, feature = "preempt"))]
+    preempt_check_probe: tests_preempt_check::Probe,
 
     /// Nesting depth for Linux-style `WF_SYNC` wake scopes ([`crate::with_wake_sync`]).
     /// When non-zero, wakees may sync-preempt an eligible next-buddy on the
@@ -683,6 +685,8 @@ impl TaskInner {
             need_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
+            #[cfg(all(unittest, feature = "preempt"))]
+            preempt_check_probe: tests_preempt_check::Probe::new(),
             wake_sync_depth: AtomicUsize::new(0),
             execution_context: SpinNoIrq::new(None),
             interrupted: AtomicBool::new(false),
@@ -786,7 +790,7 @@ impl TaskInner {
     }
 
     #[inline]
-    #[cfg(all(feature = "preempt", unittest))]
+    #[cfg(feature = "preempt")]
     pub(crate) fn is_preempt_pending(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
     }
@@ -854,24 +858,34 @@ impl TaskInner {
     #[cfg(feature = "preempt")]
     pub(crate) fn current_check_preempt_pending() {
         use kspin::NoPreemptIrqSave;
-        let curr = crate::current();
-        let need_resched = curr.need_resched.load(Ordering::Acquire);
-        crate::run_queue::record_preempt_pending_check(need_resched);
-        if !need_resched {
-            return;
-        }
+        loop {
+            let curr = crate::current();
+            let need_resched = curr.need_resched.load(Ordering::Acquire);
+            crate::run_queue::record_preempt_pending_check(need_resched);
+            if !need_resched {
+                return;
+            }
 
-        let can_preempt = curr.can_preempt(0);
-        let in_exception = khal::context::in_exception_context();
-        crate::run_queue::record_preempt_pending_blocked(can_preempt, in_exception);
+            let can_preempt = curr.can_preempt(0);
+            let in_exception = khal::context::in_exception_context();
+            crate::run_queue::record_preempt_pending_blocked(can_preempt, in_exception);
+            if !can_preempt || in_exception {
+                return;
+            }
 
-        if can_preempt && !in_exception {
-            // Note: if we want to print log msg during `preempt_resched`, we have to
-            // disable preemption here, because the klogger may cause preemption.
             let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
             if curr.need_resched.load(Ordering::Acquire) && !khal::context::in_exception_context() {
                 rq.preempt_resched()
             }
+            #[cfg(unittest)]
+            curr.preempt_check_probe.rearm(&curr);
+
+            // IRQ restore can publish a new request before this frame returns.
+            // Keep the count above zero through guard release (1 -> 2 -> 1),
+            // then restore it without rescheduling; the loop handles the request.
+            curr.disable_preempt();
+            drop(rq);
+            curr.enable_preempt(false);
         }
     }
 
@@ -1180,6 +1194,10 @@ extern "C" fn task_entry() -> ! {
     }
     crate::exit(0);
 }
+
+#[cfg(all(unittest, feature = "preempt"))]
+#[path = "tests/preempt_check.rs"]
+mod tests_preempt_check;
 
 #[cfg(all(feature = "smp", unittest))]
 mod tests_on_cpu_mask {

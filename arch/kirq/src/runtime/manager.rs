@@ -995,6 +995,7 @@ pub mod tests_irq {
 
     #[def_test(serial)]
     fn test_simulated_irq_tail_dispatches_regular_handler() {
+        let _executor = crate::deferred::ScopedDeferredExecutor::clear();
         let _irq_guard = kspin::NoPreemptIrqSave::new();
         REGULAR_CALLS.store(0, Ordering::Relaxed);
         crate::deferred::clear_deferred_executor();
@@ -1211,6 +1212,7 @@ pub mod tests_irq {
 
     #[def_test(serial)]
     fn test_irq_lifecycle_hooks_fire_around_normal_irq_handler() {
+        let _executor = crate::deferred::ScopedDeferredExecutor::clear();
         let _test_guard = IRQ_LIFECYCLE_TEST_LOCK.lock();
         let _irq_guard = kspin::NoPreemptIrqSave::new();
 
@@ -1277,6 +1279,7 @@ pub mod tests_irq {
 
     #[def_test(serial)]
     fn test_claimed_irq_tail_orders_completion_deferred_and_lifecycle_exit() {
+        let _executor = crate::deferred::ScopedDeferredExecutor::clear();
         let _test_guard = IRQ_LIFECYCLE_TEST_LOCK.lock();
         let _irq_guard = kspin::NoPreemptIrqSave::new();
 
@@ -1341,6 +1344,7 @@ pub mod tests_irq {
 
     #[def_test(serial)]
     fn test_claimed_irq_tail_runs_deferred_for_unresolved_strict_domain() {
+        let _executor = crate::deferred::ScopedDeferredExecutor::clear();
         let _test_guard = IRQ_LIFECYCLE_TEST_LOCK.lock();
         let _irq_guard = kspin::NoPreemptIrqSave::new();
 
@@ -1373,6 +1377,7 @@ pub mod tests_irq {
 
     #[def_test(serial)]
     fn test_irq_on_empty_result_runs_common_deferred_tail() {
+        let _executor = crate::deferred::ScopedDeferredExecutor::clear();
         let _test_guard = IRQ_LIFECYCLE_TEST_LOCK.lock();
         let _irq_guard = kspin::NoPreemptIrqSave::new();
 
@@ -1394,6 +1399,7 @@ pub mod tests_irq {
 
     #[def_test(serial)]
     fn test_softirq_runs_from_claimed_irq_tail_after_hardirq_exit() {
+        let _executor = crate::deferred::ScopedDeferredExecutor::clear();
         let _test_guard = IRQ_LIFECYCLE_TEST_LOCK.lock();
         let _irq_guard = kspin::NoPreemptIrqSave::new();
 

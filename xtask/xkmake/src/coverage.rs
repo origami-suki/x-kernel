@@ -34,6 +34,9 @@ pub(crate) fn generate(bundle: &Bundle, args: &RunArgs) -> Result<()> {
     if !context.dry_run {
         fs::create_dir_all(&artifacts.directory).with_path(&artifacts.directory)?;
         artifacts.remove_stale_files()?;
+        let log_path = crate::qemu::log_path(bundle);
+        let output = fs::read_to_string(&log_path).with_path(&log_path)?;
+        validate_guest_completion(&output)?;
     }
 
     println!("Generating unit-test coverage reports...");
@@ -56,6 +59,24 @@ pub(crate) fn generate(bundle: &Bundle, args: &RunArgs) -> Result<()> {
             "Coverage reports generated in {}",
             artifacts.directory.display()
         );
+    }
+    Ok(())
+}
+
+// QEMU can exit successfully after a guest error, and debugfs may read a valid
+// profile left by an earlier run. Require evidence from the newly captured log.
+fn validate_guest_completion(output: &str) -> Result<()> {
+    let has_status = |status| output.lines().any(|line| line.trim() == status);
+    if !has_status("=== UNITTEST_STATUS: ALL_TESTS_PASSED ===")
+        || has_status("=== UNITTEST_STATUS: TESTS_FAILED ===")
+    {
+        return Err(Error::Message("guest unit tests did not pass".to_string()));
+    }
+    if !has_status("=== UNITTEST_STATUS: COVERAGE_PERSISTED ===") {
+        return Err(Error::Message(
+            "guest did not confirm coverage write and filesystem sync; refusing stale profile"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -258,7 +279,23 @@ fn debugfs_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::debugfs_quote;
+    use super::{debugfs_quote, validate_guest_completion};
+
+    #[test]
+    fn coverage_requires_passing_tests_and_persisted_guest_output() {
+        let passed = "=== UNITTEST_STATUS: ALL_TESTS_PASSED ===";
+        let persisted = "=== UNITTEST_STATUS: COVERAGE_PERSISTED ===";
+        assert!(validate_guest_completion("").is_err());
+        assert!(validate_guest_completion(passed).is_err());
+        assert!(validate_guest_completion(persisted).is_err());
+        assert!(validate_guest_completion(&format!("{passed}\r\n{persisted}\r\n")).is_ok());
+        assert!(validate_guest_completion(&format!(
+            "{passed}\n=== UNITTEST_STATUS: TESTS_FAILED ===\n{persisted}\n"
+        )).is_err());
+        assert!(validate_guest_completion(&format!(
+            "{passed}\nFailed to write coverage data: Io\nFailed to flush filesystem: Io\n"
+        )).is_err());
+    }
 
     #[test]
     fn debugfs_request_values_escape_quotes_and_backslashes() {

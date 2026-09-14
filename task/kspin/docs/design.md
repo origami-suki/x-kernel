@@ -25,6 +25,9 @@
 
 ## 范围
 
+`static_lock!` 在开启 stats 时导出 klockstat 的注册宏；关闭 stats 时原样输出
+static item，与 ksync 的入口一致。因此调用方不需要为统计配置复制锁定义。
+
 涉及的源文件：
 
 ```text

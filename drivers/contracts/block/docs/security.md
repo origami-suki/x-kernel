@@ -26,6 +26,16 @@ driver 报告的 disk identity、容量、block size 和 I/O completion 跨越 b
 
 ## 故障处理
 
+`BlockCompletionOperations::process_completed_requests` 是可信驱动回调，必须有限且不睡眠。host 的串行执行
+保证以单一注册为边界，不能为同一目标创建多个注册后假设仍然互斥。完成回调不得
+在持有设备锁时唤醒调用者；目标强引用必须覆盖同步停止，之后才能销毁设备资源。
+
+完成等待契约要求 provider 的 signals 只拥有通知状态，不拥有请求或 DMA 数据。
+调用方在设备/registry 锁外通知；`BlockWaiter` 仅由准备它的任务在可睡眠上下文使用。
+准入等待失败由事务层取消 pending 节点并传递准入机会；终态等待无可恢复错误出口，
+避免尚在 DMA 中的请求随等待错误提前释放。契约本身不实现队列或 DMA 生命周期，
+也不验证设备已经完成；驱动必须先发布真实结果再发终态通知。
+
 | 故障 | 结果 |
 |---|---|
 | identity/range 冲突 | `AlreadyExists`，不发布半成品 |

@@ -14,6 +14,9 @@ use virtio_drivers::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+#[cfg(feature = "block")]
+pub use crate::blk::{BlockTestHal, BlockTestHardware, BlockTestTransport, block_test_disk};
+
 extern crate alloc;
 use alloc::{
     alloc::{Layout, alloc, dealloc},

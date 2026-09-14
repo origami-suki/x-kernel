@@ -24,7 +24,7 @@ use khal::{
 use kprocess::AsThread;
 use kspin::IrqSave;
 use ktask::{current, current_may_uninit};
-use memaddr::VirtAddr;
+use memaddr::{PAGE_SIZE_4K, VirtAddr};
 use memspace::PageFaultOutcome;
 use osvm::{MemError, MemResult, VirtMemIo};
 
@@ -69,10 +69,52 @@ fn fault_outcome_to_trap_result(outcome: PageFaultOutcome) -> bool {
     )
 }
 
-// `Vm` mirrors the osvm `VirtMemIo` entry point and is kept for future
-// direct VM access paths that instantiate the trait-backed adapter.
-#[expect(dead_code)]
-struct Vm(IrqSave);
+// Adapter instantiated by the osvm external-trait entry points.
+struct Vm;
+
+// Retry only the current user page after returning through the assembly fixup.
+// File-backed faults can wait for disk I/O here, outside exception context.
+fn copy_user_pages(
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+    mut copy_fn: impl FnMut(usize, usize) -> usize,
+) -> MemResult {
+    check_access(start, len)?;
+    let mut offset = 0;
+    while offset < len {
+        let address = start + offset;
+        let count = (PAGE_SIZE_4K - address % PAGE_SIZE_4K).min(len - offset);
+        if copy_fn(offset, count) != 0 {
+            let curr = current();
+            let thread = curr.try_as_thread().ok_or(MemError::NoAccess)?;
+            let address_space = thread
+                .process()
+                .address_space()
+                .map_err(|_| MemError::NoAccess)?;
+            loop {
+                let outcome = address_space
+                    .lock()
+                    .handle_page_fault(VirtAddr::from_usize(address), access_flags);
+                match outcome {
+                    PageFaultOutcome::Resolved => break,
+                    PageFaultOutcome::Retry | PageFaultOutcome::CowConflictRetry => continue,
+                    _ => return Err(MemError::NoAccess),
+                }
+            }
+            // A mapping revoked after resolution is still reported as a copy
+            // failure; never read uninitialized output or spin on no progress.
+            if copy_fn(offset, count) != 0 {
+                return Err(MemError::NoAccess);
+            }
+        }
+        offset += count;
+    }
+    Ok(())
+}
+
+#[cfg(unittest)]
+mod copy_tests;
 
 /// Briefly checks if the given memory region is valid user memory.
 pub fn check_access(start: usize, len: usize) -> MemResult {
@@ -217,39 +259,33 @@ fn atomic_cmpxchg_u32_inner(
 }
 
 #[extern_trait]
-// SAFETY: `Vm` validates the user range up front and performs raw copies only
-// inside the temporary user-access window established by `access_user_memory`.
+// SAFETY: `Vm` validates the user range and uses exception-table-protected
+// copies. Missing pages are resolved in the calling task before retrying.
 unsafe impl VirtMemIo for Vm {
     fn new() -> Self {
-        Self(IrqSave::new())
+        Self
     }
 
     fn read_mem(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> MemResult {
-        check_access(start, buf.len())?;
-        let failed_at = access_user_memory(|| {
-            // SAFETY: `check_access` validated the user range, and `buf`
-            // provides writable storage for exactly `buf.len()` bytes.
-            unsafe { user_copy(buf.as_mut_ptr() as *mut _, start as _, buf.len()) }
-        });
-        if unlikely(failed_at != 0) {
-            Err(MemError::NoAccess)
-        } else {
-            Ok(())
-        }
+        copy_user_pages(start, buf.len(), MappingFlags::READ, |offset, count| {
+            // SAFETY: the validated user page and this subrange of `buf` cover
+            // `count` bytes. The exception table reports inaccessible memory.
+            unsafe {
+                user_copy(
+                    buf.as_mut_ptr().cast::<u8>().add(offset),
+                    (start + offset) as _,
+                    count,
+                )
+            }
+        })
     }
 
     fn write_mem(&mut self, start: usize, buf: &[u8]) -> MemResult {
-        check_access(start, buf.len())?;
-        let failed_at = access_user_memory(|| {
-            // SAFETY: `check_access` validated the user range, and `buf`
-            // supplies readable storage for exactly `buf.len()` bytes.
-            unsafe { user_copy(start as _, buf.as_ptr() as *const _, buf.len()) }
-        });
-        if unlikely(failed_at != 0) {
-            Err(MemError::NoAccess)
-        } else {
-            Ok(())
-        }
+        copy_user_pages(start, buf.len(), MappingFlags::WRITE, |offset, count| {
+            // SAFETY: the validated user page and this subrange of `buf` cover
+            // `count` bytes. The exception table reports inaccessible memory.
+            unsafe { user_copy((start + offset) as _, buf.as_ptr().add(offset), count) }
+        })
     }
 }
 

@@ -92,6 +92,14 @@ mod rwlock;
 mod tests;
 
 pub use guard::{BaseGuard, IrqSave, KernelGuardIf, NoOp, NoPreempt, NoPreemptIrqSave};
+/// Declares a static lock unchanged when lock statistics are disabled.
+#[cfg(not(feature = "stats"))]
+#[macro_export]
+macro_rules! static_lock {
+    ($item:item) => {
+        $item
+    };
+}
 #[cfg(feature = "stats")]
 pub use klockstat::{LOCK_CLASSES, LockClassStats, linkme, static_lock};
 pub use lock::{SpinLock, SpinLockGuard};

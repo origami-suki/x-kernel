@@ -142,6 +142,42 @@ pub fn run_hardirq_exit_deferred(ctx: DeferredRunContext) -> DeferredRunResult {
 }
 
 #[cfg(unittest)]
+pub(crate) struct ScopedDeferredExecutor {
+    previous: DeferredExecutorHooks,
+    _irq_pin: kspin::NoPreemptIrqSave,
+}
+
+#[cfg(unittest)]
+impl ScopedDeferredExecutor {
+    pub(crate) fn clear() -> Self {
+        let irq_pin = kspin::NoPreemptIrqSave::new();
+        let mut hooks = DEFERRED_EXECUTOR_HOOKS.lock();
+        let previous = core::mem::take(&mut *hooks);
+        DEFERRED_EXECUTOR_HOOK.store(0, Ordering::Release);
+        Self {
+            previous,
+            _irq_pin: irq_pin,
+        }
+    }
+}
+
+#[cfg(unittest)]
+impl Drop for ScopedDeferredExecutor {
+    fn drop(&mut self) {
+        // Tests temporarily replace the boot-installed softirq executor. Leaving
+        // it cleared strands real device completions after the tests return.
+        let mut hooks = DEFERRED_EXECUTOR_HOOKS.lock();
+        *hooks = self.previous;
+        DEFERRED_EXECUTOR_HOOK.store(
+            self.previous
+                .on_hardirq_exit
+                .map_or(0, |hook| hook as usize),
+            Ordering::Release,
+        );
+    }
+}
+
+#[cfg(unittest)]
 #[allow(missing_docs)]
 pub mod tests_deferred {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -181,7 +217,32 @@ pub mod tests_deferred {
     }
 
     #[def_test(serial)]
+    fn scoped_executor_restores_registered_hook_after_clear() {
+        let _outer = super::ScopedDeferredExecutor::clear();
+        assert!(register_deferred_executor(DeferredExecutorHooks {
+            on_hardirq_exit: Some(first_hook),
+        }));
+        {
+            let _inner = super::ScopedDeferredExecutor::clear();
+            assert!(register_deferred_executor(DeferredExecutorHooks {
+                on_hardirq_exit: Some(second_hook),
+            }));
+            clear_deferred_executor();
+        }
+        FIRST_HOOK_CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            run_hardirq_exit_deferred(DeferredRunContext::new(1, None)),
+            DeferredRunResult::Ran
+        );
+        assert_eq!(FIRST_HOOK_CALLS.load(Ordering::Relaxed), 1);
+        assert!(!register_deferred_executor(DeferredExecutorHooks {
+            on_hardirq_exit: Some(second_hook),
+        }));
+    }
+
+    #[def_test(serial)]
     fn test_deferred_executor_registration_and_run() {
+        let _executor = super::ScopedDeferredExecutor::clear();
         clear_deferred_executor();
         FIRST_HOOK_CALLS.store(0, Ordering::Relaxed);
         TARGET_CONTEXT_CALLS.store(0, Ordering::Relaxed);
@@ -202,6 +263,7 @@ pub mod tests_deferred {
 
     #[def_test(serial)]
     fn test_deferred_executor_rejects_duplicate_without_overwrite() {
+        let _executor = super::ScopedDeferredExecutor::clear();
         clear_deferred_executor();
         FIRST_HOOK_CALLS.store(0, Ordering::Relaxed);
         SECOND_HOOK_CALLS.store(0, Ordering::Relaxed);
@@ -224,6 +286,7 @@ pub mod tests_deferred {
 
     #[def_test(serial)]
     fn test_deferred_executor_clear_allows_reregister() {
+        let _executor = super::ScopedDeferredExecutor::clear();
         clear_deferred_executor();
         assert!(register_deferred_executor(DeferredExecutorHooks {
             on_hardirq_exit: Some(first_hook),
@@ -237,6 +300,7 @@ pub mod tests_deferred {
 
     #[def_test(serial)]
     fn test_deferred_executor_noop_without_registration() {
+        let _executor = super::ScopedDeferredExecutor::clear();
         clear_deferred_executor();
         assert_eq!(
             run_hardirq_exit_deferred(DeferredRunContext::new(3, Some(4))),
@@ -246,6 +310,7 @@ pub mod tests_deferred {
 
     #[def_test(serial)]
     fn test_deferred_executor_runs_outside_registration_lock() {
+        let _executor = super::ScopedDeferredExecutor::clear();
         clear_deferred_executor();
         CLEARING_HOOK_CALLS.store(0, Ordering::Relaxed);
 

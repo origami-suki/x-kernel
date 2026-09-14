@@ -3,12 +3,12 @@
 // See LICENSES for license details.
 
 //! VirtIO device probing and HAL integration.
-use alloc::{boxed::Box, sync::Arc};
+use alloc::boxed::Box;
 use core::ptr::NonNull;
 
 use cfg_if::cfg_if;
 use device_res::{DmaAllocation, DmaDirection, DmaMapping, DmaOp, DmaSpec, MmioOp, MmioRegion};
-use driver_base::{Device, DriverResult};
+use driver_base::DriverResult;
 use virtio::{BufferDirection, PhysAddr, VirtIoHal};
 
 cfg_if! {
@@ -25,31 +25,6 @@ cfg_if! {
                     irq,
                     Some(crate::resource::resource_provider()),
                 )?))
-            }
-        }
-    }
-}
-
-cfg_if! {
-    if #[cfg(feature = "virtio-blk")] {
-        pub struct VirtIoBlk;
-
-        impl VirtIoBlk {
-            pub fn try_new<T: virtio::Transport + 'static>(
-                transport: T,
-                _irq: Option<usize>,
-            ) -> DriverResult<kclass::prelude::BlockDeviceImpl> {
-                let device = virtio::VirtIoBlkDev::<VirtIoHalImpl, T>::try_new(transport)?;
-                let name = device.name().into();
-                let first_minor = device.index() << virtio::VIRTIO_BLK_PART_BITS;
-                let disk = block::Gendisk::new(
-                    name,
-                    virtio::VIRTIO_BLK_MAJOR,
-                    first_minor,
-                    1 << virtio::VIRTIO_BLK_PART_BITS,
-                    Box::new(device),
-                )?;
-                Ok(Arc::new(disk))
             }
         }
     }
@@ -96,12 +71,12 @@ cfg_if! {
         impl VirtIoSocket {
             pub fn try_new<T: virtio::Transport + 'static>(
                 transport: T,
-                irq: Option<usize>,
+                _irq: Option<usize>,
             ) -> DriverResult<kclass::prelude::VsockDeviceImpl> {
                 Ok(Box::new(virtio::VirtIoVsockDev::<
                     VirtIoHalImpl,
                     T,
-                >::try_new(transport, irq)?))
+                >::try_new(transport)?))
             }
         }
     }

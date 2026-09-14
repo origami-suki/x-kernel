@@ -16,6 +16,7 @@
 当前范围包括：
 
 - `src/lib.rs`
+- `src/copy_tests.rs`（用户复制回归测试）
 
 ## 架构
 
@@ -36,7 +37,10 @@ syscall / runtime
 - 必须运行在存在 current task 的上下文中。
 - `access_user_memory()` 要求 current task 可解析为线程。
 - 用户字符串装载会触发用户地址访问，因此允许睡眠/缺页处理。
-- trap handler 依赖当前线程的 `accessing_user_memory` 标志，只在该窗口内接管页错误。
+- 普通 `osvm` 复制入口要求可睡眠的线程上下文，不自行关闭 IRQ。页错误通过
+  exception-table fixup 退出汇编后，在调用任务中完成回填；文件页回填允许等待块 I/O。
+- 原子用户访问的 trap handler 依赖当前线程的 `accessing_user_memory` 标志，
+  只在该窗口内接管页错误。
 
 ## 算法流程
 
@@ -44,22 +48,22 @@ syscall / runtime
 
 1. 调用方通过 `osvm` 指针包装或 `vm_load_string*()` 发起访问。
 2. `Vm` 先做用户地址范围检查。
-3. `access_user_memory()` 在当前线程上打开“正在访问用户内存”标志。
-4. 底层 `user_copy` 执行读写；若发生页错误，trap handler 转交当前进程地址空间处理。
-5. `kuaccess` 消费 `MmSpace::handle_page_fault()` 返回的 typed fault outcome：
-   `Resolved` / retry-class outcome 让 fault 指令重试；unmapped、permission、bus、
-   OOM、no-progress 和 generic failure 都返回 false，交给架构 exception-table
-   fixup 使 `user_copy` / `user_atomic_load_u32` /
-   `user_atomic_cmpxchg_u32` 返回失败。
-6. 访问结束后恢复线程标志，并将失败映射为 `MemError` / `KError`。
+3. `copy_user_pages()` 按用户地址的 4 KiB 页边界拆分复制，每段先调用 `user_copy`。
+4. 普通复制不打开 trap 内回填窗口。缺页时通过 exception-table fixup 返回，
+   随后在调用任务中调用当前进程的 `MmSpace::handle_page_fault()`。这样不会在
+   IRQ 被屏蔽的异常上下文里等待 IRQ 驱动的磁盘完成。
+5. `Resolved` 后重试当前页复制；retry-class outcome 重新进行 fault 处理；
+   unmapped、permission、bus、OOM、no-progress 和 generic failure 返回 `NoAccess`。
+6. 回填后复制仍失败（如并发撤销映射）时返回 `NoAccess`，不无限重试。
+   已映射页不需要取得地址空间锁；成功返回保证全部输出已初始化。
 
 ### 用户态原子访问
 
 1. 校验 4 字节对齐与用户地址范围。
 2. faultable 形式在 `access_user_memory()` 窗口内调用架构原语，允许 MM 处理
    可恢复缺页；nofault 形式直接依赖 exception-table fixup 返回失败。
-3. load 使用自然对齐的只读 32-bit load；cmpxchg 的 exclusive/atomic 序列在
-   `IrqSave` 保护下执行。
+3. load 使用自然对齐的只读 32-bit load；nofault cmpxchg 的 exclusive/atomic
+   序列在 `IrqSave` 保护下执行。
 4. 成功时返回 observed value 或 `(exchanged, observed)`；fault 映射为
    `MemError::NoAccess`。
 
@@ -74,8 +78,8 @@ syscall / runtime
 
 ## 并发模型
 
-- `Vm` 和 cmpxchg 的 exclusive/atomic 序列使用 `IrqSave`；普通原子 load
-  不需要关闭中断。
+- `Vm` 不使用 `IrqSave`，普通复制的 fault 慢路径与磁盘读取一样要求可睡眠。
+  nofault 原子访问仍保留其局部 `IrqSave` 保护。
 - 不维护全局共享状态；真正的并发控制由线程状态和地址空间锁负责。
 
 ## 设计决策
@@ -84,3 +88,9 @@ syscall / runtime
 - 只保留字符串级 helper，不在这里扩张为新的通用用户态参数解析层。
 - trap handler 的外部 ABI 仍是 `bool`，但这个 bool 现在只是架构 trap 分发的适配结果；
   MM 语义来自 `PageFaultOutcome`，避免 `kuaccess` 重新定义缺页分类。
+
+## 回归验证
+
+`src/copy_tests.rs` 使用要求 `PreparedTaskWait` 可用的按需映射后端，验证普通
+复制的缺页处理发生在异常外的可睡眠任务上下文，并覆盖跨页读、首次写缺页、
+只读保护和撤销映射。该测试不依赖真实磁盘或 IRQ 的时序。

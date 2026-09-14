@@ -17,6 +17,7 @@ kerrno.workspace = true
 kaddr_layout.workspace = true
 khal.workspace = true
 kspin.workspace = true
+ksync.workspace = true
 kprocess.workspace = true
 ktask.workspace = true
 linkme.workspace = true

@@ -4,9 +4,11 @@
 
 //! Completion-style readiness primitive for poll-based waiters.
 
+use core::task::Waker;
+
 use kspin::SpinNoIrq;
 
-use crate::{PollContext, PollRegisterError, PollSet};
+use crate::{PollContext, PollRegisterError, PollRegistration, PollSet};
 
 const COMPLETE_ALL: usize = usize::MAX;
 const COMPLETE_TOKEN_MAX: usize = COMPLETE_ALL - 1;
@@ -153,6 +155,25 @@ impl Completion {
     /// Returns an error if the underlying poll registration cannot be stored.
     pub fn register(&self, context: &mut PollContext<'_>) -> Result<(), PollRegisterError> {
         context.register(&self.waiters)
+    }
+
+    /// Registers one waker and returns its owned cancellation guard.
+    ///
+    /// For bridges retaining exactly one registration. Ordinary poll users
+    /// should use [`Self::register`]. Keep the guard alive while waiting;
+    /// dropping it unregisters unless notification already detached the waker.
+    /// The guard holds only a weak source reference. Cancellation may race with
+    /// a detached notification, so a late wake is still permitted.
+    ///
+    /// Registration does not inspect or consume completion state. Recheck
+    /// [`Self::try_wait`] after registering, including when completion preceded
+    /// registration. May allocate when the source's waiter table must grow.
+    ///
+    /// # Errors
+    /// Returns a registration error if storage cannot grow or identities are
+    /// exhausted, with no registration left behind on failure.
+    pub fn register_owned(&self, waker: &Waker) -> Result<PollRegistration, PollRegisterError> {
+        self.waiters.register(waker)
     }
 }
 

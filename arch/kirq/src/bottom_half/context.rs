@@ -245,18 +245,24 @@ impl Drop for HardIrqContextGuard {
 
 #[cfg(unittest)]
 pub mod test_support {
+    use kspin::NoPreemptIrqSave;
+
     use super::HardIrqContextGuard;
 
-    /// Test-only guard that enters hardirq context until dropped.
+    /// Test-only hardirq context with local IRQs masked and preemption disabled.
     pub struct ScopedHardIrqContext {
         _guard: HardIrqContextGuard,
+        // Restore context before permitting task preemption or local IRQs.
+        _irq_pin: NoPreemptIrqSave,
     }
 
     impl ScopedHardIrqContext {
-        /// Enters a synthetic hardirq context for cross-crate unit tests.
+        /// Pins the CPU before entering synthetic hardirq context for tests.
         pub fn enter() -> Self {
+            let irq_pin = NoPreemptIrqSave::new();
             Self {
                 _guard: HardIrqContextGuard::enter(),
+                _irq_pin: irq_pin,
             }
         }
     }
@@ -493,6 +499,19 @@ pub mod tests_context {
             assert_eq!(irq_context_snapshot().hardirq_depth(), 1);
         }
         assert_eq!(irq_context_snapshot().hardirq_depth(), 0);
+    }
+
+    #[def_test(serial)]
+    fn test_synthetic_hardirq_masks_irqs_and_restores_context() {
+        let before = irq_context_snapshot();
+        let was_enabled = karch::local_irq_enabled();
+        {
+            let _irq = super::test_support::ScopedHardIrqContext::enter();
+            assert!(!karch::local_irq_enabled());
+            assert!(is_in_hardirq());
+        }
+        assert_eq!(irq_context_snapshot(), before);
+        assert_eq!(karch::local_irq_enabled(), was_enabled);
     }
 
     #[def_test(serial)]

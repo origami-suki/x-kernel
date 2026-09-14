@@ -498,8 +498,9 @@ run_pending_softirqs()
    -> enable local IRQs while running action snapshot in vector order
    -> disable local IRQs before checking new pending bits
    -> optional handler context leak check when IRQ context debug is enabled
-   -> repeat up to restart limit
-   -> wake current CPU ksoftirqd if restart budget is exhausted
+   -> if work remains, query the scheduler's needs_resched flag
+   -> repeat up to restart limit while no scheduling request is pending
+   -> preserve pending and wake current CPU ksoftirqd on either limit
 ```
 
 `bottom_half/softirq.rs` 实现 Linux-like fixed-vector foundation，使用 per-CPU pending bit。
@@ -524,8 +525,10 @@ handler，也没有 NAPI poll budget/repoll 状态机。
 
 `ksoftirqd/N` 的调度让出由 `ktask` provider 负责：daemon 每次实际运行 softirq 后
 主动回到调度点，避免持续 pending workload 下长时间占用同一 CPU。当前 direct
-drain 仍只使用 restart limit；Linux `__do_softirq()` 的 `need_resched()` 和 2ms
-时间预算会在后续调度接口完善后单独补齐。
+drain 在每批 action 完成且仍有 pending 时，通过 `SoftirqDaemonIf::needs_resched()`
+查询当前任务的调度请求；请求存在或 restart limit 命中时保留 pending 并唤醒 daemon。
+查询不消费请求、不直接调度；任务尚未初始化或未启用 preempt 时返回 false。
+该检查不能打断单个 action，也没有引入 Linux 的 2ms 时间预算。
 
 `open_softirq()` 只用于 init-time 注册。本阶段没有 unregister API；runner 在
 `SpinNoIrq` 下复制 action table snapshot，但不会持有注册锁执行 action。

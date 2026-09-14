@@ -30,6 +30,11 @@
 
 ## 外部边界 / 攻击面
 
+PCI vsock 当前没有 ISR 确认路径，依靠轮询推进收发。探测时必须在该
+function 上禁用 INTx 输出，避免未确认的设备中断持续触发。只删除软件
+IRQ 元数据不会关闭硬件中断；屏蔽共享线路又会阻断其他设备（包括 blk）
+的完成通知。更新 PCI Command 时保留其他位，维持内存访问和 DMA 能力。
+
 `virtio` 是典型的硬件/虚拟硬件边界模块。
 它直接连接 VMM 暴露的 VirtIO 设备、
 平台传输层和上层驱动框架，
@@ -60,6 +65,50 @@
   是否可能突破本模块边界假设；
 - IRQ 路径、回收路径和正常 I/O 路径
   是否可能破坏并发或生命周期不变量。
+
+## IRQ Block Request Safety
+
+The IRQ constructor rejects panic-unwind builds before creating a device.
+A request lives in a pinned synchronous frame; all returns either precede
+submission or observe Done after descriptor/mapping retirement. No public
+nonblocking request handle exposes that stack lifetime.
+
+Request's protocol header/response, operation and state use separate UnsafeCell
+fields. A shared Request reference never creates a mutable borrow of the whole
+node. The device SpinNoIrq protects RawList links, token pointers and CPU state
+access. HAL/device ownership excludes CPU protocol access from submission to
+peek_used plus complete_*. The same original buffers are used for reclamation.
+The token index is bounded by virt_queue_size; pending callers have no extra
+software-capacity limit. Driver metadata adds no data-buffer copy.
+
+Unknown/out-of-range tokens and unproven descriptor reclamation panic before
+normal request retirement. The pinned dependency's IoError and Unsupported
+completion outcomes follow pop_used; NotReady can come from either pop or status
+and is deliberately fatal. Fatal-error paths have been source-reviewed, not
+injected into the shared QEMU test process. No device reset/retry is invented.
+
+Callbacks retain only independently owned signals after publishing Done. Before
+notification, every token/buffer reference is cleared. The host must serialize
+the entire completion pass, including notifications and scratch restoration.
+Concurrent/reentrant passes fail the scratch-ownership assertion rather than
+sharing mutable scratch. Wait preparation is task-only and all waits occur
+outside the device lock. Activation/transport lifetime remains a host obligation.
+
+Tests use an identity-mapped fake HAL and real dependency descriptors; production
+uses the existing host bounce pool. Passing fake tests does not prove physical
+device DMA coherency, which remains a hardware-validation obligation.
+
+Close accounts calls before wait preparation, not only published descriptors.
+The caller guard decrements admission only after request state and DMA retirement.
+begin_close rejects new calls while keeping previously admitted calls alive;
+its drain signal is retained until the last call retires. Host close serializes
+ownership, waits for drain, suppresses/acknowledges device IRQs, synchronizes its
+native action and stops the reclaimer before finish_close takes the transport.
+Transport destruction and coherent queue deallocation occur outside SpinNoIrq in
+the closing task. The device's immutable geometry/read-only cache is valid after
+close. No IRQ callback owns activation or can run its synchronous destructor.
+Malformed device completion remains fatal; graceful close has no forced-DMA
+cancellation or timeout guarantee for a nonresponsive device.
 
 ## unsafe 代码清单
 
@@ -220,7 +269,7 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoBlkDev<H, T> {}
 | `VirtIo9pDev<H, T>` | `H: Hal, T: Transport`（手动 impl） | `H: Hal, T: Transport`（手动 impl） |
 
 **说明**：所有设备类型的手动 `Send`/`Sync` impl 依赖以下保证：
-- 非 net 设备通过 `&mut self` 独占访问，无内部可变性。
+- blk 使用内部 SpinNoIrq 保护设备和请求状态；其他非 net 设备通过 `&mut self` 独占访问，无内部可变性。
 - net 设备通过 `SpinNoIrq` 保护共享的 `InnerDev`，中断回调和正常路径互斥。
 
 ## 威胁分析
@@ -254,7 +303,7 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoBlkDev<H, T> {}
 | F-08 | `probe_mmio_device` panic | 传入空指针 | 初始化中断 | 系统启动失败 | 1 | 调用者必须验证地址有效性 |
 | F-09 | 网络缓冲区 token 不匹配 | 内部状态不一致 | DMA 到错误地址 | 内存破坏 | 1 | `assert_eq!` 和 `is_some()` 检查；`BadState` 错误返回 |
 | F-10 | 网络 RX 事件丢失 | IRQ handler 和任务上下文都调用 `ack_interrupt()`，任务上下文清除新到事件 | virtio RX 队列停止推进并重复触发未处理 IRQ | TCP 接收窗口降为零，host→guest 传输超时 | 2 | 已注册 IRQ 时仅由 handler 调用 `ack_interrupt()`，`recv()` 仅消费已完成队列项；纯轮询模式由 `recv()` 确认中断 |
-| F-11 | 对固有只读块设备发起写请求 | 上层绕过或尚未建立 block-device view | 单次写入被拒绝 | 文件系统保持只读且介质不被修改 | 3 | `write_sector()` 在提交 VirtIO 请求前返回 `DriverError::ReadOnly` |
+| F-11 | 对固有只读块设备发起写请求 | 上层绕过或尚未建立 block-device view | 单次写入被拒绝 | 文件系统保持只读且介质不被修改 | 3 | `write_block()` 的轮询和 IRQ 请求路径均在提交前返回 `DriverError::ReadOnly` |
 
 ## 故障管理
 

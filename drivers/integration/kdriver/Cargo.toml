@@ -15,7 +15,7 @@ ignored = ["display", "input", "kalloc", "vsock"]
 [features]
 pci-non-ecam = []
 net = ["dep:net", "kclass/net"]
-block = ["dep:block", "kclass/block"]
+block = ["dep:block", "kclass/block", "dep:ktask", "dep:kpoll", "dep:kirq", "dep:linked_list_r4l", "dep:kcpu_id_map", "dep:ksync"]
 char = ["dep:char_driver", "kclass/char"]
 display = ["dep:display", "kclass/display"]
 input = ["dep:input", "kclass/input"]
@@ -81,6 +81,12 @@ karch = { workspace = true }
 kclass = { workspace = true }
 kdevice = { workspace = true }
 block = { workspace = true, optional = true }
+ktask = { workspace = true, optional = true }
+kpoll = { workspace = true, optional = true }
+ksync = { workspace = true, optional = true }
+kirq = { workspace = true, optional = true }
+kcpu_id_map = { workspace = true, optional = true }
+linked_list_r4l = { workspace = true, optional = true }
 char_driver = { workspace = true, optional = true }
 console_driver = { workspace = true, optional = true }
 display = { workspace = true, optional = true }

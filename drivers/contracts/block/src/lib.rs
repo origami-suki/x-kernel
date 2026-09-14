@@ -14,6 +14,8 @@
 
 extern crate alloc;
 
+pub mod completion;
+
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

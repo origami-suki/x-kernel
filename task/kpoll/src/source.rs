@@ -181,7 +181,7 @@ impl PollSet {
 
     /// Registers `waker` and returns an ownership guard for the registration.
     ///
-    /// Prefer [`PollContext::register`] for ordinary poll waits. This method is
+    /// Prefer [`crate::PollContext::register`] for ordinary poll waits. This method is
     /// intended for long-lived bridges that must retain the guard themselves.
     ///
     /// # Errors

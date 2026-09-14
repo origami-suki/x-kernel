@@ -11,6 +11,17 @@
 
 本模块本身不直接处理用户态输入，但通过 `sleep/wait/join/affinity` 等 API 间接承载用户态行为结果；其安全边界属于“内核内部并发正确性与内存安全”。
 
+## 抢占检查与栈边界
+
+恢复 IRQ 后的新唤醒可以重新设置 `need_resched`。若运行队列 guard 析构时递归进入
+下一次抢占检查，连续请求会使旧栈帧无法退出，最终越过任务栈边界并破坏相邻对象。
+当前堆分配任务栈没有未映射保护页；增加栈大小不能替代消除这种无界增长。
+
+抢占检查通过循环消费新请求，并在释放自身 guard 时保持额外一层禁抢占计数。
+释放完成后以 `enable_preempt(false)` 配对撤销临时计数，避免析构再次进入调度。
+必须保持计数 1 → 2 → 1 → 0 的配对关系，保留新发布的 `need_resched`，
+且仍遵守禁抢占和异常上下文的入口限制。没有新增跨 CPU 重入标志或共享锁。
+
 ## 信任模型
 
 ```text
@@ -138,9 +149,12 @@ ksched algorithms / karch context switch / allocator
 | T-07a | `setaffinity` 静默成功但任务仍在非法 CPU | 高 | 非 current 只写 mask | 成功路径要求当前未占用禁止 CPU（running/queued 必须迁走，未入队只改 mask），否则 `false`/`EBUSY`；`preempt_resched`/`yield` 强制 affinity migrate |
 | T-07b | 运行任务离开路径漏 deactivate 导致调度器残留状态 | 高 | 新 leave 路径绕过统一 API | 全部经 `leave_current`；EEVDF `curr` 非 owning；`pick_next` 断言 |
 | T-07c | `blocked_resched` 无额外强引用导致切换时任务被释放 | 高 | 调用方未 clone current | rustdoc/`# Panics` 约定；`#[track_caller]` + `strong_count > 1` 硬断言；`block_on` 先 clone；unittest `blocked_resched_survives_with_caller_owned_ref` |
+| T-07d | prepared wait 在错误任务或原子上下文阻塞 | 高 | 句柄经协程转交或准备后持锁调用 park | 句柄 !Send/!Sync；prepare 在分配前校验 context，park 断言任务身份和 context；调用方仍负责不可动态检查的锁约束 |
+| T-07e | 提前或虚假唤醒导致丢失通知/提前完成 | 高 | 检查谓词与 park 并发，或 scheduler 单独唤醒任务 | 复用 KWaker 两次 latch 检查与 RQ 握手；持 task 强引用跨切换；park 只返回 wake hint，由调用方重查谓词并管理事件注册 |
 | T-08 | 周期回调执行耗时过长拖慢调度或形成 IRQ 重入循环 | 高 | callback 滥用或执行时间超过 period | API 约束 hardirq 回调短小且不阻塞；一次 IRQ 最多调用每个到期 callback 一次，下一期限从完成时间计算 |
 | T-09 | 远端唤醒后未及时调度 | 中 | 任务入远端 run queue 但远端 CPU 未到抢占安全点 | SMP 强制依赖 IPI；远端 IPI 只置 `need_resched`；探测失败才在目标 CPU `preempt_resched` 武装 backup hrtick |
 | T-09b | IRQ teardown 等待在错误上下文阻塞当前任务 | 高 | hardirq/softirq/BH-disabled 路径间接调用 `IrqSyncWaitIf` provider | `kirq` 在进入 provider 前执行 context gate；`ktask` 只提供阻塞机制，不放宽 IRQ 同步 API 约束 |
+| T-09f | softirq 调度查询提前消费任务请求 | 中 | 批次边界查询清除 need_resched 或直接调度 | `SoftirqDaemonIf::needs_resched()` 仅 Acquire 读取；真实调度仍留在安全点，无任务或无 preempt 时返回 false |
 | T-09c | workerqueue 等待绕过 kwork 生命周期谓词 | 高 | `ktask` wait helper 直接阻塞而不让 `kwork` 重查 work 状态 | `ktask` 只提供 yield/wait 机制；work 状态、cancel/flush 谓词和 deadlock gate 仍由 `kwork` 持有 |
 | T-09d | custom/dynamic workqueue 错误创建专属 task | 中 | queue-level API 重新引入 host/stop/wake 或保存 `WorkQueueHandle` | normal worker/manager kthread 属于 built-in per-CPU workerpool；所有逻辑 queue 共享 pool task，destroy 不进入 ktask |
 | T-09e | interrupt-like context 直接调用 `ktask::sleep*()` | 高 | BH workqueue callback、softirq action、hardirq 或 BH-disabled path 绕过上层 context gate | `sleep()`、`sleep_until()`、`interruptible_sleep_until()` 统一检查 `kirq::context::is_in_interrupt_context()` 并 fail-fast；`yield_now()` 不作为 sleep/blocking API |

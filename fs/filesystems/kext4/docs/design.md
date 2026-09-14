@@ -643,6 +643,12 @@ allocator 的实际并发关系建立锁顺序；不以字段分组预设锁域�
 
 ## Drop / 资源释放
 
+Namespace removal 在修改目录项之前验证最后一个链接所需的 orphan 格式。
+`unlink`、`rmdir` 和覆盖式 `rename` 在需要 orphan entry 时，对 orphan-file 格式返回 `Unsupported`，
+不修改目录、链接数或 orphan 链，也不 abort journal。删除仍有其他硬链接的普通
+inode 不需要 orphan entry，因此继续允许。底层 orphan helper 保留格式检查，
+但不能依赖它在目录项已经修改后才拒绝操作。
+
 已分配的 metadata/data blocks 通过 journaled bitmap helper 释放。Inode 删除路径先切断
 目录可达性，用 legacy orphan list 保护 zero-link cleanup；若 inode 带 external xattr
 block，则先释放或降低 refcount，并清理 `i_file_acl`/`i_blocks`，然后 truncate

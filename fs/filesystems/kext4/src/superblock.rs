@@ -3076,6 +3076,93 @@ mod tests {
     }
 
     #[test]
+    fn namespace_rejects_orphan_file_before_metadata_changes() {
+        let mke2fs = require_e2fsprogs("mke2fs");
+        let image = temporary_image_path("namespace-orphan-prevalidation");
+        create_journaled_linear_namespace_test_image(&mke2fs, &image);
+        let bytes = fs::read(&image).unwrap();
+        for (compat, ro_compat) in [
+            (
+                features::CompatFeatures::ORPHAN_FILE,
+                features::ReadOnlyCompatFeatures::empty(),
+            ),
+            (
+                features::CompatFeatures::empty(),
+                features::ReadOnlyCompatFeatures::ORPHAN_PRESENT,
+            ),
+        ] {
+            let device = Arc::new(LinuxImageDevice::new(bytes.clone()));
+            let mut filesystem = Ext4SbInfo::mount(device.clone()).unwrap();
+            let root = filesystem.root_inode().unwrap();
+            let timestamp = crate::Ext4Timestamp::new(127, 0);
+            let target = filesystem
+                .create_regular_file(&root, b"target", 0o644, 0, 0, timestamp)
+                .unwrap();
+            let source = filesystem
+                .create_regular_file(&root, b"source", 0o644, 0, 0, timestamp)
+                .unwrap();
+            let directory = filesystem
+                .create_directory(&root, b"directory", 0o755, 0, 0, timestamp)
+                .unwrap();
+            filesystem.sync_filesystem().unwrap();
+            set_allocator_feature_bits(&mut filesystem, compat, ro_compat);
+            let before = device.bytes();
+            let parent_links = root.links_count();
+            let error = Err(Ext4Error::Unsupported(UnsupportedKind::OrphanFile));
+
+            assert_eq!(
+                filesystem.unlink(&root, b"target", &target, timestamp),
+                error
+            );
+            assert_eq!(
+                filesystem.remove_directory(&root, b"directory", &directory, timestamp),
+                error
+            );
+            assert_eq!(
+                filesystem.rename(
+                    &root,
+                    b"source",
+                    &source,
+                    &root,
+                    b"target",
+                    Some(&target),
+                    timestamp,
+                ),
+                error
+            );
+            for (name, inode) in [
+                ("target", &target),
+                ("source", &source),
+                ("directory", &directory),
+            ] {
+                assert_eq!(
+                    filesystem.lookup(&root, name).unwrap().unwrap().inode(),
+                    inode.number()
+                );
+            }
+            assert_eq!(target.links_count(), 1);
+            assert_eq!(directory.links_count(), 2);
+            assert_eq!(root.links_count(), parent_links);
+            assert_eq!(filesystem.orphan_head(), None);
+            assert!(!filesystem.journal.as_ref().unwrap().is_aborted());
+            filesystem.sync_filesystem().unwrap();
+            assert_eq!(device.bytes(), before);
+
+            filesystem
+                .link(&root, b"alias", &target, timestamp)
+                .unwrap();
+            assert_eq!(target.links_count(), 2);
+            filesystem
+                .unlink(&root, b"alias", &target, timestamp)
+                .unwrap();
+            assert_eq!(target.links_count(), 1);
+            assert!(filesystem.lookup(&root, "alias").unwrap().is_none());
+            filesystem.sync_filesystem().unwrap();
+        }
+        fs::remove_file(image).unwrap();
+    }
+
+    #[test]
     fn recovery_evicts_clean_zero_link_orphan_on_huge_file_linux_image() {
         let mke2fs = require_e2fsprogs("mke2fs");
         let e2fsck = require_e2fsprogs("e2fsck");

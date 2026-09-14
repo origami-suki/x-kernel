@@ -1306,6 +1306,12 @@ impl Ext4SbInfo {
     }
 
     fn ensure_unlinked_inode_eviction_supported(&self, inode: &Ext4Inode) -> Ext4Result<()> {
+        // Removing the last name must establish orphan ownership. Reject an
+        // unsupported format before unlink/rmdir/rename changes any directory.
+        // Removing one of several hard links needs no orphan entry.
+        if inode.kind() == InodeKind::Directory || inode.links_count() <= 1 {
+            self.ensure_legacy_orphan_list_supported()?;
+        }
         match inode.kind() {
             InodeKind::RegularFile
             | InodeKind::Directory

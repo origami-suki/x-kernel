@@ -13,6 +13,9 @@ pub(crate) mod ids;
 #[cfg(feature = "virtio")]
 mod glue;
 
+#[cfg(feature = "virtio-blk")]
+mod block;
+
 #[cfg(feature = "virtio")]
 use alloc::sync::Arc;
 
@@ -63,6 +66,15 @@ impl DeviceDriver for VirtioDriver {
 
     fn probe_device(&self, device: Arc<DeviceObject>) -> DriverResult<()> {
         activate_virtio_device(device, self.kind, self.device_type)
+    }
+
+    fn remove(&self, device: Arc<DeviceObject>) -> DriverResult<()> {
+        #[cfg(feature = "virtio-blk")]
+        if self.kind == DeviceKind::Block {
+            block::close_device(device.id());
+        }
+        let _ = device;
+        Ok(())
     }
 }
 
@@ -218,10 +230,7 @@ fn dispatch_virtio_try_new<T: virtio::Transport + 'static>(
             kclass::publish_net(parent, VirtIoNet::try_new(transport, irq)?).map(drop)
         }
         #[cfg(feature = "virtio-blk")]
-        DeviceKind::Block => {
-            use glue::VirtIoBlk;
-            kclass::publish_block(parent, VirtIoBlk::try_new(transport, irq)?).map(drop)
-        }
+        DeviceKind::Block => block::activate(parent, transport, irq),
         #[cfg(feature = "virtio-gpu")]
         DeviceKind::Display => {
             use glue::VirtIoGpu;

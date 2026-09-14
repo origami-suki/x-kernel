@@ -25,7 +25,7 @@ pub(crate) fn resource_provider() -> &'static XKernelResourceProvider {
     &XKERNEL_RESOURCE_PROVIDER
 }
 
-fn map_res_err(err: ResError) -> DriverError {
+pub(crate) fn map_res_err(err: ResError) -> DriverError {
     match err {
         ResError::InvalidResource => DriverError::InvalidInput,
         ResError::MappingFailed => DriverError::Io,

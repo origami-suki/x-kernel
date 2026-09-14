@@ -37,7 +37,6 @@ const RX_BUFFER_SIZE: usize = 8192;
 pub struct VirtIoVsockDev<H: Hal, T: Transport, const RX_BUF_SIZE: usize = RX_BUFFER_SIZE> {
     inner: SpinNoIrq<VirtIOSocket<H, T, RX_BUF_SIZE>>,
     guest_cid: u64,
-    irq: Option<usize>,
 }
 
 // SAFETY: VirtIoVsockDev serializes all access to the inner VirtIOSocket
@@ -64,15 +63,18 @@ impl<H: Hal, T: Transport, const RX_BUF_SIZE: usize> Drop for VirtIoVsockDev<H, 
 impl<H: Hal, T: Transport, const RX_BUF_SIZE: usize> VirtIoVsockDev<H, T, RX_BUF_SIZE> {
     /// Create a new raw VirtIO vsock transport and initialize the device.
     ///
+    /// This adapter is polled and does not acknowledge interrupts. The caller
+    /// must arrange transport-level interrupt suppression; PCI probing disables
+    /// the function's INTx output before calling this constructor.
+    ///
     /// Returns an error if the device fails to initialize (feature
     /// negotiation, queue allocation, etc.).
-    pub fn try_new(transport: T, irq: Option<usize>) -> DriverResult<Self> {
+    pub fn try_new(transport: T) -> DriverResult<Self> {
         let inner = VirtIOSocket::<H, T, RX_BUF_SIZE>::new(transport).map_err(as_driver_error)?;
         let guest_cid = inner.guest_cid();
         Ok(Self {
             inner: SpinNoIrq::new(inner),
             guest_cid,
-            irq,
         })
     }
 
@@ -134,10 +136,6 @@ impl<H: Hal, T: Transport, const RX_BUF_SIZE: usize> Device for VirtIoVsockDev<H
 
     fn device_kind(&self) -> DeviceKind {
         DeviceKind::Vsock
-    }
-
-    fn irq(&self) -> Option<usize> {
-        self.irq
     }
 }
 

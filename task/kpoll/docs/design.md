@@ -72,9 +72,9 @@ Pollable::register(context, events)
 
 ## 调用约束 / 执行上下文
 
-- **`PollSet::wake` 可在 IRQ 中调用**：内部使用 `SpinNoIrq`；锁内原地摘取 waker
-  并 `clear` 槽表以保留 heap capacity，锁外调用 `Waker::wake`。整次 wake 只获取
-  一次 spin lock，不再二次加锁回收 buffer。
+- **`PollSet::wake` 可在 IRQ 中调用**：内部使用 `SpinNoIrq`；锁内移出旧槽表并
+  重置 active/free_head，锁外调用 `Waker::wake`。整次 wake 只获取一次 spin lock，
+  不分配新的槽表；旧 heap capacity 随移出的表释放，不回收到 source。
 - **`register` / `unregister` 可在任务上下文调用**；也可能与 IRQ wake 并发。
   `Waker::clone` 在加锁前完成；cancel 摘取的 `Waker` 在解锁后 drop，避免自定义
   waker 回调在 `SpinNoIrq` 内重入。
@@ -83,8 +83,8 @@ Pollable::register(context, events)
 - **注册可失败**：扩容失败返回 `PollRegisterError::NoMemory`；ID 耗尽返回
   `IdExhausted`；目标未就绪返回 `InvalidState`。上层映射为 `KError::NoMemory` /
   `ENOMEM` 或 `InvalidInput` / `EINVAL`。
-- **调用方必须持有 `PollRegistrations` 跨 `Poll::Pending`**；timeout、signal、
-  Ready 或 future drop 时自动注销。
+- **调用方必须持有注册 guard 跨等待**：普通 poll 使用 `PollRegistrations`，
+  单源 bridge 可使用 `PollRegistration`；timeout、Ready 或 future drop 时自动注销。
 - **wake 是提示而非状态转移**：允许迟到 wake；正确性依赖 register 后 recheck。
 - **`PollSet::new` 内部 `Arc::new` 目前仍可能在 OOM 时走全局分配器 panic**；
   该限制不扩展到每次 register。
@@ -170,6 +170,12 @@ return Pending;
 这个二次检查封闭 complete-before-register 和 register-before-complete 的 lost wake
 窗口。
 
+`Completion::register_owned(&Waker)` 为只保留一个注册的 bridge 返回
+`PollRegistration`，直接委托 `PollSet::register`，不引入新的注册状态或分配层。
+调用方必须保持 guard 存活，并在注册后重查 token；注册不消费完成状态，也不会因
+已经完成而自动调用 waker。guard 的 Weak 回指、Drop 注销和迟到 wake 语义不变。
+普通多源 poll 流程继续使用 `register(context)` 和 `PollRegistrations`。
+
 ## 并发模型
 
 - 共享状态：`SpinNoIrq<State>`。
@@ -187,7 +193,7 @@ return Pending;
 | RAII registration + token | 用所有权表达生命周期，自动回收 | 共享 `Vec<Waker>` / 按 Waker 注销 |
 | `SmallVec` inline + `try_reserve` | 常见路径零堆，溢出可失败 | 固定上限数组；裸 `Vec::push` |
 | wake 路径移出 slot table 后锁外唤醒 | IRQ 热路径单次加锁、锁内不分配、不调用 waker | 锁内构造临时 waker buffer；二次加锁 recycle capacity |
-| `PollContext` 强制入口 | 禁止把裸 Waker 永久塞进 fd | 保留旧 `register(&Waker)` 兼容 API |
+| 普通 `Pollable` 使用 `PollContext` | 禁止把裸 Waker 无 owner 地永久塞进 fd | 无 RAII owner 的注册 API |
 | registration 持 `Weak` | 防引用环，允许 source 先销毁 | registration 持强引用 |
 | `Completion` 放在 `kpoll` | `kirq` 后续可持有 wait source，且不依赖 `ktask`/`ksync` | 放入 `ktask` 或 `ksync` 后形成 crate 依赖环 |
 | `Completion` 不提供 blocking wait | 保持 scheduler-agnostic；阻塞由 `ktask`/future 层组合 | 在低层 poll crate 调用 scheduler |
