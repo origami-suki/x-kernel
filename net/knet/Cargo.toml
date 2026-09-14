@@ -14,6 +14,7 @@ vsock = ["kclass/vsock"]
 vsock_tipc_bridge = ["vsock", "dep:tipc"]
 
 [dependencies]
+entropy.workspace = true
 anon_inodefs.workspace = true
 unittest = { workspace = true }
 kclass = { workspace = true, features = ["net"] }

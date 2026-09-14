@@ -624,3 +624,9 @@ bridge v1 只转发 bytes，不转发 TIPC handles 或 memrefs。
 - Unix stream channel 被 `Option<Channel>` 持有。shutdown 在对应方向锁内更新 endpoint 的读写关闭状态并唤醒受影响方向。`Channel::drop` 在释放 ring producer 和 consumer 前发布双向关闭状态并唤醒双方 connection-state waiter；peer 的 `recv` 先消费已发布数据，缓冲区耗尽后返回 EOF，`poll` 报告 `RDHUP`。关闭端丢弃自身接收队列中的未读数据时，对端记录一次 `ConnectionReset`，由 `recv` 或 `SO_ERROR` 消费。
 - UDP socket Drop 时从 PCB registry 注销，PCB 销毁时释放接收队列与异步错误队列。
 - Ethernet RX buffer 在 `poll_rx` 完成 frame 处理后调用 driver `recycle_rx` 归还。
+
+### UDP 临时端口随机化
+
+UDP 的端口零绑定以及首次 connect、send 自动绑定从内核 `entropy` ChaCha20 池读取新的 32 位随机值，用于选择 `49152–65535` 内的起点和奇数步长。候选迭代最多遍历全部 16384 个端口，每个端口访问一次，冲突检查与注册仍在对应 bucket 锁内完成。
+
+随机数读取发生在获取 bucket 自旋锁之前，调用路径要求可睡眠的任务上下文。分配先调用 `try_seed_from_hardware` 尝试播种，再检查 `is_ready`；熵尚未就绪时返回 `EAGAIN`，socket 保持未绑定，调用方可稍后重试。该策略同时适用于阻塞和非阻塞 socket。指定非零端口的显式绑定保持原有行为。

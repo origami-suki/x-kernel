@@ -2,14 +2,17 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
+//! UDP port binding and management.
+//!
+//! Manages UDP socket bindings, bind-conflict checks, ephemeral-port
+//! allocation, binding removal, and receive-side socket lookup.
+
 use alloc::{sync::Arc, vec::Vec};
 
 use ::core::net::{IpAddr, SocketAddr};
 use hashbrown::HashMap;
 use kerrno::{KResult, k_bail};
-use khal::time::monotonic_time;
 use kspin::SpinNoIrq;
-use ksync::Mutex;
 use lazyinit::LazyInit;
 
 use super::{output::ipv4_to_core, pcb::UdpPcb, state::UdpSocketState};
@@ -22,13 +25,10 @@ const UDP_EPHEMERAL_PORT_RANGE: u16 = UDP_EPHEMERAL_PORT_END - UDP_EPHEMERAL_POR
 
 static UDP_PCB_REGISTRY: LazyInit<UdpPcbRegistry> = LazyInit::new();
 
-struct UdpPcbRegistry {
-    buckets: Vec<SpinNoIrq<UdpPcbBucket>>,
-    port_rand: Mutex<UdpPortRand>,
-}
-
-struct UdpPcbBucket {
-    by_port: HashMap<u16, Vec<UdpBindRecord>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpBindKind {
+    Auto,
+    Explicit,
 }
 
 struct UdpBindRecord {
@@ -38,20 +38,12 @@ struct UdpBindRecord {
     reuse_address: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UdpBindKind {
-    Auto,
-    Explicit,
+struct UdpPcbBucket {
+    by_port: HashMap<u16, Vec<UdpBindRecord>>,
 }
 
-struct UdpPortRand {
-    state: u64,
-}
-
-struct UdpEphemeralPortIter {
-    start: u16,
-    step: u16,
-    tries: u16,
+struct UdpPcbRegistry {
+    buckets: Vec<SpinNoIrq<UdpPcbBucket>>,
 }
 
 impl UdpPcbRegistry {
@@ -60,10 +52,7 @@ impl UdpPcbRegistry {
         for _ in 0..UDP_REGISTRY_BUCKETS {
             buckets.push(SpinNoIrq::new(UdpPcbBucket::new()));
         }
-        Self {
-            buckets,
-            port_rand: Mutex::new(UdpPortRand::new(monotonic_time().as_nanos_u64_saturating())),
-        }
+        Self { buckets }
     }
 
     #[cfg(unittest)]
@@ -141,7 +130,7 @@ impl UdpPcbRegistry {
         kind: UdpBindKind,
         reuse_address: bool,
     ) -> KResult<IpEndpoint> {
-        for port in self.ephemeral_port_iter() {
+        for port in self.ephemeral_port_iter()? {
             let endpoint = IpEndpoint {
                 addr: local_addr,
                 port,
@@ -185,9 +174,18 @@ impl UdpPcbRegistry {
         &self.buckets[bucket_index_for_port(port)]
     }
 
-    fn ephemeral_port_iter(&self) -> UdpEphemeralPortIter {
-        let rand = self.port_rand.lock().rand_u32();
-        UdpEphemeralPortIter::new(rand)
+    /// Requires sleepable task context; entropy sources may perform I/O.
+    /// Returns `EAGAIN` before publishing a bind if quality entropy is unavailable.
+    fn ephemeral_port_iter(&self) -> KResult<UdpEphemeralPortIter> {
+        // Bootstrap output can be derived from ticks alone. Only use output
+        // after the pool has credited a trusted entropy source.
+        entropy::try_seed_from_hardware();
+        if !entropy::is_ready() {
+            return Err(kerrno::KError::WouldBlock);
+        }
+        let mut bytes = [0u8; 4];
+        entropy::fill_random(&mut bytes);
+        Ok(UdpEphemeralPortIter::new(u32::from_le_bytes(bytes)))
     }
 }
 
@@ -324,23 +322,10 @@ impl UdpPcbBucket {
     }
 }
 
-impl UdpPortRand {
-    const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn rand_u32(&mut self) -> u32 {
-        // sPCG32 keeps a 64-bit linear-congruential state and
-        // derives the output with a data-dependent shift.
-        const M: u64 = 0xbb2e_fcec_3c39_611d;
-        const A: u64 = 0x7590_ef39;
-
-        let state = self.state.wrapping_mul(M).wrapping_add(A);
-        self.state = state;
-
-        let shift = 29 - (state >> 61);
-        (state >> shift) as u32
-    }
+struct UdpEphemeralPortIter {
+    start: u16,
+    step: u16,
+    tries: u16,
 }
 
 impl UdpEphemeralPortIter {

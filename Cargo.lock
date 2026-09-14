@@ -2599,6 +2599,7 @@ dependencies = [
  "async-channel",
  "async-trait",
  "bitflags 2.13.1",
+ "entropy",
  "enum_dispatch",
  "etherparse",
  "event-listener",
