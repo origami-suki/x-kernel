@@ -1,155 +1,278 @@
-# knet — 安全与可靠性分析
+# knet — Safety and Reliability Analysis
 
-## 信任模型
+## Analysis Scope
 
-```text
-posix/net syscall 层
-   │
-   │ safe API: SocketOps, Socket, SocketAddrEx, options
-   v
-┌─────────────────────────────┐
-│ knet                        │
-│                             │
-│ safe boundary               │
-│  ├─ TCP / UDP / raw socket  │
-│  ├─ Unix socket             │
-│  ├─ netlink socket          │
-│  └─ Service / Router        │
-│                             │
-│ unsafe boundary             │
-│  ├─ Unix stream ring buffer │
-│  └─ vsock RX ring advance   │
-└──────────────┬──────────────┘
-               │
-               v
-driver layer / smoltcp / ringbuf
+This analysis covers the entire `knet` crate: all source modules under `src/`,
+including the `vsock` and `vsock_tipc_bridge` feature paths and `cfg(unittest)`
+helpers. No in-crate module is excluded. The inventory describes explicit
+unsafe sites in this crate; dependency internals and generated derive
+implementations remain the responsibility of their providers.
+
+The syscall layer supplies validated socket arguments and current-call
+credentials. `kcred` defines credential predicates, `kvfs` enforces pathname
+permissions, `kclass` and its device providers own network-buffer validity and
+transport event contracts, and `ringbuf`, `smoltcp`, `zerocopy`, and `etherparse`
+provide their respective buffer and parsing contracts. Driver DMA programming,
+raw user-pointer access, host-side handshake clients, and TIPC service policy
+are external responsibilities rather than guarantees established by `knet`.
+
+## Trust Model
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+    "fontSize": "15px",
+    "background": "#FAF9F6",
+    "primaryColor": "#F5F2EC",
+    "primaryBorderColor": "#CFC8BD",
+    "primaryTextColor": "#2E2B28",
+    "secondaryColor": "#F7F4EF",
+    "secondaryBorderColor": "#D8D1C7",
+    "tertiaryColor": "#FFFFFF",
+    "lineColor": "#9A9187",
+    "edgeLabelBackground": "#FAF9F6"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "nodeSpacing": 32,
+    "rankSpacing": 38
+  }
+}}%%
+
+flowchart TD
+
+    POSIX["posix/net syscall layer"]
+
+    API["safe API<br/>SocketOps · Socket · SocketAddrEx · options"]
+
+    subgraph KNET["knet"]
+        direction TB
+
+        subgraph SAFE["safe boundary"]
+            direction LR
+
+            SOCKET["TCP · UDP · raw · packet socket"]
+            UNIX["Unix socket"]
+            NETLINK["netlink socket"]
+            CORE["Service · Router"]
+        end
+
+        subgraph UNSAFE["unsafe boundary"]
+            direction LR
+
+            RING["Unix stream<br/>ring buffer"]
+            VSOCK["vsock RX<br/>ring advance"]
+            WAKER["test RawWaker<br/>UDP · Ethernet"]
+        end
+    end
+
+    LOWER["driver layer · smoltcp · ringbuf"]
+
+    POSIX --> API
+    API --> KNET
+    KNET --> LOWER
+
+    classDef layer fill:#FFFFFF,stroke:#CFC8BD,color:#2E2B28,stroke-width:1.1px;
+    classDef safe fill:#F5F2EC,stroke:#CFC8BD,color:#2E2B28,stroke-width:1px;
+    classDef unsafe fill:#FAF9F6,stroke:#B8AEA2,color:#5A524A,stroke-width:1px,stroke-dasharray:5 4;
+
+    class POSIX,API,LOWER layer;
+    class SOCKET,UNIX,NETLINK,CORE safe;
+    class RING,VSOCK,WAKER unsafe;
+
+    style KNET fill:#F7F4EF,stroke:#CFC8BD,stroke-width:1.2px,color:#2E2B28
+    style SAFE fill:#FFFFFF,stroke:#D8D1C7,stroke-width:1px,color:#2E2B28
+    style UNSAFE fill:#FAF9F6,stroke:#B8AEA2,stroke-width:1px,stroke-dasharray:5 4,color:#5A524A
+
+    linkStyle default stroke:#9A9187,stroke-width:1.1px;
 ```
 
-- safe API 调用者信任 `knet` 维护 socket 状态、路由状态、buffer 边界和 errno 映射。
-- `knet` 信任 `posix/net` 完成用户指针读取、sockaddr 长度校验和地址族选择。
-  netlink send 路径还信任 syscall 与 socket file 入口传入本次调用者的 `Cred` 快照，
-  mutation 权限检查由 `knet` 执行。
-- pathname Unix socket 操作信任入口传入的 `Cred` 快照与当前系统调用主体一致；
-  kvfs 负责逐级 search、父目录 mutation 和 inode DAC 检查。
-- `knet` 信任 driver 层返回的 `NetBufHandle` 数据切片在 handle 生命周期内有效。
-- `knet` 使用基于 `zerocopy` 和 `etherparse` 的 crate 内 checked parser 校验 Ethernet、ARP、IPv4 和 UDP 数据，并继续依赖 smoltcp 校验 TCP、raw IP 和 IPv6 数据。
-- 设备层只接收经 `Router` 控制面适配后的 crate 内地址、CIDR 和邻居项。
-- unsafe 边界由 crate 内部封装，外部调用者没有直接调用 unsafe API 的入口。
+The trust relationships in the diagram define the security responsibilities of each layer. `knet` provides safe socket interfaces to upper layers and manages internal protocol state, routing state, and buffer boundaries. The syscall layer, filesystem, and driver layer are responsible for entry-point argument validation, access control, and underlying network resource management, respectively. Their responsibilities are defined as follows:
 
-## 外部边界 / 攻击面
+* `posix/net` handles syscall arguments, including user-pointer access, `sockaddr` length validation, and address-family parsing. `knet` receives validated arguments and maintains socket state, routing state, buffer boundaries, and the mapping from network errors to system error codes.
 
-`knet` 是面向外部输入最丰富的 crate 之一，
-攻击面不仅来自 Rust `unsafe`，
-还来自网络包、控制面消息、设备缓冲区和上层 syscall glue。
+* For netlink mutations, `knet` checks permissions against the `Cred` snapshot passed by the entry point. The syscall and socket file layers provide this snapshot, which represents the current caller.
 
-经检查，本模块直接或间接接触以下边界：
+* Pathname Unix socket operations use the `Cred` snapshot supplied by the entry point for access control. kvfs handles path traversal, parent-directory modification permissions, and inode DAC checks.
 
-- **网络输入**：Ethernet、ARP、IPv4、TCP、UDP、raw IP 包；
-- **设备输入**：driver 提供的 `NetBufHandle`、IRQ 唤醒、RX/TX 缓冲区生命周期；
-- **控制面输入**：每次发送携带的调用者凭据、批量 netlink message、header、
-  attribute、route mutation、neighbor 更新；
-- **Unix / vsock 输入**：peer socket 数据、连接建立与关闭事件、用户提供的 listen backlog，
-  以及 pathname Unix socket 经 kvfs 解析的路径和 inode；
-- **上层 syscall 语义输入**：由 `posix/net` 传入的 socket 地址族、
-  socket option、阻塞语义和权限决策结果。`SIOCSIFADDR` / `SIOCSIFNETMASK` / `SIOCSIFBRDADDR` /
-  `SIOCADDRT` / `SIOCDELRT` 等写 ioctl 的 `CAP_NET_ADMIN` 等价检查在 `posix/net` 完成；
-  `knet` 的接口地址、flags 和路由 mutation 辅助函数信任调用方已完成特权校验。
+* The driver layer supplies network data to `knet` through `NetBufHandle`, which guarantees that its data slices remain accessible throughout the handle's valid lifetime.
 
-本模块不直接解引用用户指针，
-而是信任 `posix/net` 先完成用户内存访问和长度校验。netlink 调用者凭据由
-POSIX send 或 socket file write 入口取得，并显式传递给 `NetlinkSocket`。
-本模块也不直接执行 DMA 编程，
-但会消费由 driver 层提供的网络缓冲区，
-因此仍需把 driver buffer 生命周期视为关键边界。
+* In-crate parsing paths based on `zerocopy` and `etherparse` validate lengths and field boundaries for Ethernet, ARP, IPv4, and UDP packets. TCP, raw IP, and IPv6 packets continue to use smoltcp protocol parsing and validation.
 
-因此威胁分析重点应覆盖：
+* `Router` forms the network control-plane boundary. It converts external configuration into crate-defined address, CIDR, and neighbor entries before passing them to the device layer, which processes only network configuration prepared through this interface.
 
-- 外部网络包是否能触发越界、panic、状态不一致或资源耗尽；
-- link 与 neighbor mutation 是否绕过设备 owner，address 与 route mutation 是否绕过 Router owner，设备注销是否与 rtnetlink mutation 使用同一把配置锁；
-- netlink mutation 是否复用旧凭据，或在混合批次和 queue 耗尽时产生部分提交；
-- driver buffer、socket handle、ring buffer
-  是否可能因生命周期管理错误破坏内存安全；
-- IRQ 路径与普通协议推进路径是否可能发生竞态或延迟放大。
+* Implementations that access raw memory or manipulate low-level buffers are confined to encapsulated unsafe boundaries. Public interfaces remain safe Rust APIs.
 
-## unsafe 代码清单
+## Protected Assets
 
-### 1. Unix stream 写入 vacant ring buffer
+| Asset | Protection requirement and local evidence |
+|-------|-------------------------------------------|
+| Per-call `Cred` and its effective UID | `NetlinkSocket::send_with_cred` calls `Cred::is_privileged()`, which tests effective UID 0 in `kcred`. Mutations must use this call's identity, never the socket's open credential. Credential-free sends have no mutation authority. |
+| Pathname socket inode and binding identity | `lookup_bind_entry` in [src/unix.rs](../src/unix.rs) checks final-inode `MAY_WRITE` through kvfs, verifies `NodeType::Socket`, and uses `path_bind_matches` to compare the upgraded inode with the resolved inode through `Arc::ptr_eq`. A stale or missing binding returns `ConnectionRefused`. |
+| Filesystem ownership fields | Path lookup and creation pass the same `Cred` to kvfs. kvfs uses `fsuid`, `fsgid`, supplementary groups, inode owner/group, and mode bits for DAC and ownership initialization. User bind supplies `0777 & !umask`; `bind_with_cred` receives an explicit mode from its kernel caller. |
+| Driver RX/TX memory and `PacketBuf` data | `EthernetDevice::poll_rx` finishes `handle_rx_frame` before `recycle_rx`; the provider owns buffer validity. `PacketBuf` owns packet storage and validates offsets and ranges through its accessors. Reference-counted handles keep storage alive across queues. |
+| Unix stream and vsock ring-buffer storage | The unsafe inventory specifies the occupied/vacant range and lock prerequisites for slice access and index advancement. Publication must be limited to initialized bytes; consumption must remain within occupied bytes. |
+| smoltcp `SocketHandle` values | `SOCKET_SET` owns handles under its mutex, and TCP deferred-close processing retains protocol state until closure permits reclamation. |
+| Interface configuration and device identity | `NetDevice` owns link and neighbor state; Router owns addresses and routes. `network_config_lock` protects individual control-plane mutations and device removal. UDP matching uses `PacketBuf::ifindex` and `GeneralOptions::bound_dev_if` to preserve device selection. |
+| TIPC channels, message handles, and client UUIDs | `VsockBridge::read_tipc_msg` rejects attached handles. `accept_reverse_tipc` checks the UUID returned by `ipc_port_accept` against `TipcToVsockMapping::allowed_uuids`, with an empty list explicitly permitting all UUIDs. |
+| Queued AF_PACKET frame storage | `PacketFrame` retains an `Arc<[u8]>`; `PacketRxQueue::push_back` counts the full retained frame allocation and caps each queue at 64 KiB and 1024 frames. `recv_lock` serializes consumption while payload copies run outside `rx_queue`. |
 
-位置：`src/unix/stream.rs:388` 和 `src/unix/stream.rs:392`
+## External Inputs and Trust Boundaries
+
+`knet` receives network packets, control-plane messages, device buffers, and data from upper-layer syscalls.
+This security analysis covers input validation, state updates, resource consumption, lifecycle management, and `unsafe` operations within the crate.
+
+External inputs fall into the following categories:
+
+- **Network packets**: Ethernet frames, ARP, IPv4, IPv6, TCP, UDP, ICMP errors, and raw IP packets; AF_PACKET also exposes frames with other EtherTypes.
+- **Device events and buffers**: driver-provided `NetBufHandle` objects, IRQ wakeups, and RX/TX buffer allocation and recycling.
+- **Control-plane requests**: caller credentials attached to each send, batches of netlink messages with their headers and attributes, route mutations, and neighbor updates.
+- **Unix socket and vsock inputs**: peer data, connection establishment and closure events, user-specified listen backlog limits, and paths and inodes resolved by kvfs for pathname Unix sockets.
+- **Syscall arguments and permission results**: socket address families, options, blocking semantics, and permission-check results supplied by `posix/net`.
+  `posix/net` performs checks equivalent to `CAP_NET_ADMIN` for write ioctls such as
+  `SIOCSIFADDR`, `SIOCSIFNETMASK`, `SIOCSIFBRDADDR`, `SIOCADDRT`, and `SIOCDELRT`; the interface-address, flag, and route mutation helpers in `knet` rely on this prerequisite.
+
+`posix/net` handles user-pointer access and length validation. The POSIX send or socket file write entry point obtains the current caller's credentials
+and explicitly passes them to `NetlinkSocket`. The driver layer handles DMA programming, and `knet` uses driver-provided network buffers.
+Buffer validity and recycling time therefore form part of this module's trust boundary.
+
+The threat analysis focuses on the following issues:
+
+- Conditions under which external packets trigger out-of-bounds access, panics, inconsistent state, or resource exhaustion.
+- Whether link and neighbor mutations go through the device-state owner, address and route mutations go through Router, and device unregistration shares a configuration lock with rtnetlink mutations.
+- Whether netlink mutations reuse stale credentials or partially commit when batches mix operation types or queue space is exhausted.
+- Memory-safety risks in the lifecycle management of driver buffers, socket handles, and ring buffers.
+- Races between IRQ handling and ordinary protocol processing, and their effects on processing latency.
+
+### Input Entry Points and Validation
+
+The following entries identify concrete handoffs visible in the crate. Socket
+arguments are typed values at this boundary; pointer accessibility and ABI
+length checks belong to the syscall or IO provider. Local parsing still treats
+network bytes, peer payloads, and control-plane requests as untrusted.
+
+| Entry and source | Direction, checks, and failure behavior |
+|------------------|----------------------------------------|
+| `SocketOps::send` / `recv`, `Socket::send_with_cred`, and `SocketFileOps::write` in [src/socket/mod.rs](../src/socket/mod.rs) and [src/socket/file.rs](../src/socket/file.rs) | Callers provide `Read`/`IoBuf` payloads, typed addresses, options, and, where applicable, credentials; receive paths write to caller-provided `Write` buffers. IO errors propagate through `KResult`. The netlink file-write branch obtains `kprocess::current_cred()` on each call. |
+| `NetlinkSocket::send_inner` in [src/netlink/socket.rs](../src/netlink/socket.rs) | The caller's datagram is copied before parsing. The socket must be bound or returns `NotConnected`. A route destination with nonzero pid or groups returns `EOPNOTSUPP`; another address family returns `InvalidInput`. `split_route_requests` accepts complete headers and stops at a short or invalid tail. Mixed batches return `EOPNOTSUPP`; insufficient response space returns `ENOBUFS`. Mutation privilege is checked per request using the current send's privilege result. |
+| `NlMsgHeader::read`, `parse_attrs`, and `parse_ip_by_family` in [src/netlink/wire.rs](../src/netlink/wire.rs) | Header length must lie between `NLMSG_HDR_LEN` and available bytes or parsing returns `None`. Attributes require a length of at least 4 within available bytes or return `EINVAL`; short trailing bytes and missing final alignment padding are tolerated. IPv4/IPv6 attributes require exactly 4/16 bytes; wrong lengths return `EINVAL`, and unsupported families return `EAFNOSUPPORT`. `handle_rtnetlink_request` rejects a missing `NLM_F_REQUEST` flag with `EINVAL`, returns `EOPNOTSUPP` for unsupported operations, and encodes request errors as `NLMSG_ERROR`. |
+| `UnixDomainSocket::bind_with_cred`, `create_bind_location`, and `lookup_bind_entry` in [src/unix.rs](../src/unix.rs) | Callers supply pathname or abstract addresses and credentials. Path creation delegates traversal and parent permissions to kvfs and maps an existing inode to `AddrInUse`. Lookup checks final-inode `MAY_WRITE`, socket type, and binding identity before invoking the transport. DAC errors propagate, a non-socket inode returns `NotASocket`, and an absent or stale binding returns `ConnectionRefused`. Abstract addresses use the in-memory table without inode DAC. |
+| `DgramTransport::send` / `recv` in [src/unix/dgram.rs](../src/unix/dgram.rs) | Caller bytes, ancillary objects, and sender address enter a peer channel; explicit destinations pass through `lookup_bind_entry` with current credentials. Missing connections return `NotConnected`, failed channel sends return `BrokenPipe`, and empty receive queues return `WouldBlock`. Receive transfers ancillary objects and copies payload into the caller's writer. Channels are currently unbounded. |
+| `ListenerQueue::reserve` in [src/unix/stream/listener.rs](../src/unix/stream/listener.rs) | Connect requests consume listener capacity before ring allocation. The configured capacity is `backlog.saturating_add(1).clamp(1, LISTEN_QUEUE_SIZE)`. A stopped listener returns `ConnectionRefused`; a full queue returns `WouldBlock` for nonblocking or expired waits. Interrupted waits propagate the interruption error. |
+| `EthernetDevice::poll_rx` / `handle_rx_frame` in [src/device/ethernet.rs](../src/device/ethernet.rs) | The `kclass` network device supplies `NetBufHandle`. `EthernetFrameRef::new_checked` requires a complete 14-byte header. `ArpIpv4Packet::parse` requires a complete 28-byte Ethernet/IPv4 ARP header with hardware/protocol types 1/0x0800 and address lengths 6/4. Invalid frames or ARP records are dropped. RX data is copied into owned packet storage before recycling; provider buffer validity is trusted. |
+| `Ipv4Header::validate_input_packet` / `parse_icmp_quote` in [src/stack/ipv4.rs](../src/stack/ipv4.rs) | Incoming network bytes must contain a valid IPv4 header; total length must cover the header and fit the packet, and checksum must match. Failures return `Ipv4Error::Malformed` or `BadChecksum`; accepted input is trimmed to total length. ICMP quotes permit a truncated original payload but still require a complete, checksum-valid header. |
+| UDP binding to port zero and automatic binding on the first connect or send | Each ephemeral port allocation requires a ready kernel `entropy` pool and uses fresh ChaCha20 output. If entropy is unavailable, allocation returns `EAGAIN` before registering the PCB or publishing the local endpoint. Allocation continues to fail while the entropy source remains unavailable. Platforms must provide a trusted entropy source, and the `entropy` module is responsible for entropy collection, seed quality, and readiness. Port randomization makes off-path guessing more costly; applications remain responsible for source validation and authentication. |
+| `prepare_ipv4_packet` in [src/transport/udp/input.rs](../src/transport/udp/input.rs) | The incoming IPv4 packet's UDP length must be at least 8 and fit the IP payload; `has_valid_udp_checksum` accepts zero checksums for IPv4 or validates the supplied checksum. Failure returns the original packet in `Err` for caller disposal. `deliver_ipv4_packet` applies local/peer/interface lookup; no match returns `NoSocket` with the retained packet. |
+| `PacketSocket::bind` / `send` in [src/link/packet.rs](../src/link/packet.rs) | Bind accepts interface 0 as a wildcard or requires an existing interface, otherwise `ENODEV`. Send requires a positive interface index; an explicit invalid index returns `ENXIO`, an unspecified unbound destination returns `NotConnected`, and another address family returns `EAFNOSUPPORT`. `send_with_link` checks initialization and device existence, returning `ENODEV`; `validate_link_state_for_send` returns `ENETDOWN` for a down link, `InvalidInput` for a short raw header, or `EMSGSIZE` above the MTU limit. Datagram construction requires at least six destination MAC bytes and a nonzero protocol. `validate_protocol` currently accepts all protocol values. |
+| `send_link_frame` in [src/link/mod.rs](../src/link/mod.rs) | A kernel caller supplies an interface index and complete frame slice to `Service::send_link_frame`. The exported helper returns `OperationNotSupported` before service initialization; this differs from the AF_PACKET socket wrapper's `ENODEV`. Device/frame validation belongs to the called Service/device path. |
+| `VsockConnectionManager::handle_raw_event` in [src/vsock/connection_manager.rs](../src/vsock/connection_manager.rs) | The device provider supplies a typed `VsockTransportEvent` and body slice. Source address and destination port select the connection. Receive copies `body[..length]` when available and otherwise uses the whole supplied body; `push_rx_data` bounds the copy by free ring capacity and drops excess bytes. This layer relies on the provider for wire validation and does not reject a reported length larger than the supplied body. Bridge events carry the number of bytes actually stored. |
+| `VsockBridge::recv_exact_record`, `parse_service_name`, and `read_tipc_msg` in [src/vsock/bridge.rs](../src/vsock/bridge.rs) | Host records are capped at `IPC_CHAN_MAX_BUF_SIZE` or return `OutOfRange`. Service names permit one trailing newline, require valid UTF-8, and must be nonempty, shorter than `IPC_PORT_PATH_MAX`, and NUL-free; failures return `InvalidInput` and trigger `[1]` rejection plus closure. TIPC messages with handles return `Unsupported`, oversized messages return `OutOfRange`, and short reads return `Io`; forwarding errors close the connection. |
+| `VsockBridge::accept_reverse_tipc` in [src/vsock/bridge.rs](../src/vsock/bridge.rs) | TIPC returns a channel and client UUID through `ipc_port_accept`. `uuid_allowed` accepts a listed UUID or any UUID if the list is empty. A mismatch closes the channel and returns `PermissionDenied` before creating a vsock connection. The current `TIPC_TO_VSOCK_MAP` uses an empty allowlist. |
+| `publish_kobject_uevent` in [src/netlink/socket.rs](../src/netlink/socket.rs) | A kernel publisher supplies a group and byte payload; the function appends a sequence number and delivers only to matching subscribed groups. Receive queues enforce `NETLINK_RX_QUEUE_LIMIT`; overflow drops the event. Publisher identity and payload provenance are trusted kernel-caller responsibilities. |
+
+### Authorization and Residual Trust
+
+Netlink route mutations use `Cred::is_privileged()`, currently effective UID 0,
+and return `NLMSG_ERROR` with `EPERM` for an unauthorized request. This is a
+local identity predicate, not a complete capability model. The file's stored
+open credential does not authorize subsequent netlink writes.
+
+Pathname operations propagate kvfs permission errors, including
+`KError::PermissionDenied` from generic DAC checks. kvfs owns traversal,
+parent-directory permissions, and inode permission policy; `knet` additionally
+checks socket type and binding identity. Abstract Unix addresses have no
+filesystem permission boundary.
+
+Reverse TIPC forwarding relies on the UUID returned by TIPC. The current empty
+allowlist permits every client accepted by the published TIPC service; it does
+not provide per-TA isolation. Host-to-TIPC service connections pass
+`IpcUuid::default()` to `ipc_port_connect_async`, so TIPC service policy owns
+acceptance of that identity. Neither a vsock address nor a netlink pid field is
+used here as authenticated caller credentials.
+
+## Unsafe Code Inventory
+
+### 1. Writing to Vacant Regions of the Unix Stream Ring Buffer
+
+Locations: `StreamTransport::send` in [src/unix/stream.rs](../src/unix/stream.rs), lines 256 and 260.
 
 ```rust
 let mut count = src.read(unsafe { left.assume_init_mut() })?;
-count += src.read(unsafe { right.assume_init_mut() })?;
+if count >= left.len() {
+    count += src.read(unsafe { right.assume_init_mut() })?;
+}
 ```
 
-不变量：
+Invariants:
 
-- `left` 和 `right` 来自同一次 `HeapProd::vacant_slices_mut`。
-- 两个切片表示当前 producer 的可写容量。
-- `Read::read` 只初始化它返回的字节数。
-- channel lock 持有期间，其他路径无法同时推进同一 producer。
+- `left` and `right` come from the same call to `HeapProd::vacant_slices_mut`.
+- The two slices represent vacant regions writable by the current producer.
+- The return value of `Read::read` determines the number of bytes initialized.
+- While the channel lock is held, no other path can concurrently advance the same producer.
 
-安全依据：
+Safety rationale:
 
-- `send` 持有 `self.channel.lock()` 后取得 `chan.tx`。
-- 写入后只发布 `Read::read` 返回的字节数。
-- `ringbuf` producer 自身维护环形 buffer 边界。
+- `send` obtains `chan.tx` after acquiring `self.channel.lock()`.
+- Only the number of bytes returned by `Read::read` is published after writing.
+- The `ringbuf` producer maintains the ring-buffer boundaries.
 
-调用者：
+Caller:
 
-- `StreamTransport::send`，由 Unix stream socket `SocketOps::send` 调用。
+- `StreamTransport::send`, called by `SocketOps::send` on a Unix stream socket.
 
-### 2. Unix stream 推进 write index
+### 2. Advancing the Unix Stream Write Index
 
-位置：`src/unix/stream.rs:407`
+Location: `StreamTransport::send` in [src/unix/stream.rs](../src/unix/stream.rs), line 275.
 
 ```rust
 unsafe { chan.tx.advance_write_index(count) };
 ```
 
-不变量：
+Invariants:
 
-- `count` 等于本次写入 `left` 与 `right` 的总字节数。
-- `count` 小于等于本次 `vacant_slices_mut` 暴露的总容量。
-- 推进 write index 前，相关字节已经初始化。
+- `count` equals the total number of bytes written to `left` and `right` in this operation.
+- `count` does not exceed the total capacity exposed by this call to `vacant_slices_mut`.
+- The corresponding bytes are initialized before the write index advances.
 
-安全依据：
+Safety rationale:
 
-- `count` 只由两个 `Read::read` 返回值累加得到。
-- 每次 `Read::read` 的目标切片长度受 ring buffer vacant 区域限制。
-- channel lock 保护 producer。
+- `count` is calculated solely by adding the two return values of `Read::read`.
+- Each `Read::read` destination slice is bounded by the vacant region of the ring buffer.
+- The channel lock protects the producer.
 
-调用者：
+Caller:
 
-- `StreamTransport::send`。
+- `StreamTransport::send`.
 
-### 3. Unix stream 推进 read index
+### 3. Advancing the Unix Stream Read Index
 
-位置：`src/unix/stream.rs:440`
+Location: `StreamTransport::recv` in [src/unix/stream.rs](../src/unix/stream.rs), line 312.
 
 ```rust
 unsafe { chan.rx.advance_read_index(count) };
 ```
 
-不变量：
+Invariants:
 
-- `count` 等于本次从 `chan.rx.as_slices` 返回的 occupied 区域复制出的字节数。
-- `count` 小于等于当前 readable 区域长度。
-- PEEK 语义没有进入此路径。
+- `count` equals the number of bytes copied from the occupied regions returned by `chan.rx.as_slices` in this operation.
+- `count` does not exceed the current readable length.
+- The current implementation advances the index after copying and does not branch on `RecvFlags::PEEK`; it therefore consumes data even for a PEEK request. This is a receive-semantics limitation, not a safety precondition.
 
-安全依据：
+Safety rationale:
 
-- `recv` 持有 `self.channel.lock()` 后访问 `chan.rx`。
-- `dst.write` 的输入切片来自 `as_slices` occupied 区域。
-- `count` 由两个 `dst.write` 返回值累加得到。
+- `recv` accesses `chan.rx` after acquiring `self.channel.lock()`.
+- The input slices passed to `dst.write` come from the occupied regions returned by `as_slices`.
+- `count` is the sum of the two return values of `dst.write`.
 
-调用者：
+Caller:
 
-- `StreamTransport::recv`。
+- `StreamTransport::recv`.
 
-### 4. vsock 推进 RX read index
+### 4. Advancing the vsock Receive-Buffer Read Index
 
-位置：`src/vsock/connection_manager.rs:151`
+Location: `Connection::advance_rx_read` in [src/vsock/connection_manager.rs](../src/vsock/connection_manager.rs), lines 187–189.
 
 ```rust
 unsafe {
@@ -157,232 +280,469 @@ unsafe {
 }
 ```
 
-不变量：
+Invariants:
 
-- 调用者持有 connection lock。
-- `count` 来自同一 connection 的 `rx_slices` 复制结果。
-- `count` 小于等于当前 RX occupied 长度。
+- The caller holds the connection lock.
+- `count` comes from copying the same connection's `rx_slices`.
+- `count` does not exceed the amount of data currently written to the receive buffer.
 
-安全依据：
+Safety rationale:
 
-- `VsockStreamTransport::recv` 在 `conn.lock()` 保护下读取 `rx_slices` 并调用 `advance_rx_read`。
-- PEEK 请求跳过 advance。
-- ringbuf consumer 只在 connection lock 内推进。
+- `VsockStreamTransport::recv` reads `rx_slices` and calls `advance_rx_read` while holding `conn.lock()`.
+- PEEK requests in `VsockStreamTransport::recv` preserve the current read index.
+- `recv_bridge` holds `conn.lock()` while copying from `rx_slices` and calling `advance_rx_read`. Each copy is bounded by the remaining destination capacity and the source slice length, and `count` is the total number of bytes copied.
+- The ringbuf consumer advances only while the connection lock is held.
 
-调用者：
+Callers:
 
-- feature `vsock` 下的 `VsockStreamTransport::recv`。
+- `VsockStreamTransport::recv` when the `vsock` feature is enabled.
+- `recv_bridge` in [src/vsock/connection_manager.rs](../src/vsock/connection_manager.rs) when the `vsock_tipc_bridge` feature is enabled.
 
-### 5. UDP waiter 测试专用 `RawWaker`
+### 5. Test-Only UDP `RawWaker`
 
-位置：`src/transport/udp/wait.rs:97-124`
+Locations: the `tests` module in [src/transport/udp/wait.rs](../src/transport/udp/wait.rs):
+`waker_clone` at line 109, `waker_wake` at lines 113–118,
+`waker_wake_by_ref` at lines 121–124, `waker_drop` at line 132,
+and `make_waker` at lines 135–141.
 
-该实现只在 `cfg(unittest)` 下编译，用于统计 `PollSet` 的唤醒次数。
-`RawWaker` 数据指针始终来自 `Box::leak` 生成的静态 `AtomicUsize`，
-vtable 回调保持原指针与静态生命周期，不释放该测试计数器。
-生产构建不包含这组 unsafe 代码。
+This `cfg(unittest)` implementation counts `PollSet` wakeups. `new_counter`
+uses `Box::leak` to create a static `AtomicUsize`, and `make_waker` installs
+that pointer with `WAKER_VTABLE`. The two wake callbacks cast the data pointer
+back to `AtomicUsize` and increment it atomically. Clone preserves the same
+pointer and vtable without reference-count updates, and drop does not free
+the intentionally leaked allocation. `Waker::from_raw` relies on these
+callbacks preserving the raw-waker data contract. These are the premises
+stated in the local `SAFETY:` comments and the clone/drop safety contracts.
 
-## 内存安全不变量
+The wake callbacks have local `SAFETY:` comments for their dereferences but
+lack separate function-level `# Safety` sections. Their unsafe-function
+contracts remain a source-documentation follow-up; this inventory does not
+certify that rustdoc coverage.
 
-1. `SocketHandle` 生命周期：任何 smoltcp socket handle 在访问前必须仍存在于 `SOCKET_SET`。
-2. `SocketSet` 互斥访问：所有 `SocketSet` 读写必须经过 `SOCKET_SET.inner` 的 mutex。
-3. `Service` 互斥访问：设备 RX drain、路由状态、ingress queue 和 TX dispatch 必须经过内部 Router mutex，smoltcp Interface 必须经过独立 mutex；IPv4 校验和 snoop 在 Router 锁外执行。
-4. ring buffer publish 规则：Unix stream 和 vsock 只能发布已经写入的字节，只能消费当前 occupied 区域内的字节。Unix stream 的 write index 发布、方向关闭和空队列 EOF 判定由同一个方向锁排序。
-5. driver buffer 生命周期：`NetBufHandle::data` 只在 handle 被 recycle 前使用，RX handle 必须在处理后归还。
-6. netlink message 边界：所有 payload 读取必须先经过单条 header 长度、批次对齐边界、attribute 长度和 family 校验。批次拆分在剩余不足一个 header、`nlmsg_len` 非法或截断时停止，不回滚已处理消息，也不因尾部非零填充返回 syscall 错误。
-7. netlink credential 边界：每次 `send` 或 `write` 必须传入当前调用者的独立 `Cred` 快照，netlink socket 不得缓存调用者权限。
-8. netlink batch 执行边界：每个 socket 的发送事务锁串行化容量预检、mutation 执行和 response 入队；`network_config_lock` 串行化跨 socket mutation、legacy socket ioctl mutation 与 `unregister_netdev`；混合查询和 mutation 的批次必须在状态更新前拒绝；同类 mutation 执行前必须检查完整批次的 response queue 空间。response 在 rx queue 锁外生成，锁顺序固定为发送事务锁、`network_config_lock`、Router、ingress、Interface、netlink rx queue，未涉及的锁按序跳过。
-9. route index 边界：rtnetlink route 的 `oif` 转换成设备索引后必须检查 `dev < devices.len()`。
-10. static init 顺序：创建 socket 前必须完成 `init_network` 初始化 `SERVICE`、`SOCKET_SET` 和 `LISTEN_TABLE`。
-11. pathname credential 一致性：一次 Unix pathname bind 的查找、创建和属主初始化必须使用同一份 `Cred` 快照。
-12. kernel caller 边界：没有当前用户任务的内核调用者不得进入隐式 `current_cred()` 路径；pathname 操作和 socket file 构造都必须显式选择凭据。
-13. `PacketBuf` 所有权：报文进入网络栈时创建指针大小的引用计数句柄，设备、Router、loopback、PCB 和 smoltcp adapter 之间按值转移该句柄；共享后的修改执行写时复制，协议偏移和已校验 UDP payload range 只能落在当前有效数据范围内。
-14. IPv4 输入边界：本地交付前必须校验版本、头长、总长和头部校验和，并按 `total_len` 截断尾部数据。
-15. 网络类型边界：`RouteTable` 和 `NetDevice` 不暴露 smoltcp 地址或时间类型；控制面与协议兼容转换由 `Router`、`Service` 和初始化入口完成。
-16. IPv4 重组边界：分片按源地址、目的地址、标识、协议和接口隔离；被已有区间完全覆盖的分片按重复包丢弃，部分重叠或范围矛盾会删除整条队列；重组状态受 64 条队列、4 MiB 高水位、3 MiB 低水位和 30 秒超时限制，队列创建时登记固定过期事件，完成、异常删除和容量淘汰时同步取消，首片存在的超时队列生成 ICMPv4 Time Exceeded。
-17. UDP 接收边界：UDP 长度、校验和和 payload range 通过 checked parser 验证，单个 PCB 的接收队列上限为 1024 个数据报。PCB 创建时预留该上限对应的指针大小 `PreparedUdpPacket` 槽位；loopback 发送侧必须在关闭 BH 前完成数据报解析，并把结果写入已有 `PacketBuf` 的控制元数据。`NetRx`/`SpinNoIrq` 入队路径只能移动已有句柄，不得分配或扩容。队列满时先释放 PCB 队列锁，再丢弃当前数据报。`MSG_PEEK` 只能在锁内增加 `PacketBuf` 引用计数，payload 复制必须在 `SpinNoIrq` 外完成。
-18. IPv4 输出边界：栈内 UDP 的输出 MTU 来自匹配路由指向的设备；UDP 与 raw IPv4 在路由缺失或输出设备管理 down 时返回 `ENETUNREACH`，DF 包超过 MTU 时返回 `EMSGSIZE`，允许分片的包只按 8 字节对齐切分 payload。
-19. poller 完成条件：唯一执行者通过一次 CAS 从 `RUNNING` 或 `RUNNING_PENDING` 发布 `IDLE` 或 `SCHEDULED`；RX、ingress、TX 和已到期 timer 均无立即工作且执行期间没有通知时才能进入 `IDLE`。每轮 bulk work 受 1 ms 软时间上限约束，kwork poller callback 执行有界批次，每个批次最多推进四轮，达到上限且仍有立即工作时保留 `SCHEDULED` 并 queue 下一批。
-20. 协议 timer 条件：每轮 `poll_maintenance`、`poll_ingress_single` 和 `poll_egress` 完成后必须用 `poll_at` 刷新下一次 deadline；IPv4 重组队列通过独立原子源发布最早 deadline；`has_immediate_timer_work` 与 `update_poll_timeout` 必须在轮次末尾使用新的单调时间判断绝对 deadline，尚未到期的 timer 不进入 `PollProgress::has_more`，到期后必须通过 `notify(PollReason::Timer)` 发布工作。
-21. TX 与接收窗口交接条件：socket 或 Router 产生 TX 工作后必须通过 `notify(PollReason::Tx)` 发布；TCP 从余量低于最大窗口缩放量子的接收缓冲区消费数据后必须通过 `notify(PollReason::RxWindow)` 发布零窗口恢复工作；Router data TX queue 容量实际增加时必须设置 `tx_capacity_changed`，TX waiter 只依据该字段执行全局容量唤醒。
-22. TCP 关闭生命周期：用户文件对象释放后，含有待发送数据、FIN 或重传状态的 smoltcp handle 必须继续保留在 `SOCKET_SET`；接收队列存在未读数据时必须保留 abort handle 直到 RST 发出；协议进入 `Closed` 后才能删除。只有 orphan `FIN_WAIT_2` 状态受 60 秒回收期限约束。
-23. 网络 timer 条件：协议与 deferred-close 共用一个原子 deadline 源，IPv4 重组使用独立原子源保存 deadline 和 pending 状态；周期采样回调只执行原子状态转换、唤醒与 poller 通知，不得获取 sleepable mutex、分配 future 或访问 timer wheel。IPv4 到期队列按 `PollBudget::timer_events` 分批消费。
-24. link 配置所有权：接口名、MTU、管理 up 状态和 link snapshot 只由 `NetDevice` 持有；`RTM_NEWLINK` 必须先完成名称唯一性、名称格式、设备 MTU 范围和受支持 flags 的整组校验，再修改设备。`ifi_change` 中的派生状态位按 Linux `IFF_VOLATILE` 语义保留，实际改变的未支持可写位返回 `EOPNOTSUPP`。
-25. IPv4 地址生命周期：地址或所属设备移除后，Router 地址条目、自动路由、IngressProcessor、smoltcp Interface 和设备投影必须在同一 Router 锁作用域内刷新；legacy ioctl 更新只定位主地址条目并保留同设备其他地址，netmask 更新必须保留 scope 和自定义 broadcast；最后一个同值地址消失时，Router 中依赖该 `prefsrc` 的配置路由必须同步删除；设备消失时还必须删除其路由与邻居并重编号后续接口索引。
-26. poller 锁竞争交接条件：持有全局推进权时，Router、IngressProcessor、smoltcp Interface 和 socket-set 只能通过 `try_lock` 获取；accepted batch 交接必须按 socket-set、Router 的顺序获取两把锁，只有 control batch 时跳过 socket-set；竞争必须返回 `has_more`。已经到期的 IPv4 重组事件遇到 IngressProcessor 竞争时保持 pending，继续完成本轮 TX 与协议推进；尚未到期或不存在重组队列时不为过期处理获取该锁。已经从设备取出的 raw batch、等待进入 smoltcp 的 accepted batch 和待发送 control batch 必须保留到成功交接，TCP listener preparation 与 accepted batch 入队必须处于同一次成功交接中。
-27. loopback UDP 交付边界：loopback xmit 必须在关闭 BH 前给完整 IPv4 UDP 盖戳，再于 `local_bh_disable` 下把同一 `PacketBuf` 放入共享 `NET_RX_QUEUE` 的 `pending_udp` 并 raise `NetRx`；`NetRx` 只取出 `pending_udp` 中的已盖戳 UDP，不查找 `LoopbackDevice`。`NetRx` 与 task fallback 只能通过 `SpinNoIrq` 查找 UDP PCB 并入队。完整 IPv4 UDP 不得依赖 poller `RUNNING` 所有权。TCP、ICMP、IPv6、分片和未命中 socket 的 UDP 由 `poll_rx` 从 `deferred` 交给任务 poller。
-28. `NET_RX_QUEUE` 容量与所有权边界：`pending_udp` 与 `deferred` 必须在设备创建时按 `SOCKET_BUFFER_SIZE` 预分配，`enqueue` 以两条队列长度与 in-flight 合计为上限拒绝超额报文，因此 `push_back` 不得在 `SpinNoIrq` 或 `NetRx` softirq 内触发扩容。`process_pending` 取出的盖戳 UDP 必须计入 in-flight 预留，批次大小不超过 `NET_RX_BUDGET`，在锁外交付；未命中 PCB 的报文必须仍唯一持有句柄，清除元数据后放入 `deferred`。队列满时 `enqueue` 必须把报文交还调用方，由发送路径在释放 `NET_RX_QUEUE` 与 BH guard 之后再 drop；`discard_ifindex` 必须先把匹配报文移出到局部容器，解锁后再释放，避免在 `SpinNoIrq` 内堆释放。发送路径的 task fallback 只处理进入时已有的 `pending_udp`，并按 `NET_RX_BUDGET` 拆成固定轮次。队列按 `ifindex` 区分报文所有者，`LoopbackDevice::drop` 必须调用 `discard_ifindex`；该清理对 `process_pending` 释放锁期间的在途报文是 best-effort，完整的设备身份语义需要等价于 Linux `skb->dev` 与 `NETREG_UNREGISTERING` 的注册状态。
-29. TCP listener 推进条件：收到 TCP 报文或 SYN 队列仍有 child 时，下一次实际网络 poll 必须刷新对应 listener。child 进入 accept 队列后才唤醒 `accept_poll`，唤醒发生在 entry 锁外。SYN 队列非空不会设置 `PollProgress::has_more`，未到期的协议 timer 继续等待 deadline 通知，避免半连接造成 poller 空转。
-30. Unix listener 资源边界：pending request 与容量预留之和不得超过 `LISTEN_QUEUE_SIZE`。每个连接的两个 64 KiB ring 只能在容量预留成功后分配；预留失败、中断或源 socket 状态拒绝连接时必须通过 RAII 归还名额。
+### 6. Test-Only Ethernet `RawWaker`
 
-## 线程安全
+Locations: the `tests` module in [src/device/ethernet.rs](../src/device/ethernet.rs):
+`waker_clone` at line 857, `waker_wake` at lines 861–864,
+`waker_wake_by_ref` at lines 867–870, `waker_drop` at line 873,
+and `make_waker` at lines 882–886.
 
-| 类型 | Send 条件 | Sync 条件 |
-|------|-----------|-----------|
-| `TcpSocket` | 字段满足 Send | 内部锁、atomic 和 global socket set 串行化共享状态 |
-| `UdpSocket` | 字段满足 Send | `Arc<UdpPcb>` 内的锁、atomic 和分桶 PCB registry 保护共享状态 |
-| `RawSocket` | 字段满足 Send | `RwLock`、atomic 和 immutable handle 保护共享状态 |
-| `StreamTransport` | 字段满足 Send | `Mutex<Option<Channel>>` 串行化本端操作，`ListenerState` mutex 串行化 pending queue、容量预留、listen 与 shutdown，per-direction `SpinNoPreempt` 排序数据发布、半关闭与 EOF 判定，三组 `PollSet` 隔离读、写和连接状态 waiter |
-| `NetlinkSocket` | 字段满足 Send | `Arc<NetlinkSocketInner>` 内部使用 `RwLock`、发送事务 `Mutex`、rx queue `Mutex` 和 `PollSet`；每次发送显式携带调用者凭据，socket 不保存权限主体 |
-| `Service` | 字段满足 Send | 通过内部 `Mutex` 分别保护 Interface、Router、IngressProcessor、timeout 和可复用 batch；poller 以非阻塞方式取得共享推进锁并保留竞争期间的 batch；网络 timer 与 deferred-close deadline 使用原子值发布，不在周期采样回调路径获取 sleepable mutex |
-| `Router` | 在 `Service` 内使用 | 通过 `Service` 的 Router mutex 间接共享 |
+This `cfg(unittest)` implementation tests RX-source wakeups. `new_counter`
+leaks a properly aligned `AtomicUsize`; `make_waker` installs its static pointer
+and `WAKER_VTABLE`. The local `SAFETY:` comments require the leaked, aligned
+pointer for both dereferences and atomic increments on that allocation for
+`Waker::from_raw`. Clone preserves the pointer and vtable; drop is a no-op.
+The allocation remains valid for every callback, including callbacks after
+cloning. The four unsafe callbacks lack function-level `# Safety` sections;
+their standalone contracts remain to be documented in the source. The block
+premises above are traceable to the existing local comments and constructors.
 
-## 威胁分析
+### 7. Other Explicit Unsafe Boundaries
 
-| 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
-|------|----------|----------|----------|----------|
-| T-01 | 初始化顺序错误导致 `LazyInit` 访问未初始化对象 | 高 | socket 在 `init_network` 前创建或 poll | 启动路径由 `core/kruntime` 先调用 `init_network`；新增入口需保留该顺序 |
-| T-02 | smoltcp socket handle 已删除后继续访问 | 高 | listener 关闭、accepted child 清理与并发 socket 操作交错 | `SocketSet` 访问由 mutex 串行化；`ListenTable::unlisten` drain 后删除 handle；调用点需避免缓存 handle 后跨释放点使用 |
-| T-03 | ring buffer index 推进超过实际写入或读取长度 | 高 | `advance_write_index` 或 `advance_read_index` 的 count 与切片来源不一致 | count 由持有 channel mutex 时取得的同一批 slices 计算；unsafe 注释固定不变量 |
-| T-04 | 恶意 netlink 消息越界读取或构造非法状态 | 高 | 用户传入短 header、畸形 attr、非法 family、非法 ifindex | `NlMsgHeader::read`、`parse_attrs`、`parse_ip_by_family` 和 route index 检查拒绝非法输入 |
-| T-05 | ARP spoofing 污染 neighbor cache | 中 | 外部主机发送伪造 ARP reply 或 request | 当前校验 unicast MAC、广播和本机目标 IP；完整邻居安全策略仍依赖网络隔离 |
-| T-06 | listen backlog 被 SYN 洪泛占满 | 中 | 大量连接请求命中同一 listener | backlog 被 clamp 到 `LISTEN_QUEUE_SIZE`；超限丢弃并记录 warn |
-| T-07 | raw socket 被无权限调用者创建 | 中 | syscall 层没有实施权限门禁 | `knet` 层只封装 raw socket 行为；权限策略应保留在 `posix/net::sys_socket` |
-| T-08 | netlink RX queue 被 uevent 或 response 填满 | 中 | 订阅者不消费，publisher 持续写入 | `NETLINK_RX_QUEUE_LIMIT` 限制单 socket queue 字节数，超限丢弃 |
-| T-09 | 控制面与 data-plane 不一致 | 中 | link mutation 更新设备 owner 失败，rtnetlink 与 legacy socket ioctl 地址 mutation 交错，设备移除后保留旧地址投影或控制面路由，删除地址后配置路由继续引用失效 `prefsrc`，或 route 与 neighbor mutation 绕过各自 owner | `network_config_lock` 串行化跨入口更新与 `unregister_netdev`；link query 与 mutation 直接访问 `NetDevice` owner；address 与 route query 和 mutation 直接访问 Router；接口地址查询在 Router 单次锁内完成；`RTM_NEWNEIGH` 直接访问目标设备；地址与设备删除刷新自动路由、ingress、Interface 和设备投影；地址最后持有者和设备删除路径同步清理 Router 路由并更新接口索引 |
-| T-10 | 外部网络包触发 parser panic | 中 | malformed Ethernet、ARP、IP、UDP 或 TCP packet 进入 RX | Ethernet 和 ARP 使用 `zerocopy` checked view，IPv4 与 UDP 使用 crate 内 checked parser，TCP、raw IP 和 IPv6 使用 smoltcp checked parser；错误包直接丢弃 |
-| T-11 | 中断上下文误用导致锁竞争或延迟放大 | 中 | IRQ waker 回调中直接推进 `SERVICE`、`SOCKET_SET` 或执行阻塞 socket 操作 | VirtIO IRQ handler 只确认中断并调度 NetRx softirq；NetRx softirq 只标记/唤醒 RX source 并 queue `knet-poller` work；kwork callback 在普通任务上下文执行最多四轮的有界批次 |
-| T-12 | driver buffer 或 DMA 输入破坏 packet 边界 | 高 | 驱动返回长度异常、数据在 recycle 后继续被访问、TX/RX buffer 生命周期使用错误 | RX 数据只在 `NetBufHandle` recycle 前解析和复制；外部帧使用 checked parser；TX buffer 由 driver handle 管理 |
-| T-13 | vsock-TIPC bridge 误把普通 AF_VSOCK 连接路由到 TIPC | 中 | 事件分流没有区分桥接端口或已桥接连接 | bridge 只接管静态 port map 和自己的 connection id，未命中事件继续交给 `VSOCK_CONN_MANAGER` |
-| T-14 | host 通过 bridge 注入超大或非法 TIPC message | 中 | `Received` record 超过 TIPC slot 或 port 0 service name 非法 | bridge 限制 record 长度为 `IPC_CHAN_MAX_BUF_SIZE`，动态 service name 需通过 UTF-8、NUL 和长度校验；非法 name 回 `[1]` 并断开 |
-| T-15 | TIPC handle/memref capability 经 vsock 泄露到 host | 高 | TA 向 bridge 发送带 attached handles 的 message | bridge v1 只转发 bytes，发现 attached handles 时关闭连接 |
-| T-16 | host 误判 port 0 handshake 结果 | 中 | 未读状态字节就发 payload；忽略 `[1]`；无 recv 超时导致永久阻塞 | 协议要求 host 先读单字节状态（`0`=成功，`1`=拒绝）；`libtrusty` 使用 `SO_RCVTIMEO`；CA 测试拒绝非 `[0]` 状态 |
-| T-17 | IPv4 分片耗尽内核内存 | 中 | 外部持续发送无法完成重组的不同分片流 | 重组器限制队列数量与总内存，超过高水位后淘汰最早队列到低水位，队列存活时间固定为 30 秒 |
-| T-18 | 重叠 IPv4 分片混淆上层解析 | 中 | 同一重组 key 提交相互覆盖的 payload range | 被已有区间完全覆盖的分片按重复包丢弃，任何部分重叠或总长度矛盾会删除整条队列 |
-| T-19 | UDP 接收洪泛占满 socket 队列 | 中 | 应用读取速度低于入包速度 | 每个 PCB 最多保留 1024 个数据报；创建时预留指针大小的队列槽位，达到上限时在锁外丢弃新数据报；PCB 直接复用报文进入网络栈时创建的 `PacketBuf` 句柄 |
-| T-20 | pathname Unix socket 绕过 inode/目录 DAC 或复用已有 inode | 高 | bind/connect/sendto 直接访问 binding 表，或 bind 接受已有路径 | bind 通过 `parent_at` 和 `Path::mknod` 排他创建；connect/sendto 在 lookup 后检查最终 inode `MAY_WRITE`；abstract 地址才直接访问内存 binding 表 |
-| T-21 | 内核任务隐式读取用户凭据 | 高 | 启动期 pathname bind 调用普通 `SocketOps::bind`，当前线程不存在或主体错误 | 内核调用者使用 `bind_with_cred` 显式传入 `initial_cred()` 等已选择凭据；普通入口只服务当前用户任务 |
-| T-22 | Unix stream 在 EOF 后发布数据 | 中 | send、shutdown 与 peer recv 并发交错，关闭状态和 write index 缺少共同排序 | 每个发送方向使用共享 `tx_order`；send 在锁内复检后发布，recv 在锁内复查 empty 和 closed，Channel 释放前先发布关闭状态 |
-| T-23 | netlink socket 复用旧凭据导致越权 mutation | 高 | socket 跨进程传递或调用者凭据变化后继续使用创建时权限 | POSIX send 与 socket file write 路径仅在 netlink 分支取得当前 `Cred`，`NetlinkSocket::send_with_cred` 逐条检查 mutation；无权限请求生成 `NLMSG_ERROR` 和 `EPERM` |
-| T-24 | 混合 netlink 批次发生部分 mutation | 高 | 同一发送同时包含 query 和 mutation，或 response queue 在批次中途耗尽 | 发送事务锁串行化同一 socket 的 mutation 批次；完整批次先校验类别；混合批次返回 syscall `EOPNOTSUPP`；同类 mutation 执行前检查完整 response 空间；截断或非法后续 header 只停止拆分，不回滚已处理消息 |
-| T-25 | poller 执行期间丢失新事件 | 中 | RX、TX 或 timer 通知与完成 CAS 并发 | `kwork::BudgetedPoller` 将执行期通知发布为 `RUNNING_PENDING`；完成 CAS 失败后按观察到的状态重试，并通过一次成功 CAS 同时释放执行权和发布下一轮 |
-| T-26 | smoltcp 协议 timer 缺少推进事件 | 中 | TCP 重传或 keep-alive deadline 到期时没有设备 IRQ 或 socket 调用 | 每次 Interface poll 后通过 `poll_at` 注册 timer，并在轮次末尾用新的单调时间判断绝对 deadline；到期后调用 `notify(PollReason::Timer)` 并唤醒 socket waiter；未来 deadline 不触发立即重轮询 |
-| T-27 | socket TX 工作缺少后台推进 | 中 | connect、send、receive window update 或 close 只更新 socket 状态 | 真实 TX 生产路径调用 `notify(PollReason::Tx)`；TCP 与 raw 注册 smoltcp send waker；Router data TX queue 容量增加后唤醒全局 TX waiter |
-| T-28 | TCP 文件关闭丢失已经接受的发送数据 | 中 | `write` 把数据写入 smoltcp buffer 后异步发布 TX，文件 Drop 在 poller 处理前删除 handle | Drop 将未完成协议关闭的 handle 转移到 deferred-close registry；poller 完成 payload、FIN 和重传后回收；60 秒期限只限制 orphan `FIN_WAIT_2` 占用资源 |
-| T-29 | 并发 socket 等待阻塞网络 timer 更新 | 中 | socket 注册等待时在 timeout mutex 内手工 poll 异步 sleep，timer-wheel 锁等待阻塞 poller | deadline 使用原子值发布；周期采样回调到期后直接唤醒 waiter 并通知 poller，不持有 timeout mutex，不创建或 poll timer future |
-| T-30 | TCP close 将未读数据错误转换为 FIN | 中 | 文件对象释放前未检查接收队列，协议 close 直接进入 FIN_WAIT1 | 对端收到 FIN 后继续按有序关闭处理，Linux 预期的 RST 语义丢失 | Drop 检查 smoltcp 接收队列；存在未读数据时调用 abort，并保留 handle 直到 RST dispatch 完成 |
-| T-31 | TCP 零窗口恢复缺少后台推进 | 中 | 应用在接收窗口仍编码为零时读取 TCP 接收缓冲区，却没有发布窗口恢复工作 | 接收缓冲区余量低于最大窗口缩放量子时，读取操作调用 `notify(PollReason::RxWindow)`；达到缩放量子后的窗口增长由 RX 和已登记的协议 timer 推进 |
-| T-32 | poller 执行期间丢失新事件 | 中 | RX、TX 或 timer 通知与完成 CAS 并发 | NetRx softirq、TX 和 timer 通知复用同一个 `kwork::BudgetedPoller` 状态机；执行期工作发布为 `RUNNING_PENDING`，完成 CAS 失败后按观察到的状态重试，并通过一次成功 CAS 同时释放执行权和发布下一轮 |
-| T-33 | link 复合更新发生部分提交 | 中 | 重命名成功后 MTU 或 flags 校验失败 | `Router::update_device_link` 在写入前校验目标设备、名称格式与唯一性和 MTU 范围；rtnetlink 入口忽略 `IFF_VOLATILE` 变更并拒绝实际改变的未支持可写位，设备 setter 只接收已验证值 |
-| T-34 | poller 推进权被普通任务持有的共享 mutex 长时间占用 | 中 | poller 取得 `RUNNING` 后等待被其他 socket 或控制面任务持有的 Router、IngressProcessor、Interface 或 socket-set | poll round 对这些共享锁使用 `try_lock`；竞争时保留待交接 batch，返回 `has_more` 并沿原四态状态机安排后续轮次；IPv4 重组只在真实到期事件 pending 时尝试 IngressProcessor 锁，竞争不中止 TX；assist 仍限一轮，获取推进权采用机会式 CAS |
-| T-35 | loopback UDP 依赖 poller 所有权才能完成投递 | 中 | `sendto` 只把报文排进 TX queue，短 `SO_RCVTIMEO` 在 poller 被占用时到期 | loopback xmit 在关闭 BH 前盖戳并入 `NET_RX_QUEUE`，raise `NetRx`；BH 恢复时把完整 IPv4 UDP 写入 PCB；TCP/ICMP 与未命中 socket 的 UDP 仍走 poller |
-| T-36 | Unix stream listener 待处理连接耗尽内核内存 | 中 | 攻击者持续连接且服务端不执行 `accept` | backlog 按 Linux 计数规则转换并限制到 `LISTEN_QUEUE_SIZE`；容量预留先于 ring 分配；非阻塞连接返回 `EAGAIN`，阻塞连接按 `SO_SNDTIMEO` 等待容量，超时后返回 `EAGAIN`；shutdown 与 Drop 唤醒等待者 |
-| T-37 | UDP socket 接收跨设备 ICMP 错误 | 中 | ICMP 错误查找丢失入接口索引，将未知设备视为通配符 | ingress 将 `PacketBuf::ifindex` 传入 UDP PCB lookup；绑定设备的 PCB 只匹配相同接口索引 |
+The current crate sources contain no explicit `unsafe impl`, unsafe trait,
+FFI declaration or definition, inline `asm!`, `global_asm!`, or standalone
+assembly source. The thread-safety table below describes ordinary Rust types
+and their synchronization, not handwritten unsafe trait implementations.
+Test callback raw pointers are covered by entries 5 and 6; socket IO uses
+`Read`, `Write`, and slice interfaces rather than public raw-pointer inputs.
 
-影响等级定义：
+## Memory Safety Invariants
 
-- 高：导致 UB、内存破坏、权限提升。
-- 中：导致 panic、服务不可用、数据不一致。
-- 低：导致性能退化、日志丢失、功能降级。
+### 1. `SocketHandle` Lifetime
 
-## 故障模式与影响分析
+Every smoltcp socket handle must still exist in `SOCKET_SET` when accessed.
 
-| 编号 | 故障模式 | 故障原因 | 局部影响 | 系统影响 | 严重度 | 应对措施 |
-|------|----------|----------|----------|----------|--------|----------|
-| F-01 | 网络设备缺失 | `DeviceContainer<NetDevice>` 为空 | 只有 loopback 可用 | 对外 TCP、UDP、raw IP 返回无路由或连接失败 | 3 | `init_network` 记录 warn，`Service::get_source_address` 返回 `ENETUNREACH` |
-| F-02 | 目的地址无路由 | `RouteTable::lookup` 未命中 | 当前发送失败 | 应用连接失败 | 3 | connect 或 send 路径返回 `ENETUNREACH`，dispatch 路径 warn 后丢弃 |
-| F-03 | Ethernet pending queue 满 | ARP 未解析且 `pending_tx` 达到上限 | 后续 IP 包丢弃 | 单目的或多目的通信丢包 | 3 | 记录 warn；后续需按 next-hop 拆分队列降低 head-of-line blocking |
-| F-04 | driver TX buffer 分配失败 | NIC driver 返回 `alloc_tx_buf` 错误 | 当前 frame 未发送 | 网络吞吐下降或连接超时 | 3 | 记录 warn 并返回；上层 poller 可继续重试 |
-| F-05 | UDP ICMP error queue 丢失 | PCB registry 未注册、ICMP 引用头无效或 socket 已关闭 | `SO_ERROR` 或 error queue 缺失 | 应用无法获得异步网络错误 | 4 | socket 创建时初始化 PCB registry，bind 时登记 PCB，Drop 时注销；ICMP 引用报文使用允许截断 payload 的 IPv4 头解析路径 |
-| F-06 | TCP accepted child abort | 握手期间 peer reset 或 smoltcp child 关闭 | `accept` 返回 `ConnectionAborted` | 应用重试 accept | 4 | `ListenTable::accept` 清理 closed child 并继续扫描队列 |
-| F-07 | poll waker 或协议 timer 丢失 | UDP socket 事件漏通知、TCP/raw device mask 错误、timeout 或 Ethernet RX poll source 注册缺失、注册所有者未跨 `Pending` 存活、register 后复查缺失或 timer 到期后缺少 poller 通知 | socket 阻塞等待延迟，TCP 重传或 keep-alive 延后 | 应用 IO latency 上升或连接超时 | 3 | UDP 入队、错误和关闭通过 socket 事件通知接收 waiter；TCP/raw 设备绑定变化后通知 waiter 重建 RX 注册并复查事件版本；`Service::register_rx_waker` 使用同一个 `PollContext` 注册 timeout poll 和支持 interrupt-driven RX 的 Ethernet RX poll source；未 attach `NetRxScheduler` 的设备回退 timeout 聚合 waker；调用方持有 `PollRegistrations` 并在注册后复查 readiness；每次 Interface poll 后按 `poll_at` deadline 注册 timer，到期后调用 `notify(PollReason::Timer)` |
-| F-08 | malformed netlink request | header 或 attr 长度非法 | 返回 empty response 或 netlink error | 调用者请求失败 | 4 | checked reader 和 error response 处理 |
-| F-09 | 网络服务或控制面未初始化 | AF_PACKET 或 netlink route 请求早于 `SERVICE` 或 Router 初始化 | AF_PACKET 设备绑定与发送返回 `ENODEV`；link dump 为空，mutation 返回错误，地址或路由 dump 为空 | 对应网络功能暂不可用 | 2 | 所有 `SERVICE` 查询先检查初始化状态；初始化路径在公开网络接口可用前完成 Router 与 `SERVICE` 初始化；新增启动路径需保持顺序 |
-| F-10 | Unix stream peer 提前关闭 | channel 被 shutdown 或 drop | send 在无发送进度时返回 `BrokenPipe`，已有进度时返回部分字节数；recv 排空本端缓冲后返回 EOF；peer 关闭时丢弃未读输入则返回一次 `ConnectionReset`；poll 报告 `RDHUP`、`HUP` 或 `ERR` | 应用感知连接关闭 | 4 | endpoint atomic 记录双方半关闭状态与待处理 reset；per-direction `tx_order` 统一关闭与数据顺序；三组 `PollSet` 按受影响事件定向唤醒 |
-| F-11 | 中断上下文执行重型网络推进 | IRQ 或 `NetRx` 误调用 socket send、recv 或 `poller::assist_once` | 锁竞争、调度延迟或死锁 | 网络 IO 延迟上升，严重时系统卡顿 | 2 | IRQ 路径只做设备 ack、RX pending 标记和 `NetRx` 调度；Ethernet `NetRx` 只唤醒设备 RX `PollSet`；loopback 在关闭 BH 前给已有 `PacketBuf` 盖戳，`NetRx` 从 `NET_RX_QUEUE` 只取出盖戳 UDP 并通过无分配的 `SpinNoIrq` lookup 与句柄入队路径交付，不查找 `LoopbackDevice`；不得从 softirq 调用 `poller::assist_once` 或获取 `Service` / `SocketSet` mutex |
-| F-12 | RX buffer recycle 顺序错误 | frame payload 在 `recycle_rx` 后仍被引用 | 读取悬垂数据或数据损坏 | packet 解析异常，严重时破坏内存安全 | 1 | `EthernetDevice::poll_rx` 在 recycle 前完成解析和复制；新增设备适配需保持同样生命周期 |
-| F-13 | port 0 handshake 永久等待 | host 早于 TA publish 连接且未设 recv 超时；或 service 永不 publish | host `read` 阻塞；负例测试挂起 | CA/测试进程无响应 | 3 | dynamic connect 保留 `WAIT_FOR_PORT`；host 设 `TRUSTY_VSOCK_TIMEOUT_SEC`；明确拒绝场景回 `[1]` |
-| F-14 | 快速重连 `tipc_connect` 超时 `-11` | `route_event` 在 `has_connection()` 前丢弃同批 `Received`，service-name record 丢失 | host status-byte `EAGAIN`；约半数快速重连失败 | storage client/proxy harness 间歇失败 | 2 | mapped bridge port 仅按 `local_port` 认领；事件入 FIFO，不依赖 `has_connection()` |
-| F-15 | IPv4 分片重组超时 | 首片到达后 30 秒内缺少后续分片 | 当前数据报丢失 | UDP 接收超时 | 3 | 删除过期队列；首片存在且允许回复时发送 ICMPv4 Fragment Reassembly Timeout |
-| F-16 | UDP DF 数据报超过路由 MTU | `IP_MTU_DISCOVER` 要求 DF 且 packet 长度超过路由 MTU | 当前发送失败 | 应用收到 `EMSGSIZE` | 4 | 发送前读取路由 MTU，Router 拒绝对 DF 包执行输出分片 |
-| F-17 | 启动期 Unix pathname bind panic | 内核任务调用隐式 `current_cred()`，但尚无当前用户线程 | `/dev/log` 等内核 socket 无法绑定 | 启动中断 | 2 | 启动期调用 `bind_with_cred` 并显式传入 `initial_cred()`；保留可用的初始 fs context |
-| F-18 | smoltcp 过期 poll 期限变成超长等待 | 有符号微秒差值为负后通过 `as u64` 转换 | soft timer 被设置到远未来 | TCP 数据路径停顿，可能伴随 timer IRQ 异常 | 2 | 在同一 epoch 下直接把 `SmoltcpInstant` 映射为 `MonotonicInstant`，不计算无符号 delay；单测覆盖过期和未来期限 |
-| F-19 | 无权限 netlink mutation | 当前发送凭据不具备配置权限 | mutation 不执行，RX queue 收到 `NLMSG_ERROR` 和 `EPERM` | 调用者配置失败 | 4 | 每次发送重新检查凭据；error 入队后发送入口返回已消费请求长度 |
-| F-20 | 混合或截断 netlink 批次 | 单次发送混合 query 与 mutation，或后续 message 的长度不足、截断 | 混合批次未执行并返回 syscall 错误；截断尾部只停止后续解析 | 调用者需修正或拆分批次 | 4 | 批次分类在状态更新及 response 生成前完成；剩余不足一个 header 或非法 `nlmsg_len` 时结束拆分 |
-| F-21 | RX 或 TX backlog 长期占用推进任务 | 持续高包率超过单轮 budget | 单轮达到预算或 1 ms 软时间上限并留下 backlog | 其他任务调度延迟或网络吞吐下降 | 3 | 设备 RX、stack ingress、stack egress 和 Router TX 最多处理 32 个工作项后检查时间；每批最多连续执行四轮，达到上限后重新唤醒并归还执行权，剩余 backlog 进入下一批 |
-| F-22 | TCP peer 在本地文件关闭后不发送 FIN | peer 已确认本地 FIN，协议 handle 长期停留在 orphan `FIN_WAIT_2` | deferred-close registry 持续持有 socket buffer | 网络内存随失联连接增长 | 3 | 进入 `FIN_WAIT_2` 时设置 60 秒期限，期限进入统一 poll timer，到期后回收 handle |
-| F-23 | IPv4 输出设备管理 down | `RTM_NEWLINK` 清除匹配路由设备的 `IFF_UP` | 当前 UDP 或 raw IP 发送失败 | 应用收到 `ENETUNREACH` | 4 | UDP 和 raw IP 在提交发送缓冲前通过 `SERVICE` 校验输出路由和设备管理状态 |
-| F-24 | 数据面共享锁竞争 | socket 或控制面任务持有 Router、IngressProcessor、Interface 或 socket-set | 当前 poll round 提前结束并保留 batch | 网络工作延后到下一轮 | 3 | 返回 `has_more`，单执行者完成 CAS 发布 `SCHEDULED`；raw、accepted 和 control batch 保持所有权，下一轮从保留位置继续 |
-| F-25 | 短超时 loopback UDP 在 poller 忙碌时丢包 | `sendto` 只通知 poller，`recvfrom` 的 1 jiffy 超时先到期 | 并发 libc-test `socket.exe` 间歇 `ETIMEDOUT` | 用户可见功能回归 | 3 | loopback UDP 在发送路径的 BH 窗口内由 `NetRx` 交付 PCB；poller 不再承担该交付；压力测试覆盖 SMP=1 与 SMP=4 的四并发短超时场景 |
-| F-26 | TCP child 永久滞留 SYN 队列 | packet mark 在 child 进入可接受状态前被消费，后续 ingress 或 timer poll 没有刷新 listener | accept 队列保持为空 | 服务端连接建立后仍阻塞于 `accept` | 2 | SYN 队列非空的 listener 在每次实际网络 poll 后刷新；仅在 child 移入 accept 队列后唤醒 waiter；SYN 队列不请求连续 poll |
-| F-27 | Unix listener shutdown 后连接或 accept 永久等待 | listener 状态改变时没有通知容量和请求事件 | 阻塞 `connect` 或 `accept` 无法返回 | 应用线程长期休眠 | 2 | `shutdown(SHUT_RD)` 和 Drop 同时通知 `capacity_available` 与 `request_available`；已排队请求先交付，空队列上的阻塞 `accept` 返回 `EINVAL`；设置了 `SO_SNDTIMEO` 的阻塞 `connect` 在容量等待超时后返回 `EAGAIN` |
+### 2. `SocketSet` Mutual Exclusion
 
-严重度定义：
+All reads and writes to `SocketSet` must acquire the `SOCKET_SET.inner` mutex.
 
-- 1：致命，系统崩溃、数据丢失。
-- 2：严重，功能不可用，需重启恢复。
-- 3：一般，功能降级，可自动恢复。
-- 4：轻微，影响有限，用户可容忍。
+### 3. `Service` Mutual Exclusion
 
-## 故障管理
+Draining device receive queues, accessing routing state and inbound queues, and dispatching transmissions must acquire the internal Router mutex. The smoltcp Interface must be protected by a separate mutex.
+IPv4 validation and snooping run outside the Router lock.
 
-- 普通输入错误使用 `KError` 和 `LinuxError` 返回，例如 `EINVAL`、`EAFNOSUPPORT`、`ENETUNREACH`、`EADDRINUSE`、`EWOULDBLOCK`。
-- netlink 批次在剩余不足一个 header、`nlmsg_len` 小于 header 或大于剩余字节时停止拆分；已处理消息不回滚，尾部填充不必为零。完成批次拆分后的 payload 或 attribute 错误返回 `NLMSG_ERROR`。
-- 无权限 netlink mutation 在 RX queue 中返回带 `EPERM` 的 `NLMSG_ERROR`；混合查询和 mutation 批次在修改状态前返回 syscall `EOPNOTSUPP`。
-- malformed Ethernet、ARP、IP、UDP、TCP 包在 RX 路径丢弃，并通过 warn 或 trace 记录。
-- UDP PCB 接收队列和 Router TX 队列满时映射为丢包或 `WouldBlock`，poller 负责等待 IO readiness。
-- smoltcp buffer 和 Unix stream ring buffer 满时映射为 `WouldBlock`，poller 负责等待 IO readiness；非阻塞 Unix stream send 已有进度时返回部分字节数。Unix listener backlog 满时非阻塞 `connect` 返回 `WouldBlock`；阻塞连接按 `SO_SNDTIMEO` 等待 `accept` 或 backlog 增长，超时后返回 `WouldBlock`。
-- loopback 和 Ethernet 队列满时丢包并记录 warn。共享 `NetRx` 队列满时 loopback xmit 仍对发送路径返回成功，对齐 Linux `loopback_xmit` 在 `__netif_rx` 返回 `NET_RX_DROP` 时仍给出 `NETDEV_TX_OK`。
-- panic 路径主要来自初始化顺序、内部 invariant 破坏和 `expect` 断言；新增公开入口应先返回 `KError`，再进入内部断言区。
+### 4. Ring-Buffer Publication Rules
 
-## 隐私分析
+Unix stream and vsock may publish only bytes that have been written and consume only bytes within the currently occupied region.
+For Unix streams, the same directional lock orders write-index publication, directional closure, and EOF checks on an empty queue.
 
-`knet` 会处理用户进程通过 socket 发送的 payload、从网络收到的 packet payload、Unix socket credentials、netlink 消息和 vsock payload。
-这些数据在内核内按 socket buffer、ring buffer、driver buffer 或 netlink queue 保存。
-模块自身不做持久化，也不把 payload 写入日志；trace 日志当前会输出 Ethernet frame 字节，生产环境需按日志级别控制敏感网络数据泄露。
+### 5. Driver Buffer Lifetime
 
-## 已知限制
+`NetBufHandle::data` is used only before the handle is recycled. Receive handles must be returned after processing.
 
-- `RTM_GETNEIGH` dump 列入后续范围，neighbor 通过 `RTM_NEWNEIGH` mutation 进入设备 owner。
-- IPv4 输出使用匹配路由指向设备的 MTU，ICMP Fragmentation Needed 中的 next-hop MTU 只进入 UDP error queue，尚未形成动态 PMTU cache。
-- IPv4 输出分片只支持无 options 的栈内生成报文，尚未实现 options copy 语义。
-- route dump 读取 Router 中的配置路由和地址派生路由。
-- smoltcp maintenance 与单次 egress pass 提供有界执行，ingress 通过 `poll_ingress_single` 按 packet 推进；单个 packet 的协议处理和一次 egress pass 仍会形成有限的软上限超出。
-- Router、IngressProcessor、Interface 和 socket-set 的竞争通过非阻塞退让保持 poller 所有权边界；transport、listen table 与设备回调内部的短临界区仍会形成有限的软上限超出。
- - UDP RX queue 在 PCB 创建时一次保留 1024 个指针大小的槽位，空闲 socket 仍承担这部分固定元数据开销。
- - address 与 route dump 直接读取 Router，link dump 直接读取设备实时快照。
-- raw socket 创建权限由 syscall 层承担，`knet` 构造器自身没有进程凭据参数。
-- Ethernet 设备只处理 IPv4 ARP，IPv6 NDP、非 Ethernet 链路和多队列 NIC 抽象仍待扩展。
-- crate 内 UDP 数据路径当前只支持 IPv4；IPv6 UDP 继续由 smoltcp DNS 路径使用，普通 UDP socket 不提供 IPv6 收发。
-- vsock-TIPC bridge v1 不转发 TIPC handles 或 memrefs，也不为 vsock send credit 建立持久重试队列。
-- `SO_BINDTODEVICE` 的 setsockopt 当前不做特权检查。Linux 6.8 仅在 socket 已经绑过设备时要求 `CAP_NET_RAW`（改绑或解绑）；第一次绑定不检查。x-kernel 用 euid 0 近似 capability，此处尚未对齐该再绑定检查。
+### 6. netlink Message Boundaries
 
-## 审计清单
+All payload reads must follow validation of the individual message's header length, batch alignment boundaries, attribute lengths, and address family.
+Batch splitting stops when fewer than a header's worth of bytes remain or when `nlmsg_len` is invalid or indicates truncation. Already processed messages remain effective, and trailing padding may contain nonzero values.
 
-修改本模块时需验证：
+### 7. netlink Credential Boundary
 
-- 每个 `unsafe` 块均有 `SAFETY:` 注释。
-- 新增 smoltcp socket handle 的生命周期受 `SOCKET_SET` 保护。
-- 新增 link 与 neighbor mutation 直接更新目标设备 owner；address 与 route mutation 在 `network_config_lock` 内更新 Router 并刷新派生投影；最后一个同值地址删除时同步清理 Router 中依赖该 `prefsrc` 的配置路由；设备移除走 `unregister_netdev`，在同一把锁下删除并重编号路由与设备邻居。
-- 每次 netlink `send` 或 `write` 传入当前调用者的 `Cred` 快照，socket 不缓存权限。
-- 新增 netlink parser 先校验单条 header 长度和批次对齐边界，再校验 attribute、family 和 index。
-- 同一 netlink socket 的发送事务保持串行，跨控制面入口的 mutation 由 `network_config_lock` 串行化；设备移除走 `unregister_netdev`；锁顺序为发送事务锁、`network_config_lock`、控制面 owner 锁、rx queue。
-- 仅含查询或仅含 mutation 的批次支持逐条处理，混合批次在状态更新前返回 `EOPNOTSUPP`，mutation 批次执行前检查完整 response 空间。
-- 新增 ring buffer 操作的 advance count 来自同一锁内同一批 slices。
-- Unix stream 的 write index 发布、方向关闭和空队列 EOF 判定保持同一个 per-direction 排序点，方向锁内不执行用户复制或 `PollSet` 唤醒，shutdown 在释放 `channel` mutex 后执行 waiter 唤醒。
-- Unix listener 改动保持 pending request 与 reservation 总数受 `LISTEN_QUEUE_SIZE` 限制，ring 分配位于容量预留之后，binding slot 和状态锁不跨阻塞等待，shutdown 与 Drop 唤醒 connect 和 accept waiter。
-- Unix pathname 文件系统上下文锁与 abstract binding 表锁在 transport callback 前释放，阻塞 connect 不持有地址查找层锁。
-- 新增外部网络输入使用 checked parser。
-- IPv4 分片重组改动保持队列数量、内存和超时上限，并拒绝重叠 range。
-- `SO_BINDTODEVICE` 通过 `GeneralOptions::bound_dev_if` 原子交换更新，UDP 接收过滤、发送和 TCP/raw RX 设备选择读取同一标量。Relaxed 读取仅承载设备编号，实际改变后由 `PollEvent` 的 Release/Acquire 版本发布更新并唤醒设备 RX waiter。设备 RX 注册保留配置事件订阅，并用版本复查覆盖设备选择到注册完成的窗口；绑定与解绑触发重建设备 RX 注册，默认与解绑状态覆盖全部设备。配置通知只触发就绪条件重查，用户可见事件仍由实际 IO 状态决定。设备 RX 订阅只承担唤醒职责，报文隔离由协议接收过滤承担。
-- UDP 纯接收等待只持有 socket 自身的读、错误和关闭事件订阅。检查入队、异步错误和读关闭路径均在发布状态后通知 waiter，注册后复查覆盖通知先于注册的窗口，取消等待撤销全部订阅。设备绑定变化通过 ingress 的当前 `bound_dev_if` 过滤生效，原有接收订阅持续有效。Ethernet RX、loopback 发送和 timer 路径负责独立推进网络处理；纯接收等待与设备 RX 及全局协议 timer 广播解耦。带写事件的等待继续承接 TX 所需的网络进展通知。
-- UDP registry 改动保持 bind、connect、普通接收和 ICMP error lookup 使用同一 PCB 所有权来源，并让普通接收与 ICMP error lookup 使用各自入站报文的接口索引执行 `SO_BINDTODEVICE` 过滤。`NetRx` 与 task 共享的 bucket、connected peer 和 PCB 接收队列必须使用 `SpinNoIrq`，sleepable 状态更新不得放在这些锁内。
-- 修改 poller 状态机或 `Service::poll_budgeted` 时验证四态转换、单执行者获取、一次 CAS 释放、分阶段 smoltcp 预算和 1 ms 软时间上限；`PollProgress::has_more` 只能包含立即工作，协议 timer 在轮次末尾使用新的单调时间判断绝对 deadline，IPv4 到期队列按 timer budget 分批消费；TX waiter 只能由 `tx_capacity_changed` 触发全局容量唤醒。
-- 修改 `Service::poll_budgeted` 的锁路径时验证共享推进锁保持 `try_lock` 语义，竞争时设置 `has_more`，只有 pending 的 IPv4 过期事件才参与锁竞争重试且不终止 TX，raw、accepted 和 control batch 在重试前保持所有权，TCP listener preparation 只在 accepted batch 能立即转入 Router 时执行。
-- 修改 TCP listener 推进时验证 SYN 队列非空的 entry 在实际网络 poll 后得到刷新，child 移入 accept 队列后才在 entry 锁外唤醒 waiter，并保持 SYN 队列不进入 `PollProgress::has_more`。
-- 修改 poller 执行边界时验证 assist 保持一次机会式 CAS 和单轮预算；loopback UDP 必须在发送路径的 BH/`NetRx` 窗口内进入 PCB，不依赖 poller 所有权。
-- 修改 `NET_RX_QUEUE` 时验证 `pending_udp` 与 `deferred` 在设备创建时完成预分配、`enqueue` 上限为两条队列长度与 in-flight 合计、`SpinNoIrq` 内不发生扩容、堆释放或 UDP PCB 交付，队列满与 `discard_ifindex` 都在锁外 drop `PacketBuf`，`process_pending` 批次不超过 `NET_RX_BUDGET`，以及发送路径 fallback 只执行固定轮次；共享该队列的单元测试必须声明 `serial`。
-- 修改 UDP PCB 队列时验证 PCB 创建时预留 1024 个指针大小的槽位、`PacketBuf` 在进入网络栈时建立引用计数生命周期、loopback 在关闭 BH 前写入已校验 UDP 元数据、softirq 与 `SpinNoIrq` 入队路径不分配或扩容、满队列报文在锁外释放、FIFO 顺序，以及 `MSG_PEEK` 的 payload 复制位于锁外。
-- 修改 TCP Drop 或异步 TX 路径时验证已成功写入的 payload 在文件关闭后仍由协议对象持有，未读数据关闭发送 RST，deferred-close handle 在 `Closed` 后删除，状态期限只作用于 orphan `FIN_WAIT_2`。
-- 新增 socket option 明确 errno、阻塞语义和 poll readiness。
-- 新增 pathname Unix socket 入口使用单次凭据快照，并让全部 VFS 操作显式接收该快照。
-- pathname bind 保持排他创建、`0777 & !umask` mode 和 fs credential owner；connect/sendto
-  在读取 binding 前检查最终 inode `MAY_WRITE`。
-- 新增内核调用路径不得依赖 `current_cred()`；调用者必须显式选择凭据。
-- 新增公开 API 先确认是否需要跨 crate 暴露。
+Credential-bearing `Socket::send_with_cred` calls and netlink socket file writes use a snapshot of the current caller. `NetlinkSocket::send_with_cred` evaluates `Cred::is_privileged()` for that invocation. The credential-free `SocketOps::send` path passes `false` and cannot authorize mutations; read-only requests remain available.
 
-### UDP 临时端口的熵要求
+### 8. netlink Batch Execution Boundary
 
-临时端口分配依赖内核 `entropy` 池的质量熵就绪标志，每次分配使用新的 ChaCha20 输出。单调时间种子和 socket 私有的确定性 PRNG 已移除。熵尚未就绪时返回 `EAGAIN`，错误发生在 PCB 注册和本地端点发布之前。平台需配置可用的可信熵源；熵源持续不可用时，临时端口分配持续返回 `EAGAIN`。
+A per-socket send-transaction lock serializes capacity prechecks, mutation execution, and response enqueueing.
+`network_config_lock` serializes individual mutations across sockets, legacy socket ioctl mutations, and `unregister_netdev`. Each rtnetlink mutation acquires it separately; an entire batch is not isolated from other control-plane callers.
+Batches mixing queries and mutations must be rejected before any state update.
+Before executing a mutation-only batch, response-queue space must be checked for the entire batch.
+A mutation-only batch is processed message by message. A later validation or operation error does not roll back earlier successful mutations. Capacity preflight reserves room for mutation responses on that socket, but does not provide all-or-nothing transaction semantics.
+Responses are generated outside the receive-queue lock. The fixed lock order is send-transaction lock, `network_config_lock`, Router, ingress processing, Interface, and netlink receive queue, skipping locks that are not involved.
 
-端口随机化提高离路径报文伪造的猜测成本，应用层仍需验证报文来源与认证信息。熵采集、播种质量和就绪状态的维护由 `entropy` 模块承担。
+### 9. Route Index Boundary
+
+After converting an rtnetlink route's `oif` into a device index, `dev < devices.len()` must be checked.
+
+### 10. Static Object Initialization Order
+
+`init_network` must initialize `SERVICE`, `SOCKET_SET`, and `LISTEN_TABLE` before any socket is created.
+
+### 11. Credential Consistency for Pathname Operations
+
+Lookup, creation, and owner initialization within a single Unix pathname bind must use the same `Cred` snapshot.
+
+### 12. Credential Requirements for Kernel Callers
+
+Kernel callers without a current user task must not enter implicit `current_cred()` paths.
+Both pathname operations and socket file construction must select credentials explicitly.
+
+### 13. `PacketBuf` Ownership
+
+A pointer-sized reference-counted handle is created when a packet enters the network stack. Devices, Router, loopback, PCB, and smoltcp adapters transfer this handle by value.
+Modifications after sharing use copy-on-write. Protocol offsets and validated UDP payload ranges must remain within the currently valid data range.
+
+### 14. IPv4 Input Boundary
+
+Before local delivery, the version, header length, total length, and header checksum must be validated, and trailing data must be trimmed according to `total_len`.
+
+### 15. Network Type Boundary
+
+`RouteTable` and `NetDevice` do not expose smoltcp address or time types.
+`Router`, `Service`, and initialization entry points perform control-plane and protocol compatibility conversions.
+
+### 16. IPv4 Reassembly Boundary
+
+Fragments are isolated by source address, destination address, identification, protocol, and interface.
+Fragments fully covered by an existing range are discarded as duplicates. Partial overlap or conflicting ranges cause the entire queue to be deleted.
+Reassembly state is limited to 64 queues, a 4 MiB high watermark, a 3 MiB low watermark, and a 30-second timeout. Queue creation registers a fixed expiration event, which is canceled on completion, deletion due to an error, or capacity eviction. An expired queue that retains the first fragment generates ICMPv4 Time Exceeded.
+
+### 17. UDP Receive Boundary
+
+The parser validates UDP length, checksum, and payload boundaries. Each PCB receive queue holds at most 1024 datagrams.
+PCB creation reserves pointer-sized `PreparedUdpPacket` slots for this limit.
+The loopback send path must parse the datagram before disabling BH and store the result in the control metadata of the existing `PacketBuf`.
+The `NetRx`/`SpinNoIrq` enqueue path may only move existing handles; allocation and capacity growth are prohibited.
+When the queue is full, the PCB queue lock must be released before the current datagram is discarded.
+`MSG_PEEK` may only increment the `PacketBuf` reference count under the lock; payload copying must occur outside `SpinNoIrq`.
+
+### 18. IPv4 Output Boundary
+
+The output MTU for in-stack UDP comes from the device selected by the matching route.
+UDP and raw IPv4 return `ENETUNREACH` when no route exists or the output device is administratively down, and return `EMSGSIZE` when a DF packet exceeds the MTU. Payloads of packets that permit fragmentation are split only at 8-byte-aligned boundaries.
+
+### 19. Poller Completion Conditions
+
+The sole executor publishes `IDLE` or `SCHEDULED` from `RUNNING` or `RUNNING_PENDING` with a single CAS.
+It may enter `IDLE` only when RX, ingress processing, TX, and expired timers have no immediately processable work and no notification arrived during execution.
+Each processing round has a soft time limit of 1 ms. The kwork poller callback executes bounded batches of at most four rounds. If the limit is reached while immediately processable work remains, it retains `SCHEDULED` and queues the next batch.
+
+### 20. Protocol Timer Conditions
+
+After each round of `poll_maintenance`, `poll_ingress_single`, and `poll_egress`, `poll_at` must refresh the next deadline.
+IPv4 reassembly queues publish their earliest deadline through a separate atomic source.
+`has_immediate_timer_work` and `update_poll_timeout` must reread monotonic time at the end of the round and check absolute deadlines. Timers that have not expired must not contribute to `PollProgress::has_more`; expiration must publish work through `notify(PollReason::Timer)`.
+
+### 21. TX and Receive-Window Handoff Conditions
+
+Sockets and Router must publish newly generated TX work through `notify(PollReason::Tx)`.
+After TCP consumes data from a receive buffer whose free space is below the maximum window-scaling quantum, it must publish zero-window recovery work through `notify(PollReason::RxWindow)`.
+An actual increase in Router's data transmit-queue capacity must set `tx_capacity_changed`. Global capacity wakeups for TX waiters must depend solely on this field.
+
+### 22. TCP Close Lifecycle
+
+After the user file object is released, smoltcp handles with pending data, FIN, or retransmission state must remain in `SOCKET_SET`.
+If the receive queue contains unread data, the aborted connection's handle must be retained until RST is sent.
+A handle may be removed only after the protocol enters `Closed`.
+The 60-second reclamation deadline applies only to `FIN_WAIT_2` handles detached from user file objects.
+
+### 23. Network Timer Conditions
+
+Protocol timers and deferred-close processing share an atomic deadline source. IPv4 reassembly uses a separate atomic source for its deadline and pending state.
+The periodic sampling callback may only perform atomic state transitions, wakeups, and poller notifications. It must not acquire sleeping mutexes, allocate futures, or access the timer wheel.
+Expired IPv4 queues are consumed in batches according to `PollBudget::timer_events`.
+
+### 24. Link Configuration Ownership
+
+`NetDevice` owns the interface name, MTU, administrative state, and link snapshot.
+`RTM_NEWLINK` must validate name uniqueness, name format, device MTU range, and supported flags as a complete set before modifying the device.
+Derived state bits in `ifi_change` are preserved according to Linux `IFF_VOLATILE` semantics. Actual changes to unsupported writable bits return `EOPNOTSUPP`.
+
+### 25. IPv4 Address Lifecycle
+
+After an address or its device is removed, Router address entries, automatic routes, IngressProcessor, the smoltcp Interface, and device projections must be refreshed while holding the Router lock once.
+Legacy ioctl updates target only the primary address entry and preserve other addresses on the same device. Netmask updates must preserve address scope and custom broadcast addresses.
+When the last instance of an address value disappears, configured routes in Router that depend on that `prefsrc` must be removed at the same time.
+Device removal must also delete the device's routes and neighbors and renumber subsequent interface indices.
+
+### 26. Poller Handoff Under Lock Contention
+
+While holding global execution ownership, the poller may acquire Router, IngressProcessor, the smoltcp Interface, and socket-set locks only through `try_lock`.
+Handing off an admitted-packet batch must acquire socket-set before Router. A batch containing only control packets skips socket-set.
+Contention must return `has_more`.
+If an expired IPv4 reassembly event encounters IngressProcessor contention, it retains its pending state and allows TX and protocol processing to continue for the current round.
+The expiration path does not acquire this lock when no reassembly queue exists or no queue has expired.
+Raw-packet batches already taken from devices, admitted-packet batches awaiting smoltcp, and control-packet batches awaiting transmission must retain ownership until handoff succeeds. TCP listener preparation and enqueueing of the admitted-packet batch must occur within the same successful handoff.
+
+### 27. Loopback UDP Delivery Boundary
+
+Before disabling BH, the loopback send path must write validated metadata for complete IPv4 UDP packets. Under `local_bh_disable`, it then places the same `PacketBuf` into `pending_udp` in the shared `NET_RX_QUEUE` and triggers `NetRx`.
+`NetRx` dequeues only UDP packets with validated metadata from `pending_udp` and does not look up `LoopbackDevice`.
+Both `NetRx` and supplemental processing in task context must use `SpinNoIrq` for UDP PCB lookup and enqueueing.
+Delivery of complete IPv4 UDP packets is independent of the poller's `RUNNING` execution ownership.
+`poll_rx` passes TCP, ICMP, IPv6, fragments, and UDP packets without a matching socket from `deferred` to the task poller.
+
+### 28. `NET_RX_QUEUE` Capacity and Ownership Boundary
+
+`pending_udp` and `deferred` must be preallocated according to `SOCKET_BUFFER_SIZE` when the device is created. `enqueue` checks capacity against the combined number of queued and in-flight packets and rejects excess packets, so `push_back` must never trigger capacity growth within `SpinNoIrq` or the `NetRx` softirq.
+UDP packets with validated metadata taken by `process_pending` must count toward the in-flight reservation. Each batch is limited to `NET_RX_BUDGET` and delivered outside the lock.
+Packets without a matching PCB must retain exclusive handle ownership, have their metadata cleared, and enter `deferred`.
+When the queue is full, `enqueue` must return the packet to the caller. The send path then drops it after releasing the `NET_RX_QUEUE` lock and BH guard.
+`discard_ifindex` must first move matching packets to a local container and drop them after unlocking to avoid heap deallocation within `SpinNoIrq`.
+Supplemental processing in the send path's task context handles only the `pending_udp` packets present at entry, split into a fixed number of rounds according to `NET_RX_BUDGET`.
+The queue identifies packet owners by `ifindex`, and `LoopbackDevice::drop` must call `discard_ifindex`.
+For in-flight packets while `process_pending` has released the lock, this operation provides only best-effort cleanup. Complete device-identity semantics require registration state equivalent to Linux `skb->dev` and `NETREG_UNREGISTERING`.
+
+### 29. TCP Listener Progress Conditions
+
+When a TCP packet arrives or the SYN queue still contains child connections, the next actual network poll must refresh the corresponding listener.
+`accept_poll` is awakened only after a child connection enters the accept queue, and the wakeup occurs outside the entry lock.
+A nonempty SYN queue does not set `PollProgress::has_more`. Unexpired protocol timers continue to wait for expiration notifications, preventing half-open connections from causing poller busy loops.
+
+### 30. Unix Listener Resource Boundary
+
+The sum of pending requests and capacity reservations must not exceed `LISTEN_QUEUE_SIZE`.
+The two 64 KiB ring buffers for each connection may be allocated only after capacity has been reserved successfully.
+RAII must return the slot if reservation fails, the operation is interrupted, or the source socket's state rejects the connection.
+
+## Thread Safety
+
+| Type | Send Conditions | Sync Conditions |
+|------|-----------------|-----------------|
+| `TcpSocket` | All fields satisfy Send | Internal locks, atomics, and the global socket set serialize shared state |
+| `PacketSocket` | All fields satisfy Send | `Arc<PacketSocketInner>` retains the socket; `local_addr` uses `RwLock`, `rx_queue` and `recv_lock` use `Mutex`, and statistics use atomics |
+| `UdpSocket` | All fields satisfy Send | Locks and atomics in `Arc<UdpPcb>`, together with the bucketed PCB registry, protect shared state |
+| `RawSocket` | All fields satisfy Send | `RwLock`, atomics, and immutable handles protect shared state |
+| `StreamTransport` | All fields satisfy Send | `Mutex<Option<Channel>>` serializes local endpoint operations; the `ListenerState` mutex serializes the pending queue, capacity reservations, listening, and closure; a `SpinNoPreempt` lock for each send direction orders data publication, half-close, and EOF checks; three `PollSet` groups manage read, write, and connection-state waiters separately |
+| `NetlinkSocket` | All fields satisfy Send | `Arc<NetlinkSocketInner>` internally uses `RwLock`, a send-transaction `Mutex`, a receive-queue `Mutex`, and `PollSet`; each send explicitly carries caller credentials, and the socket does not retain an authorization identity |
+| `Service` | All fields satisfy Send | Separate internal `Mutex` instances protect Interface, Router, IngressProcessor, timeouts, and reusable batches; the poller acquires shared processing locks without blocking and retains batches during contention; network-timer and deferred-close deadlines are published atomically, and the periodic sampling callback never acquires sleeping mutexes |
+| `Router` | Used within `Service` | Shared indirectly through the Router mutex in `Service` |
+
+## Threat Analysis
+
+| ID | Threat | Impact | Trigger | Consequence | Mitigation |
+|----|--------|--------|---------|-------------|------------|
+| T-01 | Incorrect initialization order causes `LazyInit` to access an uninitialized object | High | A socket is created or polled before `init_network` | Invalid initialization access can panic and prevent network service startup. | The boot path calls `init_network` from `core/kruntime` first; new entry points must preserve this order |
+| T-02 | Access to a smoltcp socket handle after removal | High | Listener closure, accepted-child cleanup, and concurrent socket operations interleave | Access to a removed protocol object violates handle lifetime and can panic during socket operations. | A mutex serializes `SocketSet` access; `ListenTable::unlisten` drains the queue before removing handles; call sites must avoid caching handles and using them across release points |
+| T-03 | Ring-buffer indices advance beyond the amount actually written or read | High | The count passed to `advance_write_index` or `advance_read_index` does not correspond to the source slices | Publishing unwritten bytes or consuming beyond occupied storage violates ring-buffer memory safety. | The count is computed from the same batch of slices obtained while holding the channel mutex; unsafe comments explicitly document these invariants |
+| T-04 | Malicious netlink messages cause out-of-bounds reads or construct invalid state | High | Users supply short headers, malformed attributes, invalid address families, or invalid ifindex values | Malformed control-plane input can read outside message bounds or corrupt network configuration. | `NlMsgHeader::read`, `parse_attrs`, `parse_ip_by_family`, and route index checks reject invalid input |
+| T-05 | ARP spoofing poisons the neighbor cache | Medium | An external host sends forged ARP replies or requests | Poisoned neighbor entries can redirect or disrupt traffic to affected peers. | Current checks cover unicast MAC addresses, broadcast, and local target IP addresses; comprehensive neighbor security still depends on network isolation |
+| T-06 | A SYN flood fills the listen backlog | Medium | Many connection requests target the same listener | Legitimate connection requests are dropped, making the listener unavailable. | The listen backlog is capped at `LISTEN_QUEUE_SIZE`; excess requests are dropped with warning logs |
+| T-07 | An unauthorized caller creates a raw socket | Medium | The syscall layer omits permission checks | An unauthorized process gains raw packet transmission or reception access. | `knet` only encapsulates raw socket behavior; permission policy should remain in `posix/net::sys_socket` |
+| T-08 | uevents or responses fill the netlink receive queue | Medium | Subscribers do not consume messages while publishers keep writing | Subscribers lose uevents or request responses once queue capacity is exhausted. | `NETLINK_RX_QUEUE_LIMIT` bounds queue bytes per socket; excess messages are dropped |
+| T-09 | Control-plane and data-plane state diverge | Medium | Link mutations fail to update device-owned state; rtnetlink and legacy socket ioctl address mutations interleave; device removal leaves stale address projections or control-plane routes; configured routes retain invalid `prefsrc` references after address deletion; or route and neighbor mutations bypass their state owners | Packets use stale devices, source addresses, or routes, causing misrouting or configuration inconsistency. | `network_config_lock` serializes updates across entry points and `unregister_netdev`; link queries and mutations directly access the `NetDevice` state owner; address and route queries and mutations directly access Router; interface-address queries complete under a single Router lock acquisition; `RTM_NEWNEIGH` directly accesses the target device; address and device deletion refresh automatic routes, ingress processing, Interface, and device projections; deleting the last instance of an address value or deleting a device also cleans up Router routes and updates interface indices |
+| T-10 | External network packets trigger parser panics | Medium | Malformed Ethernet, ARP, IP, UDP, or TCP packets enter RX | A parser panic interrupts kernel network processing and can make service unavailable. | Ethernet and ARP use bounds-checked `zerocopy` views; IPv4 and UDP use in-crate bounds-checked parsers; TCP, raw IP, and IPv6 use smoltcp bounds-checked parsers; malformed packets are dropped |
+| T-11 | Interrupt-context misuse causes lock contention or increased latency | Medium | An IRQ wakeup callback directly advances `SERVICE` or `SOCKET_SET`, or performs blocking socket operations | Blocking or contended work delays interrupt processing and can deadlock network IO. | The VirtIO interrupt handler only acknowledges interrupts and schedules the NetRx softirq; Ethernet NetRx marks or wakes receive event sources, while loopback NetRx delivers prepared UDP handles through the bounded non-sleeping PCB path; remaining work is queued for `knet-poller`; the kwork callback executes bounded batches of at most four rounds in ordinary task context |
+| T-12 | Driver buffers or DMA input violate packet boundaries | High | A driver returns an invalid length, data is accessed after recycling, or TX/RX buffer lifetimes are mismanaged | Stale buffer references or invalid lengths can expose dangling data or violate memory safety. | RX data is parsed and copied only before `NetBufHandle` recycling; external frames use bounds-checked parsers; driver handles manage TX buffers |
+| T-13 | The vsock-TIPC bridge incorrectly routes ordinary AF_VSOCK connections to TIPC | Medium | Event routing fails to distinguish bridge ports or already bridged connections | Ordinary socket traffic reaches the wrong IPC service or is consumed by the bridge. | The bridge takes ownership only of static port mappings and connection IDs it manages; unmatched events continue to `VSOCK_CONN_MANAGER` |
+| T-14 | The host injects oversized or invalid TIPC messages through the bridge | Medium | A `Received` record exceeds TIPC slot capacity or the port 0 service name is invalid | Oversized or malformed records disrupt bridge connections and pressure message-buffer resources. | The bridge limits record length to `IPC_CHAN_MAX_BUF_SIZE`; dynamic service names must pass UTF-8, NUL, and length checks; invalid names receive `[1]` and the connection is closed |
+| T-15 | TIPC handle/memref capabilities leak to the host through vsock | High | A TA sends a message with attached handles to the bridge | Capabilities intended for local TIPC participants cross the host trust boundary. | Bridge v1 forwards only bytes and closes the connection when it detects attached handles |
+| T-16 | The host misinterprets the port 0 handshake result | Medium | The host sends payload before reading the status byte, ignores `[1]`, or blocks indefinitely without a recv timeout | The host sends data to an unestablished channel or waits indefinitely for a rejected service. | The protocol requires the host to read a one-byte status first: `0` means success and `1` means rejection; `libtrusty` uses `SO_RCVTIMEO`; CA tests reject any status other than `[0]` |
+| T-17 | IPv4 fragments exhaust kernel memory | Medium | External sources continuously send distinct fragment streams that cannot be fully reassembled | Incomplete reassembly consumes memory needed by other kernel networking operations. | The reassembler limits queue count and total memory; exceeding the high watermark evicts the oldest queues until the low watermark is reached; queue lifetime is fixed at 30 seconds |
+| T-18 | Overlapping IPv4 fragments confuse upper-layer parsing | Medium | Overlapping payload ranges are submitted under the same reassembly key | Ambiguous reassembly can change the payload interpreted by the receiving protocol. | Fragments fully covered by an existing range are dropped as duplicates; any partial overlap or conflicting total length deletes the entire queue |
+| T-19 | A UDP receive flood fills socket queues | Medium | The application reads more slowly than packets arrive | Unread datagrams retain socket memory and cause subsequent packet drops. | Each PCB retains at most 1024 datagrams; pointer-sized queue slots are reserved at creation; new datagrams are dropped outside the lock when the limit is reached; the PCB directly reuses the `PacketBuf` handle created when the packet entered the network stack |
+| T-20 | Pathname Unix sockets bypass inode/directory DAC or reuse existing inodes | High | bind/connect/sendto access the binding table directly, or bind accepts an existing path | A caller accesses a protected socket endpoint or attaches to the wrong inode binding. | bind uses `parent_at` and `Path::mknod` for exclusive creation; connect/sendto check `MAY_WRITE` on the final inode after lookup; only abstract addresses directly access the in-memory binding table |
+| T-21 | A kernel task implicitly reads user credentials | High | Boot-time pathname bind calls ordinary `SocketOps::bind` before a current user thread exists or with the wrong credential identity | A missing user context panics, or the operation uses an unintended authorization identity. | Kernel callers use `bind_with_cred` to pass explicitly selected credentials such as `initial_cred()`; ordinary entry points serve only the current user task |
+| T-22 | A Unix stream publishes data after EOF | Medium | send, shutdown, and peer recv interleave without a common ordering point for closure state and the write index | A receiver observes EOF followed by newly published bytes, violating stream ordering. | Each send direction shares `tx_order`; send rechecks under the lock before publishing; recv rechecks queue emptiness and connection closure under the lock; Channel publishes closure state before release |
+| T-23 | A netlink socket reuses stale credentials for unauthorized mutations | High | A socket continues using creation-time permissions after transfer between processes or a change in caller credentials | A caller changes protected network configuration using another identity's authority. | POSIX send and socket file write obtain the current `Cred` only in the netlink branch; `NetlinkSocket::send_with_cred` checks each mutation; unauthorized requests generate `NLMSG_ERROR` with `EPERM` |
+| T-24 | A netlink batch commits only some mutations | High | A single send mixes queries and mutations, or the response queue runs out of space midway through the batch | The caller observes only part of its intended configuration update. | The send-transaction lock serializes mutation batches on the same socket; mutations remain per-message operations without rollback; the complete batch is classified first; mixed batches return syscall `EOPNOTSUPP`; mutation-only batches check space for all responses before execution; a truncated or invalid subsequent header only stops splitting and does not roll back processed messages |
+| T-25 | New events are lost during poller execution | Medium | RX, TX, or timer notifications race with the completion CAS | Pending network work is stranded, causing stalls or connection timeouts. | `kwork::BudgetedPoller` publishes notifications received during execution as `RUNNING_PENDING`; after a failed completion CAS, it retries according to the observed state, and one successful CAS both releases execution ownership and publishes the next round |
+| T-26 | smoltcp protocol timers lack a progress event | Medium | A TCP retransmission or keepalive deadline arrives without a device IRQ or socket call | TCP retransmission and keepalive work stalls until another unrelated event arrives. | Each Interface poll registers a timer through `poll_at`; the end of each round checks the absolute deadline against freshly read monotonic time; expiration calls `notify(PollReason::Timer)` and wakes socket waiters; future deadlines do not trigger immediate repolling |
+| T-27 | Socket TX work lacks background processing | Medium | connect, send, receive-window updates, or close update only socket state | Queued transmission remains pending and applications encounter IO stalls or timeouts. | Paths that actually generate TX work call `notify(PollReason::Tx)`; TCP and raw sockets register smoltcp send wakers; increases in Router data transmit-queue capacity wake global TX waiters |
+| T-28 | TCP file closure loses data already accepted for transmission | Medium | `write` copies data into the smoltcp buffer and asynchronously publishes TX work, but file Drop removes the handle before the poller processes it | Payload already accepted by write is discarded before protocol transmission completes. | Drop transfers handles with incomplete protocol closure to the deferred-close registry; the poller reclaims them after data transmission, FIN processing, and retransmission complete; the 60-second deadline only limits resource retention by `FIN_WAIT_2` handles detached from user file objects |
+| T-29 | Concurrent socket waits block network-timer updates | Medium | Socket wait registration manually polls an asynchronous sleep object under the timeout-state mutex, and waiting for the timer-wheel lock blocks the poller | Blocked timer updates delay protocol work and socket wakeups. | Deadlines are published atomically; after expiration, the periodic sampling callback directly wakes waiters and notifies the poller without holding the timeout-state mutex or creating or polling timer futures |
+| T-30 | TCP close follows the FIN path despite unread data, notifying the peer of an orderly shutdown and losing the RST semantics expected by Linux | Medium | File-object release omits the receive-queue check, and protocol close directly enters FIN_WAIT1 | The peer receives an orderly close despite unread data being discarded. | Drop checks the smoltcp receive queue; unread data triggers abort, and the handle is retained until RST dispatch completes |
+| T-31 | TCP zero-window recovery lacks background processing | Medium | The application reads the TCP receive buffer while the advertised window is still encoded as zero, without publishing window-recovery work | The peer continues to observe a closed receive window, stalling transmission. | Reads call `notify(PollReason::RxWindow)` when receive-buffer free space is below the maximum window-scaling quantum; after that quantum is reached, RX and registered protocol timers drive further window growth |
+| T-32 | New events are lost during poller execution | Medium | RX, TX, or timer notifications race with the completion CAS | Pending RX, TX, or timer work is stranded after the executor finishes. | NetRx softirq, TX, and timer notifications share the same `kwork::BudgetedPoller` state machine; work arriving during execution is published as `RUNNING_PENDING`; a failed completion CAS retries according to the observed state, and one successful CAS both releases execution ownership and publishes the next round |
+| T-33 | A compound link update commits partially | Medium | Renaming succeeds before MTU or flag validation fails | The device is renamed while other requested configuration fields remain unchanged. | `Router::update_device_link` validates the target device, name format and uniqueness, and MTU range before writing; the rtnetlink entry point ignores `IFF_VOLATILE` changes and rejects actual changes to unsupported writable bits; device setters receive only validated values |
+| T-34 | Shared mutexes held by ordinary tasks retain poller execution ownership for an extended period | Medium | After acquiring `RUNNING`, the poller waits for Router, IngressProcessor, Interface, or socket-set held by another socket or control-plane task | Other network work cannot progress while the sole poller waits for a shared lock. | Polling rounds use `try_lock` for these shared locks; contention preserves batches awaiting handoff, returns `has_more`, and schedules later rounds through the existing four-state machine; IPv4 reassembly attempts the IngressProcessor lock only when expired events are pending and continues TX after contention; assisted processing remains limited to one round and attempts only one CAS to acquire execution ownership |
+| T-35 | Loopback UDP delivery depends on poller ownership | Medium | `sendto` only queues the packet for transmission, and a short `SO_RCVTIMEO` expires while poller execution ownership is occupied | A locally sent datagram misses the receive deadline and causes a user-visible timeout. | The loopback send path writes validated UDP metadata before disabling BH, enqueues the packet in `NET_RX_QUEUE`, and triggers `NetRx`; when BH is restored, complete IPv4 UDP packets enter the PCB; TCP/ICMP and UDP packets without a matching socket continue through the poller |
+| T-36 | Pending Unix stream listener connections exhaust kernel memory | Medium | An attacker continuously connects while the server does not call `accept` | Queued connections retain ring buffers and exhaust memory available to the kernel. | The backlog is converted according to Linux counting rules and capped at `LISTEN_QUEUE_SIZE`; capacity is reserved before ring-buffer allocation; nonblocking connections return `EAGAIN`, while blocking connections wait for capacity according to `SO_SNDTIMEO` and return `EAGAIN` on timeout; shutdown and Drop wake waiters |
+| T-37 | A UDP socket receives ICMP errors from another device | Medium | ICMP error lookup loses the ingress interface index and treats an unknown device as a wildcard | A device-bound socket reports an asynchronous error for traffic from another interface. | Ingress processing passes `PacketBuf::ifindex` to UDP PCB lookup; a device-bound PCB matches only the same interface index |
+
+| T-38 | AF_PACKET receive traffic retains excessive frame storage | Medium | A packet socket consumes frames more slowly than they are published | The receive queue drops new frames and retains bounded socket memory | `PacketRxQueue::push_back` enforces both 64 KiB and 1024-frame limits and counts full frame allocations even for datagram views; `publish_frame` increments drop statistics on rejection. |
+| T-39 | Reverse TIPC forwarding reaches a host endpoint without per-client isolation | Medium | A client connects to a published forwarding service whose `allowed_uuids` is empty | Any client accepted by that TIPC service can forward bytes to the configured host endpoint | `VsockBridge::accept_reverse_tipc` closes mismatched UUIDs with `PermissionDenied` when an allowlist is configured. The current empty list permits all accepted clients; isolation depends on TIPC service access policy or a deployment-specific allowlist. |
+| T-40 | Ethernet trace logging exposes packet contents | Medium | Trace logging is enabled while sensitive frames are sent or received | Packet payloads become visible to readers of the kernel log | `EthernetDevice::send_frame` and `poll_rx` log frame bytes at trace level. Production log configuration and access control must restrict this exposure; payload redaction is not implemented at these sites. |
+| T-41 | Unix datagram peers retain unbounded queued messages | Medium | A sender continues enqueueing while the peer does not receive | Heap use grows with unread payloads and ancillary objects, risking resource exhaustion | `DgramTransport` uses `async_channel::unbounded` in socket-pair creation and bind. There is currently no queue quota; deployments must bound producer traffic or add queue admission limits. This remains an unmitigated resource limit. |
+
+Impact levels:
+
+- High: undefined behavior, memory corruption, or privilege escalation.
+- Medium: panics, service unavailability, or inconsistent data.
+- Low: performance degradation, lost logs, or reduced functionality.
+
+## Failure Mode and Effects Analysis
+
+| ID | Failure Mode | Cause | Local Effect | System Effect | Severity | Mitigation |
+|----|--------------|-------|--------------|---------------|----------|------------|
+| F-01 | No network device | `kclass::net_devices()` returns no devices | Only loopback is available | External TCP, UDP, and raw IP operations report no route or connection failure | 3 | `init_network` logs a warning; `Service::get_source_address` returns `ENETUNREACH` |
+| F-02 | No route to the destination | `RouteTable::lookup` finds no match | The current send fails | Application connection failure | 3 | connect or send returns `ENETUNREACH`; the dispatch path logs a warning and drops the packet |
+| F-03 | Ethernet pending queue is full | ARP is unresolved and `pending_tx` reaches its limit | Subsequent IP packets are dropped | Packet loss when communicating with one or more destinations | 3 | Log a warning; future work should split queues by next hop to reduce head-of-line blocking |
+| F-04 | Driver transmit-buffer allocation fails | The NIC driver returns an `alloc_tx_buf` error | The current frame is not sent | Reduced network throughput or connection timeout | 3 | Log a warning and return; the upper-layer poller can continue retrying |
+| F-05 | UDP ICMP error-queue entries are lost | Missing PCB registry registration, an invalid ICMP quoted header, or a closed socket | Missing `SO_ERROR` or error-queue information | Applications cannot obtain asynchronous network errors | 4 | Initialize the PCB registry at socket creation, register the PCB at bind, and unregister it on Drop; parse ICMP quoted packets through an IPv4 header path that permits truncated payloads |
+| F-06 | A TCP connection awaiting acceptance is aborted | The peer resets during the handshake or the smoltcp child connection closes | `accept` returns `ConnectionAborted` | The application retries accept | 4 | `ListenTable::accept` removes closed child connections and continues scanning the queue |
+| F-07 | A poll wakeup or protocol-timer event is lost | UDP socket notifications are lost; the TCP/raw device mask is incorrect; timeout or Ethernet RX event sources are not registered; the registration owner is released during `Pending`; readiness is not rechecked after registration; or timer expiration fails to notify the poller | Delayed blocking socket waits, TCP retransmissions, or keepalives | Higher application IO latency or connection timeout | 3 | UDP receive waiters are notified when packets are enqueued, errors occur, or the socket is shut down; changes to TCP/raw device bindings notify waiters to rebuild RX registrations and recheck the event version; `Service::register_rx_waker` uses the same `PollContext` to register timeout polling and Ethernet receive-poll event sources that support interrupt-driven reception; devices without `NetRxScheduler` fall back to the timeout aggregate waker; callers retain `PollRegistrations` and recheck readiness after registration; each Interface poll registers the deadline returned by `poll_at` and calls `notify(PollReason::Timer)` on expiration |
+| F-08 | Malformed netlink request | Invalid header or attribute length | An empty response or netlink error is returned | The caller's request fails | 4 | Bounds-checked readers and error-response handling |
+| F-09 | Network service or control plane is uninitialized | An AF_PACKET or netlink route request precedes `SERVICE` or Router initialization | AF_PACKET device binding and sending return `ENODEV`; link dumps are empty, mutations return errors, and address or route dumps are empty | The corresponding network functions are temporarily unavailable | 2 | Check initialization before every `SERVICE` query; initialize Router and `SERVICE` before public network interfaces become available; new boot paths must preserve this order |
+| F-10 | A Unix stream peer closes early | The channel is shut down or released | send returns `BrokenPipe` if no progress was made, or a partial byte count otherwise; recv returns EOF after draining the local buffer; if the peer discards unread input on closure, recv returns `ConnectionReset` once; polling reports `RDHUP`, `HUP`, or `ERR` | The application observes connection closure | 4 | Endpoint atomics record both half-close states and pending resets; `tx_order` for each send direction orders closure and data together; three `PollSet` groups selectively wake waiters for affected events |
+| F-11 | Heavy network processing runs in interrupt context | IRQ or `NetRx` incorrectly calls socket send, recv, or `poller::assist_once` | Lock contention, scheduling delays, or deadlock | Higher network IO latency or severe system stalls | 2 | IRQ paths only acknowledge device interrupts, mark RX pending, and schedule `NetRx`; Ethernet `NetRx` only wakes the device RX `PollSet`; loopback writes validated UDP metadata into the existing `PacketBuf` before disabling BH; `NetRx` takes only UDP packets with validated metadata from `NET_RX_QUEUE` and delivers them through allocation-free `SpinNoIrq` lookup and handle enqueueing without looking up `LoopbackDevice`; softirqs must not call `poller::assist_once` or acquire `Service` / `SocketSet` mutexes |
+| F-12 | Incorrect RX buffer recycling order | Frame payload remains referenced after `recycle_rx` | Dangling-data reads or data corruption | Packet parsing errors or, in severe cases, memory-safety violations | 1 | `EthernetDevice::poll_rx` completes parsing and copying before recycling; new device adapters must preserve this lifetime |
+| F-13 | Port 0 handshake waits indefinitely | The host connects before the TA publishes the service without setting a receive timeout, or the service is never published | Host `read` blocks; negative tests hang | The CA/test process becomes unresponsive | 3 | Dynamic connections retain `WAIT_FOR_PORT`; the host sets `TRUSTY_VSOCK_TIMEOUT_SEC`; explicit rejection returns `[1]` |
+| F-14 | Rapid reconnect causes `tipc_connect` timeout `-11` | Bridge event routing discards a receive event before its connection-request event has created bridge state, losing the service-name record | Reading the status byte on the host returns `EAGAIN`; roughly half of rapid reconnects fail | Intermittent failures in storage clients and the proxy test framework | 2 | `VsockConnectionManager::handle_raw_event` recognizes reserved local ports and records `is_bridge` on the connection; `push_bridge_event` and `pop_bridge_event` preserve FIFO event order |
+| F-15 | IPv4 fragment reassembly times out | Subsequent fragments are missing 30 seconds after the first fragment arrives | The current datagram is lost | UDP receive timeout | 3 | Delete expired queues; send ICMPv4 Fragment Reassembly Timeout when the first fragment is present and replies are permitted |
+| F-16 | A UDP DF datagram exceeds the route MTU | `IP_MTU_DISCOVER` requires DF and packet length exceeds the route MTU | The current send fails | The application receives `EMSGSIZE` | 4 | Read the route MTU before sending; Router rejects output fragmentation of DF packets |
+| F-17 | Boot-time Unix pathname bind panics | A kernel task calls implicit `current_cred()` before a current user thread exists | Kernel sockets such as `/dev/log` cannot bind | Boot is interrupted | 2 | Use `bind_with_cred` with explicit `initial_cred()` during boot; retain a usable initial filesystem context |
+| F-18 | An expired smoltcp poll deadline becomes an excessively long wait | A negative signed microsecond difference is converted through `as u64` | The software timer is set far into the future | TCP data-path stalls with a risk of accompanying timer IRQ anomalies | 2 | Map `SmoltcpInstant` directly to `MonotonicInstant` on the same time base without calculating an unsigned delay; unit tests cover expired and future deadlines |
+| F-19 | Unauthorized netlink mutation request | The credentials for the current send lack configuration permission | The mutation is not executed; the receive queue gets `NLMSG_ERROR` with `EPERM` | The caller's configuration attempt fails | 4 | Recheck credentials on every send; after enqueueing the error response, the send entry point returns the consumed request length |
+| F-20 | Mixed or truncated netlink batch | A single send mixes queries and mutations, or a subsequent message is too short or truncated | A mixed batch is not executed and returns a syscall error; a truncated tail only stops further parsing | The caller must correct or split the batch | 4 | Classify the batch before state updates or response generation; stop splitting when fewer than a header's worth of bytes remain or `nlmsg_len` is invalid |
+| F-21 | RX or TX backlogs monopolize the processing task | A sustained packet rate exceeds the per-round budget | A round reaches its budget or 1 ms soft time limit with work still pending | Scheduling delays for other tasks or reduced network throughput | 3 | Device RX, stack ingress, stack egress, and Router TX check time after at most 32 work items; each batch runs at most four consecutive rounds, then reschedules and releases execution ownership, leaving remaining work for the next batch |
+| F-22 | A TCP peer does not send FIN after the local file closes | The peer acknowledges the local FIN, but the protocol handle remains in `FIN_WAIT_2` after detachment from the user file object | The deferred-close registry keeps socket buffers alive | Network memory grows with unresponsive connections | 3 | Set a 60-second deadline on entry to `FIN_WAIT_2`, include it in the unified poll timer, and reclaim the handle on expiration |
+| F-23 | The IPv4 output device is administratively down | `RTM_NEWLINK` clears `IFF_UP` on the device selected by the matching route | The current UDP or raw IP send fails | The application receives `ENETUNREACH` | 4 | UDP and raw IP validate the output route and device administrative state through `SERVICE` before committing the send buffer |
+| F-24 | Data-plane shared-lock contention | A socket or control-plane task holds Router, IngressProcessor, Interface, or socket-set | The current polling round ends early and retains its batches | Network work is deferred to the next round | 3 | Return `has_more`; the sole executor publishes `SCHEDULED` through the completion CAS; raw, admitted, and control-packet batches retain ownership and resume from their saved positions in the next round |
+| F-25 | Short-timeout loopback UDP loses packets while the poller is busy | `sendto` only notifies the poller, and the 1-jiffy `recvfrom` timeout expires first | Concurrent libc-test `socket.exe` runs intermittently report `ETIMEDOUT` | A user-visible functional regression | 3 | `NetRx` delivers loopback UDP to the PCB within the send path's BH window; the poller no longer performs this delivery; stress tests cover four concurrent short-timeout operations with SMP=1 and SMP=4 |
+| F-26 | A TCP child connection remains in the SYN queue indefinitely | The packet marker is consumed before the child becomes acceptable, and later ingress processing or timer polling does not refresh the listener | The accept queue stays empty | The server remains blocked in `accept` after connection establishment | 2 | Refresh listeners with nonempty SYN queues after each actual network poll; wake waiters only after a child enters the accept queue; SYN queues do not request continuous polling |
+| F-27 | Connect or accept waits indefinitely after Unix listener shutdown | A listener state change does not notify capacity and request events | Blocking `connect` or `accept` cannot return | Application threads remain asleep indefinitely | 2 | Both `shutdown(SHUT_RD)` and Drop notify `capacity_available` and `request_available`; queued requests are delivered first, and blocking `accept` on an empty queue returns `EINVAL`; blocking `connect` with `SO_SNDTIMEO` returns `EAGAIN` when its capacity wait times out |
+
+Severity levels:
+
+- 1: Fatal; system crash or data loss.
+- 2: Severe; functionality is unavailable and recovery requires a restart.
+- 3: Moderate; functionality is degraded and can recover automatically.
+- 4: Minor; impact is limited and acceptable to users.
+
+## Failure Management
+
+- Ordinary input errors are returned through `KError` and `LinuxError`, such as `EINVAL`, `EAFNOSUPPORT`, `ENETUNREACH`, `EADDRINUSE`, and `EWOULDBLOCK`.
+- netlink batch splitting stops when fewer than a header's worth of bytes remain, or when `nlmsg_len` is smaller than the header or larger than the remaining bytes. Already processed messages are not rolled back, and trailing padding may contain nonzero values. Payload or attribute errors detected after batch splitting return `NLMSG_ERROR`.
+- Unauthorized netlink mutations return `NLMSG_ERROR` with `EPERM` through the receive queue. Batches mixing queries and mutations return syscall `EOPNOTSUPP` before any state mutation.
+- Malformed packets are rejected by the RX parsers and their callers. Logging depends on the path: malformed ARP uses a debug log, while some parser failures return `None` or an error without a dedicated log. Trace logging records Ethernet frame bytes before protocol parsing.
+- Full UDP PCB receive queues and Router TX queues result in packet drops or `WouldBlock`; the poller waits for IO readiness events.
+- Full smoltcp buffers and Unix stream ring buffers return `WouldBlock`, and the poller waits for IO readiness events. A nonblocking Unix stream send returns a partial byte count if it has already made progress. When a Unix listener backlog is full, nonblocking `connect` returns `WouldBlock`; blocking connections wait according to `SO_SNDTIMEO` for `accept` to release capacity or for the backlog limit to increase, and return `WouldBlock` on timeout.
+- Full loopback and Ethernet queues drop packets and log warnings. When the shared `NetRx` queue is full, loopback send still returns success, matching Linux `loopback_xmit`, which returns `NETDEV_TX_OK` even when `__netif_rx` returns `NET_RX_DROP`.
+- Panic paths include initialization order, violated internal invariants, `expect` assertions, and the driver RX recycling `unwrap` in `EthernetDevice::poll_rx`. New public entry points should validate inputs and return errors through `KError` before entering paths that contain internal assertions.
+
+## Privacy Analysis
+
+`knet` handles data sent by user processes through sockets, network packet payloads, Unix socket credentials, netlink messages, and vsock payloads.
+These data reside in kernel socket buffers, ring buffers, driver buffers, or netlink queues. The module itself stores them only in memory.
+Ordinary logs omit payload contents, while trace logs record Ethernet frame bytes. Production environments must control log levels to limit exposure of sensitive network data.
+
+## Known Limitations
+
+- `StreamTransport::recv` currently consumes copied bytes even when `RecvFlags::PEEK` is requested. `DgramTransport::recv` also dequeues before copying. Callers must not rely on non-consuming Unix socket PEEK semantics until those paths implement them.
+- netlink mutation-only batches have response-capacity preflight and per-socket serialization, but later operation failures do not roll back earlier mutations. `network_config_lock` is acquired per mutation, so different callers can interleave between messages in a batch.
+- Unix datagram channels are unbounded. The stream listener limit and AF_PACKET/netlink queue limits do not bound their queued payloads or ancillary objects.
+- `NetlinkSocket::send_inner` and `PacketSocket::send` copy the caller's full input into a `Vec` before later protocol checks. Receive-queue quotas do not cap these transient send allocations; upstream request-size and workload limits remain relevant.
+- The reverse TIPC forwarding map currently has an empty UUID allowlist, accepting every client admitted by the TIPC service. Per-client isolation requires a nonempty mapping or external service policy.
+- `VsockConnectionManager::handle_raw_event` trusts the provider's typed events and copies only available receive bytes. A receive length larger than the supplied body is not rejected, and a full connection ring drops excess bytes. Record completeness depends on the provider and flow-control contract.
+- The unsafe callback functions identified in the test-only inventory have incomplete function-level safety documentation. Existing local block comments are recorded above; missing callback contracts remain a source follow-up.
+- Driver RX recycling is assumed to succeed: `EthernetDevice::poll_rx` calls `recycle_rx(...).unwrap()`. A provider recycling error can panic despite successful packet parsing.
+
+- `RTM_GETNEIGH` neighbor dumps remain unimplemented. `RTM_NEWNEIGH` mutations delegate neighbor updates to the device-state owner.
+- IPv4 output uses the MTU of the device selected by the matching route. The next-hop MTU in ICMP Fragmentation Needed enters only the UDP error queue; a dynamic PMTU cache is not yet implemented.
+- IPv4 output fragmentation supports only packets generated within the stack without IP options. IP option copying semantics are not yet implemented.
+- Route dumps read configured routes and address-derived routes from Router.
+- smoltcp maintenance and each egress operation have bounded work, while ingress advances packet by packet through `poll_ingress_single`. Protocol processing for one packet or a single egress operation can still briefly exceed the soft time limit.
+- Nonblocking retry on Router, IngressProcessor, Interface, and socket-set contention preserves the poller ownership boundary. Short critical sections within transports, the listen table, and device callbacks can still briefly exceed the soft time limit.
+- Each UDP receive queue reserves 1024 pointer-sized slots at PCB creation, so idle sockets still incur this fixed metadata overhead.
+- Address and route dumps read Router directly; link dumps read live device snapshots directly.
+- The syscall layer controls raw socket creation permissions; `knet` constructors themselves take no process-credential argument.
+- Ethernet devices handle only IPv4 ARP. IPv6 NDP, non-Ethernet links, and multiqueue NIC abstractions remain to be extended.
+- The in-crate UDP data path currently supports only IPv4. The smoltcp DNS path continues to use IPv6 UDP, while ordinary UDP sockets do not support IPv6 transmission or reception.
+- The vsock-TIPC v1 bridge does not forward TIPC handles or memrefs and does not maintain a persistent retry queue for vsock transmit credits.
+- `SO_BINDTODEVICE` setsockopt currently performs no privilege check. Linux 6.8 requires `CAP_NET_RAW` only if the socket is already bound to a device, covering both rebinding and unbinding; the first bind is unchecked. x-kernel approximates capability permissions with euid 0 and has not yet implemented this rebinding check.
+
+## Verification References
+
+These are existing verification points, not results of a test run performed
+for this document update. Test names are resolved against current source.
+
+| Documented control | Existing verification |
+|--------------------|-----------------------|
+| Current-send netlink authorization | [src/netlink/tests.rs](../src/netlink/tests.rs): `test_route_mutation_checks_each_send_credential` checks unprivileged `EPERM`, an unprivileged query, and a privileged request on the same socket. |
+| Batch classification and response-space preflight | [src/netlink/tests.rs](../src/netlink/tests.rs): `test_route_socket_rejects_mixed_query_and_mutation_batch` checks rejection before mutation; `test_mutation_queue_reservation_failure_preserves_network_state` checks `ENOBUFS` and unchanged address state. Neither test establishes rollback of later operation failures. |
+| netlink length and trailing-byte handling | [src/netlink/tests.rs](../src/netlink/tests.rs): `test_malformed_nlmsg_len_does_not_mutate_network_state`, `test_route_dump_ignores_nonzero_short_trailer`, and `test_route_dump_stops_at_invalid_trailing_header`. |
+| Compound link updates | [src/netlink/tests.rs](../src/netlink/tests.rs): `test_reject_invalid_link_name_and_mtu_without_partial_update` checks invalid configuration without partially updating device state. |
+| AF_PACKET memory accounting | [src/link/packet.rs](../src/link/packet.rs): `test_datagram_empty_payload_frames_are_accounted` exercises the frame-count limit for empty datagrams; `test_queue_drop_statistics` checks oversized-frame rejection and drop accounting. |
+| AF_PACKET transmission rejection | [src/link/packet.rs](../src/link/packet.rs): `test_send_ifindex_errors` and `test_send_link_state_validation` check interface, link-state, short-header, and MTU failures. |
+| AF_PACKET receive ownership | [src/link/packet.rs](../src/link/packet.rs): `test_peek_preserves_frame` and `test_recv_write_failure_preserves_packet` check retention across PEEK and failed destination writes. These tests do not cover Unix stream PEEK. |
+| IPv4 overlap and duplicate handling | [src/stack/fragment.rs](../src/stack/fragment.rs): `test_ipv4_reassembly_drops_overlapping_fragments` and `test_ipv4_reassembly_keeps_queue_on_duplicate_fragment`. |
+| Reassembly deadlines and bounded expiration | [src/stack/fragment.rs](../src/stack/fragment.rs): `test_ipv4_reassembly_deadline_is_fixed_at_queue_creation` and `test_ipv4_reassembly_expiration_respects_timer_budget`. |
+| Unix address lookup and lock handoff | [src/unix.rs](../src/unix.rs): `unix_missing_abstract_address_returns_connection_refused` and `unix_abstract_lookup_releases_registry_before_callback`. Pathname DAC remains a kvfs contract and is not established by these abstract-address tests. |
+| UDP and Ethernet test waker use | [src/transport/udp/wait.rs](../src/transport/udp/wait.rs): `test_udp_socket_waiters_wake_all_read_waiters`; [src/device/ethernet.rs](../src/device/ethernet.rs): `test_net_rx_softirq_wakes_only_pending_sources`. They exercise callback use, not a complete proof of raw-waker soundness. |
+| TIPC UUID policy, record length, and handle rejection | Inspect `uuid_allowed`, `accept_reverse_tipc`, `recv_exact_record`, and `read_tipc_msg` in [src/vsock/bridge.rs](../src/vsock/bridge.rs), together with `TIPC_TO_VSOCK_MAP` in [src/vsock/bridge_port_map.rs](../src/vsock/bridge_port_map.rs). The empty allowlist and error branches are directly reproducible source checks. |
+| Trace payload exposure | Inspect the `trace!` calls in `EthernetDevice::send_frame` and `poll_rx` in [src/device/ethernet.rs](../src/device/ethernet.rs) and the deployment's enabled log level. |
+
+To run crate unit tests, prepare `.config` from a platform defconfig and use
+`make unittest UNITTEST_CRATE=knet` according to the repository
+[build workflow](../../../docs/ai/skills/build-workflow/SKILL.md). Feature-specific
+coverage requires enabling `vsock` and `vsock_tipc_bridge` through the relevant
+Kconfig configuration; ordinary builds do not exercise those paths or test-only
+callbacks automatically.
+
+## Audit Checklist
+
+Changes to this module must verify the following:
+
+- Every `unsafe` block has a `SAFETY:` comment.
+- The lifecycle of each new smoltcp socket handle is protected by `SOCKET_SET`.
+- New link and neighbor mutations directly update state owned by the target device.
+  Address and route mutations update Router and refresh derived projections under `network_config_lock`.
+  Deleting the last instance of an address value also removes configured Router routes that depend on that `prefsrc`.
+  Device removal uses `unregister_netdev` to delete and renumber routes and device neighbors under the same lock.
+- Every credential-bearing netlink send or socket file write receives the current caller's `Cred` snapshot; sockets do not cache permissions. Credential-free sends remain unprivileged.
+- New netlink parsers validate individual message header lengths and batch alignment boundaries before validating attributes, address families, and indices.
+- Send transactions on the same netlink socket remain serialized. `network_config_lock` serializes mutations across control-plane entry points.
+  Device removal uses `unregister_netdev`.
+  The lock order is send-transaction lock, `network_config_lock`, control-plane state-owner locks, and receive queue.
+- Query-only and mutation-only batches support per-message processing. Mixed batches return `EOPNOTSUPP` before state updates, and mutation batches check space for all responses before execution.
+- Index advancement in new ring-buffer operations is derived from the same batch of slices under the same lock.
+- Unix stream write-index publication, directional closure, and empty-queue EOF checks retain a common ordering point for each send direction. User copies and `PollSet` wakeups occur outside directional locks, and shutdown wakes waiters after releasing the `channel` mutex.
+- Unix listener changes keep the sum of pending requests and capacity reservations within `LISTEN_QUEUE_SIZE`. Ring buffers are allocated after capacity reservation; binding-slot and state locks are released before blocking waits; shutdown and Drop wake connect and accept waiters.
+- Unix pathname filesystem-context locks and abstract-address binding-table locks are released before transport callbacks. Blocking connect does not hold address-lookup-layer locks.
+- New external network inputs use bounds-checked parsers.
+- IPv4 fragment reassembly changes preserve queue-count, memory, and timeout limits and reject overlapping ranges.
+- `SO_BINDTODEVICE` updates `GeneralOptions::bound_dev_if` through atomic exchange. UDP receive filtering, UDP transmission, and TCP/raw RX device selection read the same field. Relaxed reads carry only the interface index. When the value changes, the `PollEvent` version publishes the update with Release/Acquire ordering and wakes device RX waiters. RX registration retains the subscription to configuration events and rechecks the event version to detect changes between device selection and registration completion. Binding and unbinding rebuild device RX registrations; default and unbound states select all devices. Notifications trigger readiness rechecks, and actual IO state determines user-visible events. Protocol receive filtering enforces packet isolation.
+- UDP waits for reception alone subscribe only to the socket's read, error, and shutdown events. Packet enqueueing, asynchronous errors, and read shutdown publish their state before notifying waiters. Readiness checks after registration account for notifications that arrived earlier, and cancellation removes all subscriptions. Ingress filters packets using the current `bound_dev_if`, so existing receive subscriptions remain valid when the binding changes. Ethernet RX, loopback sends, and timers independently advance network processing. Waits for reception alone are independent of device RX broadcasts and global protocol timer broadcasts. Waits that include write events retain the network progress notifications required for TX.
+- UDP registry changes keep bind, connect, ordinary receive, and ICMP error lookup tied to the same PCB ownership source. Ordinary receive and ICMP error lookup use their respective incoming packet's interface index for `SO_BINDTODEVICE` filtering. Buckets, connected-peer state, and PCB receive queues shared by `NetRx` and tasks must use `SpinNoIrq`; state updates that can sleep must remain outside these locks.
+- Changes to the poller state machine or `Service::poll_budgeted` verify the four-state transitions, sole-executor acquisition, release through a single CAS, staged smoltcp budgets, and the 1 ms soft time limit.
+  `PollProgress::has_more` includes only immediately processable work. Protocol timers reread monotonic time at the end of each round and check absolute deadlines; expired IPv4 queues are consumed in batches according to the timer budget.
+  Only `tx_capacity_changed` triggers global capacity wakeups for TX waiters.
+- Changes to locking in `Service::poll_budgeted` preserve `try_lock` semantics for shared processing locks and set `has_more` on contention.
+  Only pending IPv4 expiration events participate in lock-contention retries, and TX processing continues after contention. Raw, admitted, and control-packet batches retain ownership before retrying.
+  TCP listener preparation occurs only when the admitted-packet batch can immediately enter Router.
+- TCP listener progress changes verify that entries with nonempty SYN queues are refreshed after actual network polling. Waiters are awakened outside the entry lock only after child connections enter the accept queue, and SYN queues remain excluded from `PollProgress::has_more`.
+- Changes to poller execution boundaries verify that assisted processing attempts only one CAS and respects the single-round budget.
+  Loopback UDP must reach the PCB within the send path's BH/`NetRx` window, independently of poller execution ownership.
+- Changes to `NET_RX_QUEUE` verify that `pending_udp` and `deferred` are preallocated at device creation and that `enqueue` counts both queued and in-flight packets toward capacity.
+  Capacity growth, heap deallocation, and UDP PCB delivery occur outside `SpinNoIrq` locks. Packets dropped because the queue is full or during `discard_ifindex` cleanup must also release `PacketBuf` outside the lock.
+  `process_pending` batches are capped at `NET_RX_BUDGET`, and supplemental processing in the send path uses a fixed number of rounds.
+  Unit tests sharing this queue must declare `serial`.
+- UDP PCB queue changes verify that PCB creation reserves 1024 pointer-sized slots and that `PacketBuf` establishes its reference-counted lifetime when entering the network stack.
+  Loopback must write validated UDP metadata before disabling BH; softirq and `SpinNoIrq` enqueue paths only move existing handles.
+  Receive queues preserve FIFO order, full queues drop packets outside the lock, and `MSG_PEEK` also copies payloads outside the lock.
+- Changes to TCP Drop or asynchronous TX verify that successfully written payloads remain owned by the protocol object after file closure, unread data at close triggers RST, deferred-close handles are removed after `Closed`, and the reclamation deadline applies only to `FIN_WAIT_2` handles detached from user file objects.
+- New socket options specify error codes, blocking semantics, and poll readiness conditions.
+- New pathname Unix socket entry points use a single credential snapshot and pass it explicitly to all VFS operations.
+- Pathname binding preserves exclusive creation, uses mode `0777 & !umask`, and takes ownership information from filesystem credentials.
+  connect/sendto check `MAY_WRITE` on the final inode before reading the binding.
+- New kernel call paths must not depend on `current_cred()`.
+  Callers must select credentials explicitly.
+- Before adding a public API, verify whether cross-crate exposure is required.
