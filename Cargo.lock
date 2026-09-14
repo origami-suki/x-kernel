@@ -2714,6 +2714,7 @@ dependencies = [
  "loongArch64",
  "memspace",
  "of",
+ "unittest",
 ]
 
 [[package]]

@@ -57,6 +57,20 @@ impl kirq::IntrManagerIf {
             }
             IrqType::Io => {}
             IrqType::Ex(irq) => {
+                // Gate the external hwirq at the platform routing layer, before
+                // it can reach either controller. The PCH PIC table (64 lines)
+                // is the binding constraint, so any number outside
+                // `0..PCH_PIC_IRQ_COUNT` is not a valid device interrupt for
+                // this platform and is rejected rather than forwarded. The
+                // controller-level checks in `pch_pic`/`eiointc` are
+                // defense-in-depth.
+                if irq >= pch_pic::PCH_PIC_IRQ_COUNT {
+                    warn!(
+                        "loongarch: reject out-of-range external hwirq {irq} (valid 0..{})",
+                        pch_pic::PCH_PIC_IRQ_COUNT
+                    );
+                    return;
+                }
                 if enabled {
                     eiointc::enable_irq(irq);
                     pch_pic::enable_irq(irq);

@@ -38,6 +38,7 @@ kplat = { workspace = true }
 kbuild_config = { workspace = true }
 kernel_boot = { workspace = true }
 memspace = { workspace = true }
+unittest = { workspace = true }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
 loongArch64 = "0.2.4"
