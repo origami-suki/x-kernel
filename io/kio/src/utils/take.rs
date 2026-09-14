@@ -41,27 +41,33 @@ impl<T> Take<T> {
         }
     }
 
+    /// Returns the number of bytes still permitted by this adapter.
     pub fn limit(&self) -> u64 {
         self.limit
     }
 
+    /// Returns bytes consumed since construction or the last `set_limit` call.
     pub fn position(&self) -> u64 {
         self.len - self.limit
     }
 
+    /// Resets the byte budget and logical position without seeking the inner reader.
     pub fn set_limit(&mut self, limit: u64) {
         self.len = limit;
         self.limit = limit;
     }
 
+    /// Returns the owned reader with its current underlying position.
     pub fn into_inner(self) -> T {
         self.inner
     }
 
+    /// Borrows the underlying reader.
     pub fn get_ref(&self) -> &T {
         &self.inner
     }
 
+    /// Mutably borrows the reader without updating this adapter's byte budget.
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
@@ -114,6 +120,9 @@ impl<T: Read> Read for Take<T> {
             // cursor / sliced_buf / ibuf must drop here
 
             #[cfg(borrowedbuf_init)]
+            // SAFETY: the bounded subcursor initialized its filled prefix and
+            // new_init bytes of the following unfilled region. Its borrow has
+            // ended, so those same ranges can be committed to the parent cursor.
             unsafe {
                 // SAFETY: filled bytes have been filled and therefore initialized
                 buf.advance_unchecked(filled);

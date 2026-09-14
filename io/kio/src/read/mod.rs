@@ -18,6 +18,16 @@ use crate::{Chain, Error, Result, Take};
 
 mod impls;
 
+/// Fills `buf` using repeated [`Read::read`] calls.
+///
+/// # Errors
+///
+/// Retries [`Error::Interrupted`], returns [`Error::UnexpectedEof`] on premature
+/// EOF, and forwards other read errors. Partial reads are not rolled back.
+///
+/// # Panics
+///
+/// Panics if a reader returns a byte count greater than the supplied slice.
 pub fn default_read_exact<R: Read + ?Sized>(this: &mut R, mut buf: &mut [u8]) -> Result<()> {
     while !buf.is_empty() {
         match this.read(buf) {
@@ -36,6 +46,17 @@ pub fn default_read_exact<R: Read + ?Sized>(this: &mut R, mut buf: &mut [u8]) ->
     }
 }
 
+/// Reads once into the unfilled part of a borrowed cursor, initializing it first.
+///
+/// The callback follows [`Read::read`]; success advances by its returned count.
+///
+/// # Errors
+///
+/// Forwards the callback error, including [`Error::Interrupted`].
+///
+/// # Panics
+///
+/// Panics if the callback reports more bytes than the cursor capacity.
 pub fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_>) -> Result<()>
 where
     F: FnOnce(&mut [u8]) -> Result<usize>,
@@ -47,8 +68,11 @@ where
     }
     #[cfg(not(borrowedbuf_init))]
     {
+        // SAFETY: zero-filling only initializes the exclusively borrowed unfilled region;
+        // it never replaces initialized bytes with uninitialized data.
         let n = read(unsafe { cursor.as_mut().write_filled(0) })?;
         assert!(n <= cursor.capacity());
+        // SAFETY: the entire region was zero-filled above, and the count is in bounds.
         unsafe {
             cursor.advance(n);
         }
@@ -56,6 +80,12 @@ where
     Ok(())
 }
 
+/// Fills the cursor using repeated [`Read::read_buf`] calls.
+///
+/// # Errors
+///
+/// Retries [`Error::Interrupted`], returns [`Error::UnexpectedEof`] on a successful
+/// read without progress, and forwards other read errors. Filled bytes remain.
 pub fn default_read_buf_exact<R: Read + ?Sized>(
     this: &mut R,
     mut cursor: BorrowedCursor<'_>,
@@ -76,6 +106,16 @@ pub fn default_read_buf_exact<R: Read + ?Sized>(
     Ok(())
 }
 
+/// Appends bytes until EOF, returning the number appended.
+///
+/// `size_hint` estimates remaining bytes for allocation/read sizing; it is not
+/// a limit. Use [`Read::take`] to bound an untrusted stream.
+///
+/// # Errors
+///
+/// Retries [`Error::Interrupted`], forwards other read errors, and maps failed
+/// `try_reserve` calls to [`Error::NoMemory`]. Appended bytes remain on error.
+/// Some growth uses infallible allocation and can panic or terminate on failure.
 #[cfg(feature = "alloc")]
 pub fn default_read_to_end<R: Read + ?Sized>(
     r: &mut R,
@@ -205,6 +245,14 @@ pub fn default_read_to_end<R: Read + ?Sized>(
     }
 }
 
+/// Appends bytes through a callback while preserving string validity.
+///
+/// # Safety
+///
+/// `f` must only append initialized bytes: it must not shrink the vector or
+/// modify its original prefix, including when returning an error or unwinding.
+/// This preserves the original UTF-8 prefix and makes suffix-only validation
+/// and restoration of the original length sound.
 #[cfg(feature = "alloc")]
 pub(crate) unsafe fn append_to_string<F>(buf: &mut String, f: F) -> Result<usize>
 where
@@ -244,6 +292,12 @@ where
 }
 
 /// Default [`Read::read_to_string`] implementation with optional size hint.
+///
+/// # Errors
+///
+/// Forwards [`default_read_to_end`] errors. Invalid appended UTF-8 is removed
+/// and yields [`Error::IllegalBytes`] if reading otherwise succeeded. Existing
+/// string contents are preserved; valid appended bytes may remain on error.
 #[cfg(feature = "alloc")]
 pub fn default_read_to_string<R: Read + ?Sized>(
     r: &mut R,
@@ -255,8 +309,9 @@ pub fn default_read_to_string<R: Read + ?Sized>(
     // method to fill it up. An arbitrary implementation could overwrite the
     // entire contents of the vector, not just append to it (which is what
     // we are expecting).
-    // SAFETY: `append_to_string` restores the original length on failure and
-    // validates the newly appended suffix as UTF-8 before committing it.
+    // SAFETY: default_read_to_end only appends initialized bytes and leaves
+    // the original prefix untouched, including on error. append_to_string
+    // validates the new suffix before committing its length.
     unsafe { append_to_string(buf, |b| default_read_to_end(r, b, size_hint)) }
 }
 
@@ -264,31 +319,68 @@ pub fn default_read_to_string<R: Read + ?Sized>(
 ///
 /// See [`std::io::Read`](https://doc.rust-lang.org/std/io/trait.Read.html) for more details.
 pub trait Read {
-    /// Pull some bytes from this source into the specified buffer
+    /// Pulls bytes into `buf`, returning a count in `0..=buf.len()`.
+    ///
+    /// Only the reported prefix contains newly read data. Short reads are allowed.
+    /// Zero usually indicates EOF, or an empty destination. Implementations must
+    /// not return an out-of-range count; adapters may panic on such violations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source's I/O error. The default helpers retry
+    /// [`Error::Interrupted`] only where explicitly documented.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
     /// Read the exact number of bytes required to fill `buf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] before filling `buf`, or forwards a read
+    /// error other than [`Error::Interrupted`], which the default implementation retries.
+    /// On failure the buffer and source may have advanced.
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         default_read_exact(self, buf)
     }
 
     /// Pull some bytes from this source into the specified buffer.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`Read::read`] errors in the default implementation, without retry.
+    /// Overrides may append initialized bytes before returning an error.
     fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> Result<()> {
         default_read_buf(|b| self.read(b), buf)
     }
 
     /// Reads the exact number of bytes required to fill `cursor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedEof`] when a successful read makes no progress,
+    /// or forwards non-interruption read errors. Already filled bytes remain.
     fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> Result<()> {
         default_read_buf_exact(self, cursor)
     }
 
     /// Read all bytes until EOF in this source, placing them into `buf`.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation retries [`Error::Interrupted`], forwards other
+    /// read errors, and returns [`Error::NoMemory`] for fallible reservation failure.
+    /// Previously appended bytes remain. Infallible allocation can still terminate.
     #[cfg(feature = "alloc")]
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
         default_read_to_end(self, buf, None)
     }
 
     /// Read all bytes until EOF in this source, appending them to `buf`.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation forwards read/allocation errors and reports
+    /// [`Error::IllegalBytes`] for invalid appended UTF-8 when reading otherwise
+    /// succeeds. Invalid suffixes are removed; an existing read error takes precedence.
     #[cfg(feature = "alloc")]
     fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
         default_read_to_string(self, buf, None)
@@ -325,6 +417,10 @@ pub trait Read {
 ///
 /// See [`std::io::read_to_string`](https://doc.rust-lang.org/std/io/fn.read_to_string.html)
 /// for more details.
+///
+/// # Errors
+///
+/// Forwards [`Read::read_to_string`] errors from `reader`.
 #[cfg(feature = "alloc")]
 pub fn read_to_string<R: Read>(mut reader: R) -> Result<String> {
     let mut buf = String::new();
@@ -340,18 +436,35 @@ pub fn read_to_string<R: Read>(mut reader: R) -> Result<String> {
 pub trait BufRead: Read {
     /// Returns the contents of the internal buffer, filling it with more data, via `Read` methods,
     /// if empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying source error if filling fails. An empty successful
+    /// slice indicates EOF or a zero-capacity buffer.
     fn fill_buf(&mut self) -> Result<&[u8]>;
 
     /// Marks the given `amount` of additional bytes from the internal buffer as having been read.
     /// Subsequent calls to `read` only return bytes that have not been marked as read.
+    /// `amount` must not exceed the slice returned by the last `fill_buf` call.
+    /// Violating this contract may panic or corrupt logical position accounting.
     fn consume(&mut self, amount: usize);
 
     /// Checks if there is any data left to be `read`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`BufRead::fill_buf`] errors without retry.
     fn has_data_left(&mut self) -> Result<bool> {
         self.fill_buf().map(|b| !b.is_empty())
     }
 
-    /// Skips all bytes until the delimiter `byte` or EOF is reached.
+    /// Skips bytes through the delimiter `byte` or EOF, returning bytes consumed.
+    /// The delimiter, if found, is included in the count.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`BufRead::fill_buf`] errors, including interruptions, without
+    /// retry. Bytes consumed before an error remain consumed.
     fn skip_until(&mut self, byte: u8) -> Result<usize> {
         let mut read = 0;
         loop {
@@ -370,7 +483,15 @@ pub trait BufRead: Read {
         }
     }
 
-    /// Read all bytes into `buf` until the delimiter `byte` or EOF is reached.
+    /// Appends bytes through delimiter `byte` or EOF and returns the appended count.
+    /// The delimiter, if found, is included in both the buffer and count.
+    /// Implementations must only append: existing bytes must remain unchanged,
+    /// including on error or unwind, because `read_line` relies on this contract.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`BufRead::fill_buf`] errors without retry. Bytes already appended
+    /// and consumed remain so. Allocation uses infallible vector growth.
     #[cfg(feature = "alloc")]
     fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize> {
         let mut read = 0;
@@ -398,10 +519,17 @@ pub trait BufRead: Read {
 
     /// Read all bytes until a newline (the `0xA` byte) is reached, and append
     /// them to the provided `String` buffer.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`BufRead::read_until`] errors. On successful reading, invalid
+    /// appended UTF-8 produces [`Error::IllegalBytes`]; an invalid suffix is removed.
+    /// The underlying stream is not rewound.
     #[cfg(feature = "alloc")]
     fn read_line(&mut self, buf: &mut String) -> Result<usize> {
-        // SAFETY: `append_to_string` validates the appended bytes before
-        // exposing them through the `String`.
+        // SAFETY: the read_until contract requires append-only mutation even
+        // on error or unwind. append_to_string validates that suffix before
+        // exposing it through the String.
         unsafe { super::append_to_string(buf, |b| self.read_until(b'\n', b)) }
     }
 

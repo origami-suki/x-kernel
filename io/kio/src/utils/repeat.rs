@@ -60,12 +60,22 @@ impl Read for Repeat {
     }
 
     /// This function is not supported by `Repeat`, because there's no end of its data
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`crate::Error::NoMemory`] because the stream is infinite.
+    /// Use [`Read::take`] to bound the reader before collecting its contents.
     #[cfg(feature = "alloc")]
     fn read_to_end(&mut self, _: &mut Vec<u8>) -> Result<usize> {
         Err(crate::Error::NoMemory)
     }
 
     /// This function is not supported by `Repeat`, because there's no end of its data
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`crate::Error::NoMemory`] because the stream is infinite.
+    /// Use [`Read::take`] to bound the reader before collecting its contents.
     #[cfg(feature = "alloc")]
     fn read_to_string(&mut self, _: &mut String) -> Result<usize> {
         Err(crate::Error::NoMemory)

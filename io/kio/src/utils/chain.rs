@@ -40,14 +40,17 @@ impl<T, U> Chain<T, U> {
         }
     }
 
+    /// Returns both owned readers in their original order.
     pub fn into_inner(self) -> (T, U) {
         (self.first, self.second)
     }
 
+    /// Borrows the first and second readers.
     pub fn get_ref(&self) -> (&T, &U) {
         (&self.first, &self.second)
     }
 
+    /// Mutably borrows both readers. Altering them does not reset the EOF switch.
     pub fn get_mut(&mut self) -> (&mut T, &mut U) {
         (&mut self.first, &mut self.second)
     }

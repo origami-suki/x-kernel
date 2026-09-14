@@ -60,10 +60,36 @@ pub(crate) fn default_write_fmt<W: Write + ?Sized>(
 ///
 /// See [`std::io::Write`](https://doc.rust-lang.org/std/io/trait.Write.html) for more details.
 pub trait Write {
+    /// Writes a prefix of `buf`, returning the number of bytes accepted.
+    ///
+    /// Implementations must return a count no greater than `buf.len()`. A short
+    /// write is allowed; acceptance into a buffer does not imply persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's I/O error. An error must not report a successful count;
+    /// callers needing all bytes should use [`Write::write_all`].
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
 
+    /// Pushes pending output through the writer's buffering layers.
+    ///
+    /// Durability and device completion depend on the implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying writer's flush or write error.
     fn flush(&mut self) -> Result<()>;
 
+    /// Writes all bytes, retrying short writes and [`Error::Interrupted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WriteZero`] if a write makes no progress before completion,
+    /// or forwards any other write error. Earlier output is not rolled back.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics if a writer returns more bytes than supplied.
     fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
         while !buf.is_empty() {
             match self.write(buf) {
@@ -76,10 +102,21 @@ pub trait Write {
         Ok(())
     }
 
+    /// Formats arguments into this writer using [`Write::write_all`].
+    ///
+    /// # Errors
+    ///
+    /// Forwards the error from writing the formatted text.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics if a formatting implementation returns
+    /// `fmt::Error` without an underlying I/O error.
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
         default_write_fmt(self, args)
     }
 
+    /// Borrows this writer so adapters can use it without taking ownership.
     fn by_ref(&mut self) -> &mut Self
     where
         Self: Sized,

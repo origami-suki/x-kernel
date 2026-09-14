@@ -21,7 +21,11 @@ use self::buffer::Buffer;
 use crate::Error;
 use crate::{BufRead, DEFAULT_BUF_SIZE, IoBuf, Read, Result, Seek, SeekFrom};
 
-/// The `BufReader<R>` struct adds buffering to any reader.
+/// Adds read buffering and lookahead to an underlying reader.
+///
+/// Dropping or unwrapping discards unread buffered bytes. Direct reads or seeks
+/// through inner accessors can invalidate the adapter's position accounting.
+/// See the crate-level example for `fill_buf` followed by bounded `consume`.
 ///
 /// See [`std::io::BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html)
 /// for more details.
@@ -32,6 +36,12 @@ pub struct BufReader<R: ?Sized> {
 
 impl<R: Read> BufReader<R> {
     /// Creates a new `BufReader<R>` with the specified buffer capacity.
+    ///
+    /// # Panics
+    ///
+    /// Without `alloc`, panics if `capacity` exceeds [`DEFAULT_BUF_SIZE`].
+    /// With `alloc`, capacity overflow can panic and allocation failure follows
+    /// the allocator policy. Zero capacity is allowed but cannot buffer input.
     pub fn with_capacity(capacity: usize, inner: R) -> BufReader<R> {
         BufReader {
             buf: Buffer::with_capacity(capacity),
@@ -74,6 +84,7 @@ impl<R: ?Sized> BufReader<R> {
         self.buf.capacity()
     }
 
+    /// Returns the length of the buffer prefix tracked as initialized.
     #[cfg(borrowedbuf_init)]
     #[doc(hidden)]
     pub fn initialized(&self) -> usize {
@@ -112,8 +123,16 @@ impl<R: Read + ?Sized> BufReader<R> {
     /// end of file is reached.
     ///
     /// After calling this method, you may call [`consume`](BufRead::consume)
-    /// with a value less than or equal to `n` to advance over some or all of
+    /// with a value no larger than the returned slice length to advance over some or all of
     /// the returned bytes.
+    ///
+    /// # Errors
+    ///
+    /// Forwards underlying [`Read::read_buf`] errors without retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` exceeds [`Self::capacity`].
     pub fn peek(&mut self, n: usize) -> Result<&[u8]> {
         assert!(n <= self.capacity());
         while n > self.buf.buffer().len() {
@@ -286,6 +305,11 @@ impl<R: ?Sized + Seek> Seek for BufReader<R> {
     /// seeks will be performed instead of one. If the second seek returns
     /// [`Err`], the underlying reader will be left at the same position it would
     /// have if you called `seek` with <code>[SeekFrom::Current]\(0)</code>.
+    ///
+    /// # Errors
+    ///
+    /// Forwards errors from inner [`Seek::seek`] calls. A failed second seek in
+    /// the overflow case leaves the buffer discarded and the first seek committed.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         let result: u64;
         if let SeekFrom::Current(n) = pos {
@@ -326,6 +350,10 @@ impl<R: ?Sized + Seek> Seek for BufReader<R> {
     /// has an incorrect implementation of [`Seek::stream_position`], or if the
     /// position has gone out of sync due to calling [`Seek::seek`] directly on
     /// the underlying reader.
+    ///
+    /// # Errors
+    ///
+    /// Forwards errors from the inner [`Seek::stream_position`] call.
     fn stream_position(&mut self) -> Result<u64> {
         let remainder = (self.buf.filled() - self.buf.pos()) as u64;
         self.inner.stream_position().map(|pos| {
@@ -341,6 +369,15 @@ impl<R: ?Sized + Seek> Seek for BufReader<R> {
     /// flushed, allowing for more efficient seeks. This method does not return
     /// the location of the underlying reader, so the caller must track this
     /// information themselves if it is required.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`Self::seek`] errors when the destination is outside buffered data.
+    ///
+    /// # Panics
+    ///
+    /// With overflow checks enabled, negating `i64::MIN` in the negative-offset
+    /// fast path panics. Other out-of-buffer offsets use the underlying seek.
     fn seek_relative(&mut self, offset: i64) -> Result<()> {
         let pos = self.buf.pos() as u64;
         if offset < 0 {

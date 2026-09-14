@@ -16,17 +16,17 @@ use core::fmt;
 
 use self::shim::LineWriterShim;
 use crate::{BufWriter, IntoInnerError, IoBufMut, Result, Write};
-/// The [`BufWriter`] struct wraps a writer and buffers its output.
-/// But it only does this batched write when it goes out of scope, or when the
-/// internal buffer is full. Sometimes, you'd prefer to write each line as it's
-/// completed, rather than the entire buffer at once. Enter `LineWriter`. It
-/// does exactly that.
+/// Buffers output and sends completed newline-terminated lines to the inner writer.
+///
+/// A partial line remains buffered until space is needed or the writer is flushed.
+/// Short writes can leave pending complete lines in the buffer for a later call.
 ///
 /// Like [`BufWriter`], a `LineWriter`’s buffer will also be flushed when the
 /// `LineWriter` goes out of scope or when its internal buffer is full.
 ///
 /// If there's still a partial line in the buffer when the `LineWriter` is
-/// dropped, it will flush those contents.
+/// dropped, it attempts to write those contents; errors are discarded.
+/// Explicitly call [`Write::flush`] when errors must be observed.
 ///
 /// See [`std::io::LineWriter`](https://doc.rust-lang.org/std/io/struct.LineWriter.html)
 /// for more details.
@@ -35,12 +35,14 @@ pub struct LineWriter<W: ?Sized + Write> {
 }
 
 impl<W: Write> LineWriter<W> {
+    /// Creates a line-buffered writer with [`crate::DEFAULT_BUF_SIZE`] bytes of capacity.
     pub fn new(inner: W) -> LineWriter<W> {
         LineWriter {
             inner: BufWriter::new(inner),
         }
     }
 
+    /// Creates a line-buffered writer with at least `capacity` bytes of storage.
     #[cfg(feature = "alloc")]
     pub fn with_capacity(capacity: usize, inner: W) -> LineWriter<W> {
         LineWriter {
@@ -50,6 +52,12 @@ impl<W: Write> LineWriter<W> {
 
     /// Unwraps this `LineWriter`, returning the underlying writer.
     /// An [`Err`] will be returned if an error occurs while flushing the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IntoInnerError`] retaining this writer and the error from
+    /// writing pending data, including [`crate::Error::WriteZero`] on no progress.
+    /// It does not call the underlying writer's `flush` method.
     #[cfg_attr(not(feature = "alloc"), allow(clippy::result_large_err))]
     pub fn into_inner(self) -> core::result::Result<W, IntoInnerError<LineWriter<W>>> {
         self.inner

@@ -9,7 +9,10 @@ pub struct ReadFn<R> {
     r: R,
 }
 
-/// Creates a reader that wraps a function.
+/// Creates a reader whose `read` calls invoke `r` synchronously.
+///
+/// The callback must follow [`Read::read`], including its byte-count bound.
+/// Errors and callback execution-context requirements are forwarded unchanged.
 pub fn read_fn<R>(r: R) -> ReadFn<R>
 where
     R: FnMut(&mut [u8]) -> Result<usize>,
@@ -32,7 +35,11 @@ pub struct WriteFn<W> {
     w: W,
 }
 
-/// Creates a writer that wraps a function.
+/// Creates a writer whose `write` calls invoke `w` synchronously.
+///
+/// The callback must follow [`Write::write`], including its byte-count bound.
+/// Errors are forwarded unchanged. `flush` is a no-op returning success;
+/// this adapter provides no callback for durability or pending-output handling.
 pub fn write_fn<W>(w: W) -> WriteFn<W>
 where
     W: FnMut(&[u8]) -> Result<usize>,

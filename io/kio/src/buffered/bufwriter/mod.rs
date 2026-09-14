@@ -21,6 +21,11 @@ type Buffer = heapless::Vec<u8, DEFAULT_BUF_SIZE, u16>;
 
 /// Wraps a writer and buffers its output.
 ///
+/// Successful writes may only append to memory. Call [`Write::flush`] to
+/// observe delivery errors. Drop attempts to drain pending bytes but ignores
+/// errors, and skips that attempt after a tracked inner-write panic.
+/// See the crate-level example for construction, writing, flushing, and recovery.
+///
 /// See [`std::io::BufWriter`](https://doc.rust-lang.org/std/io/struct.BufWriter.html)
 /// for more details.
 pub struct BufWriter<W: ?Sized + Write> {
@@ -223,16 +228,21 @@ impl<W: ?Sized + Write> BufWriter<W> {
         self.buf.capacity() - self.buf.len()
     }
 
-    // SAFETY: Requires `buf.len() <= self.buf.capacity() - self.buf.len()`,
-    // i.e., that input buffer length is less than or equal to spare capacity.
+    /// Appends bytes into existing spare storage without a capacity check.
+    ///
+    /// # Safety
+    ///
+    /// `buf.len()` must not exceed `self.buf.capacity() - self.buf.len()`.
+    /// The input must not overlap the destination allocation's written range.
     #[inline]
     unsafe fn write_to_buffer_unchecked(&mut self, buf: &[u8]) {
         debug_assert!(buf.len() <= self.spare_capacity());
         let old_len = self.buf.len();
         let buf_len = buf.len();
         let src = buf.as_ptr();
-        // SAFETY: the caller guaranteed sufficient spare capacity, and the
-        // destination range starts at the old logical end of the vector.
+        // SAFETY: the caller guarantees sufficient spare capacity and no overlap.
+        // The exclusive borrow keeps the allocation live and stable; u8 needs
+        // no extra alignment. The copy initializes the tail before set_len.
         unsafe {
             let dst = self.buf.as_mut_ptr().add(old_len);
             core::ptr::copy_nonoverlapping(src, dst, buf_len);
@@ -353,7 +363,8 @@ impl<W: ?Sized + Write> Write for BufWriter<W> {
         // Use < instead of <= to avoid a needless trip through the buffer in some cases.
         // See `write_cold` for details.
         if buf.len() < self.spare_capacity() {
-            // SAFETY: safe by above conditional.
+            // SAFETY: the branch checked buf.len() < spare_capacity(). The
+            // input slice and exclusively borrowed writer storage do not overlap.
             unsafe {
                 self.write_to_buffer_unchecked(buf);
             }
@@ -369,7 +380,8 @@ impl<W: ?Sized + Write> Write for BufWriter<W> {
         // Use < instead of <= to avoid a needless trip through the buffer in some cases.
         // See `write_all_cold` for details.
         if buf.len() < self.spare_capacity() {
-            // SAFETY: safe by above conditional.
+            // SAFETY: the branch checked buf.len() < spare_capacity(). The
+            // input slice and exclusively borrowed writer storage do not overlap.
             unsafe {
                 self.write_to_buffer_unchecked(buf);
             }
@@ -389,6 +401,11 @@ impl<W: ?Sized + Write + Seek> Seek for BufWriter<W> {
     /// Seek to the offset, in bytes, in the underlying writer.
     ///
     /// Seeking always writes out the internal buffer before seeking.
+    ///
+    /// # Errors
+    ///
+    /// Forwards buffer-drain errors (including [`Error::WriteZero`]) or the inner
+    /// seek error. A seek error does not undo output already drained.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         self.flush_buf()?;
         self.get_mut().seek(pos)

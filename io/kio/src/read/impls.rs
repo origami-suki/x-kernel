@@ -350,6 +350,10 @@ impl BufRead for VecDeque<u8> {
     /// Returns the contents of the "front" slice as returned by
     /// [`as_slices`][`VecDeque::as_slices`]. If the contained byte slices of the `VecDeque` are
     /// discontiguous, multiple calls to `fill_buf` will be needed to read the entire content.
+    ///
+    /// # Errors
+    ///
+    /// This in-memory implementation does not return an error.
     #[inline]
     fn fill_buf(&mut self) -> Result<&[u8]> {
         let (front, _) = self.as_slices();

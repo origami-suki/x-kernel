@@ -26,6 +26,14 @@ use crate::{BufReader, BufWriter, DEFAULT_BUF_SIZE, Error, Read, Result, Write};
 /// `reader` to `writer` is returned.
 ///
 /// See [`std::io::copy`](https://doc.rust-lang.org/std/io/fn.copy.html) for more details.
+///
+/// The destination is not flushed. An endless source requires a bounded adapter.
+///
+/// # Errors
+///
+/// Forwards read and [`Write::write_all`] errors, including [`Error::WriteZero`].
+/// The generic loop retries interrupted reads; specialized paths inherit the
+/// chosen reader's error contract. Partial progress is not rolled back.
 pub fn copy<R, W>(reader: &mut R, writer: &mut W) -> Result<u64>
 where
     R: Read + ?Sized,
@@ -41,6 +49,14 @@ where
     BufferedWriterSpec::copy_from(writer, reader)
 }
 
+/// Copies until EOF using a [`DEFAULT_BUF_SIZE`]-byte stack buffer.
+///
+/// Returns the total copied count; does not flush the destination.
+///
+/// # Errors
+///
+/// Retries interrupted reads and forwards other read or [`Write::write_all`]
+/// errors. Input consumption and output before an error are not rolled back.
 pub fn stack_buffer_copy<R, W>(reader: &mut R, writer: &mut W) -> Result<u64>
 where
     R: Read + ?Sized,
@@ -204,8 +220,9 @@ impl<I: Write + ?Sized> BufferedWriterSpec for BufWriter<I> {
             let mut read_buf: BorrowedBuf<'_> = buf.spare_capacity_mut().into();
 
             #[cfg(borrowedbuf_init)]
+            // SAFETY: init tracks the initialized prefix of this spare region,
+            // adjusted after extending the vector or flushing its contents.
             unsafe {
-                // SAFETY: init is either 0 or the init_len from the previous iteration.
                 read_buf.set_init(init);
             }
 

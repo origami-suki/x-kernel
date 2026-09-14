@@ -20,7 +20,7 @@ use crate::{BufRead, Error, IoBuf, IoBufMut, Read, Result, Seek, SeekFrom, Write
 /// [`Seek`] implementation.
 ///
 /// `Cursor`s are used with in-memory buffers, anything implementing
-/// <code>[AsRef]<\[u8]></code>, to allow them to implement [`Read`] and/or [`Write`],
+/// [`AsRef<[u8]>`], to allow them to implement [`Read`] and/or [`Write`],
 /// allowing these buffers to be used anywhere you might use a reader or writer
 /// that does actual I/O.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -30,26 +30,36 @@ pub struct Cursor<T> {
 }
 
 impl<T> Cursor<T> {
+    /// Creates a cursor at byte position zero, even when `inner` is nonempty.
     pub const fn new(inner: T) -> Cursor<T> {
         Cursor { pos: 0, inner }
     }
 
+    /// Returns the owned buffer, discarding the cursor position.
     pub fn into_inner(self) -> T {
         self.inner
     }
 
+    /// Borrows the underlying buffer.
     pub const fn get_ref(&self) -> &T {
         &self.inner
     }
 
+    /// Mutably borrows the buffer without adjusting the cursor position.
     pub const fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
 
+    /// Returns the byte offset from the start of the buffer.
     pub const fn position(&self) -> u64 {
         self.pos
     }
 
+    /// Sets the byte offset without resizing the buffer. Positions beyond EOF are allowed.
+    ///
+    /// Before using `IoBuf` or `IoBufMut` capacity queries, keep the position
+    /// within the corresponding underlying remaining count; those implementations
+    /// subtract the position without saturation.
     pub const fn set_position(&mut self, pos: u64) {
         self.pos = pos;
     }
@@ -59,6 +69,7 @@ impl<T> Cursor<T>
 where
     T: AsRef<[u8]>,
 {
+    /// Returns the bytes before and after the current position, clamped to the buffer length.
     pub fn split(&self) -> (&[u8], &[u8]) {
         let slice = self.inner.as_ref();
         let pos = self.pos.min(slice.len() as u64);
@@ -70,6 +81,7 @@ impl<T> Cursor<T>
 where
     T: AsMut<[u8]>,
 {
+    /// Mutably splits the buffer at the current position, clamped to its length.
     pub fn split_mut(&mut self) -> (&mut [u8], &mut [u8]) {
         let slice = self.inner.as_mut();
         let pos = self.pos.min(slice.len() as u64);
@@ -233,8 +245,9 @@ fn reserve_and_pad(pos_mut: &mut u64, vec: &mut Vec<u8>, buf_len: usize) -> Resu
         let diff = pos - vec.len();
         let spare = vec.spare_capacity_mut();
         debug_assert!(spare.len() >= diff);
-        // Safety: we have allocated enough capacity for this.
-        // And we are only writing, not reading
+        // SAFETY: reserve above ensures capacity through pos. The exclusive
+        // spare slice is only written, and zero-fill initializes the entire
+        // gap before set_len exposes it.
         unsafe {
             spare
                 .get_unchecked_mut(..diff)
@@ -250,7 +263,9 @@ fn reserve_and_pad(pos_mut: &mut u64, vec: &mut Vec<u8>, buf_len: usize) -> Resu
 ///
 /// # Safety
 ///
-/// `vec` must have `buf.len()` spare capacity.
+/// `pos + buf.len()` must be representable and no greater than `vec.capacity()`.
+/// The input must not overlap the destination range. The vector allocation
+/// must remain live and exclusively borrowed for the copy.
 #[cfg(feature = "alloc")]
 unsafe fn vec_write_all_unchecked(pos: usize, vec: &mut Vec<u8>, buf: &[u8]) -> usize {
     debug_assert!(vec.capacity() >= pos + buf.len());
@@ -274,8 +289,9 @@ fn vec_write_all(pos_mut: &mut u64, vec: &mut Vec<u8>, buf: &[u8]) -> Result<usi
     let buf_len = buf.len();
     let mut pos = reserve_and_pad(pos_mut, vec, buf_len)?;
 
-    // Safety: we have ensured that the capacity is available
-    // and that all bytes get written up to pos
+    // SAFETY: reserve_and_pad establishes capacity and initializes any gap
+    // up to pos. The input does not alias the exclusively borrowed vector.
+    // The copy initializes the remaining bytes before the length is extended.
     unsafe {
         pos = vec_write_all_unchecked(pos, vec, buf);
         if pos > vec.len() {

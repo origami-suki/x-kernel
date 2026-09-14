@@ -13,6 +13,16 @@ use crate::{BufReader, BufWriter, DEFAULT_BUF_SIZE, IoBuf, IoBufMut, Read, Resul
 
 /// Extension methods for [`IoBuf`].
 pub trait IoBufExt: Read + IoBuf {
+    /// Transfers one chunk to `writer`, returning its accepted byte count.
+    ///
+    /// The generic path reads at most [`DEFAULT_BUF_SIZE`] bytes, then writes once.
+    /// A short write can discard the unread remainder of that temporary chunk.
+    /// The slice specialization does not advance the source slice; `VecDeque` and
+    /// `BufReader` consume only the accepted bytes. This is not [`crate::copy`].
+    ///
+    /// # Errors
+    ///
+    /// Forwards read/write errors without retry or rollback.
     #[inline]
     fn write_to<W: Write + ?Sized>(&mut self, writer: &mut W) -> Result<usize> {
         IoBufSpec::write_to(self, writer)
@@ -24,6 +34,17 @@ impl<T: Read + IoBuf + ?Sized> IoBufExt for T {}
 /// Extension methods for [`IoBufMut`].
 pub trait IoBufMutExt: Write + IoBufMut {
     /// Reads some bytes from `reader` and writes them into this buffer.
+    ///
+    /// The generic path uses one stack-buffer read and one write, bounded by
+    /// `remaining_mut` and [`DEFAULT_BUF_SIZE`]; short writes can lose consumed input.
+    /// The mutable-slice specialization does not shorten the destination slice.
+    /// Vector and `BufWriter` specializations fill only existing spare capacity,
+    /// without reserving or flushing; initialized bytes remain even on error.
+    /// For a `BorrowedCursor`, success returns its cumulative `written()` count.
+    ///
+    /// # Errors
+    ///
+    /// Forwards read/write errors without retry or rollback.
     #[inline]
     fn read_from<R: Read + ?Sized>(&mut self, reader: &mut R) -> Result<usize> {
         IoBufMutSpec::read_from(self, reader)

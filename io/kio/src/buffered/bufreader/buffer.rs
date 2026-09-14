@@ -44,6 +44,13 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Creates an empty read buffer with `capacity` bytes of storage.
+    ///
+    /// # Panics
+    ///
+    /// Without `alloc`, panics if `capacity` exceeds [`crate::DEFAULT_BUF_SIZE`].
+    /// With `alloc`, panics on allocation size overflow; allocation failure follows
+    /// the allocator's failure policy.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         #[cfg(feature = "alloc")]
@@ -52,6 +59,8 @@ impl Buffer {
         let buf = {
             let mut buf = Vec::new();
             assert!(capacity <= buf.capacity());
+            // SAFETY: capacity was checked against inline storage, and each new
+            // element is MaybeUninit<u8>, which permits uninitialized contents.
             unsafe { buf.set_len(capacity) };
             buf
         };
@@ -64,10 +73,12 @@ impl Buffer {
         }
     }
 
+    /// Returns the initialized, unread bytes without reading from the underlying source.
     #[inline]
     pub fn buffer(&self) -> &[u8] {
-        // SAFETY: self.pos and self.filled are valid, and self.filled => self.pos, and
-        // that region is initialized because those are all invariants of this type.
+        // SAFETY: the buffer invariant is pos <= filled <= capacity, with all
+        // bytes below filled initialized. The shared borrow prevents mutation
+        // for the lifetime of the returned slice.
         unsafe {
             self.buf
                 .get_unchecked(self.pos..self.filled)
@@ -157,6 +168,20 @@ impl Buffer {
         self.pos = 0;
     }
 
+    /// Returns unread bytes, reading from `reader` once if the buffer is exhausted.
+    ///
+    /// A successful empty slice indicates no bytes were read, including at EOF or
+    /// with zero capacity. Bytes filled before a read error remain buffered.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`Read::read_buf`] errors, including [`crate::Error::Interrupted`],
+    /// without retrying. Existing unread bytes are returned without invoking `reader`.
+    ///
+    /// # Panics
+    ///
+    /// With debug assertions enabled, panics if the internal read position exceeds
+    /// the filled length, violating the buffer invariant.
     #[inline]
     pub fn fill_buf(&mut self, mut reader: impl Read) -> Result<&[u8]> {
         // If we've reached the end of our internal buffer then we need to fetch
@@ -171,7 +196,8 @@ impl Buffer {
             #[cfg(not(feature = "alloc"))]
             let mut buf = BorrowedBuf::from(self.buf.as_mut_slice());
             #[cfg(borrowedbuf_init)]
-            // SAFETY: `self.filled` bytes will always have been initialized.
+            // SAFETY: `self.initialized` records the initialized prefix of the
+            // same backing storage; it is bounded by the buffer capacity.
             unsafe {
                 buf.set_init(self.initialized);
             }

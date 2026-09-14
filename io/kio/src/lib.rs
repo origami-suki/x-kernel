@@ -38,6 +38,6 @@ pub use self::{buffered::*, iobuf::*, read::*, seek::*, utils::*, write::*};
 pub struct PollState {
     /// Object can be read now.
     pub readable: bool,
-    /// Object can be writen now.
+    /// Object can be written now.
     pub writable: bool,
 }
