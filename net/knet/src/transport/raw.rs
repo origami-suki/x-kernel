@@ -19,7 +19,7 @@ use smoltcp::{
     iface::SocketHandle,
     socket::raw as smol,
     storage::PacketMetadata,
-    wire::{IpAddress, IpListenEndpoint, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr},
+    wire::{IpAddress, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr},
 };
 
 use crate::{
@@ -59,7 +59,6 @@ impl RawSocket {
     pub fn new(ip_version: IpVersion, ip_protocol: IpProtocol) -> Self {
         let dispatch_irq = SOCKET_SET.add(new_raw_socket(ip_version, ip_protocol));
         let general = GeneralOptions::new();
-        general.set_device_mask(u32::MAX);
         Self {
             dispatch_irq,
             ip_version,
@@ -166,15 +165,6 @@ impl SocketOps for RawSocket {
         let local_addr = local_addr.into_ip()?;
         let local = self.check_ip_version(local_addr.ip().into())?;
         *self.local_addr.write() = Some(local);
-        let device_mask = if local.is_unspecified() {
-            u32::MAX
-        } else {
-            SERVICE.smoltcp_device_mask_for(&IpListenEndpoint {
-                addr: Some(local),
-                port: 0,
-            })
-        };
-        self.general.set_device_mask(device_mask);
         Ok(())
     }
 
@@ -185,11 +175,6 @@ impl SocketOps for RawSocket {
             *self.local_addr.write() = Some(SERVICE.get_smoltcp_source_address(&remote)?);
         }
         *self.peer_addr.write() = Some(remote);
-        self.general
-            .set_device_mask(SERVICE.smoltcp_device_mask_for(&IpListenEndpoint {
-                addr: Some(remote),
-                port: 0,
-            }));
         Ok(())
     }
 

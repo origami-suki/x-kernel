@@ -20,17 +20,14 @@ use ktime_types::{MonotonicInstant, TimeSpan};
 use smoltcp::{
     iface::{Interface, PollIngressSingleResult, PollResult, SocketSet},
     time::Instant as SmoltcpInstant,
-    wire::{
-        HardwareAddress, IpAddress as SmoltcpIpAddress, IpCidr as SmoltcpIpCidr,
-        IpListenEndpoint as SmoltcpIpListenEndpoint,
-    },
+    wire::{HardwareAddress, IpAddress as SmoltcpIpAddress, IpCidr as SmoltcpIpCidr},
 };
 
 use crate::{
     LISTEN_TABLE, SOCKET_SET,
     buf::PacketBuf,
     device::{LinkConfigUpdate, LinkSendSnapshot, LinkSnapshot, NeighborUpdate},
-    ip::{IpAddress, IpListenEndpoint},
+    ip::IpAddress,
     poller::{PollBudget, PollProgress},
     router::{NeighborUpdatePolicy, Router, Rule},
     stack::ingress::{IngressProcessor, prepare_smoltcp_ingress},
@@ -508,22 +505,6 @@ impl Service {
             .map(super::to_smoltcp_ip_address)
     }
 
-    pub fn smoltcp_device_mask_for(&self, endpoint: &SmoltcpIpListenEndpoint) -> u32 {
-        match endpoint.addr {
-            Some(addr) => self.smoltcp_device_mask_for_addr(&addr),
-            None => u32::MAX,
-        }
-    }
-
-    pub fn smoltcp_device_mask_for_addr(&self, addr: &SmoltcpIpAddress) -> u32 {
-        let addr = super::from_smoltcp_ip_address(*addr);
-        self.router
-            .lock()
-            .table
-            .lookup(&addr)
-            .map_or(u32::MAX, |rule| 1u32 << rule.dev)
-    }
-
     pub fn get_source_address(&self, dst_addr: &IpAddress) -> KResult<IpAddress> {
         self.router.lock().output_route_source(dst_addr, 0)
     }
@@ -578,21 +559,6 @@ impl Service {
         } else {
             router.queue_ipv4_packet(packet, oif)
         }
-    }
-
-    pub fn device_mask_for(&self, endpoint: &IpListenEndpoint) -> u32 {
-        match endpoint.addr {
-            Some(addr) => self.device_mask_for_addr(&addr),
-            None => u32::MAX,
-        }
-    }
-
-    pub fn device_mask_for_addr(&self, addr: &IpAddress) -> u32 {
-        self.router
-            .lock()
-            .table
-            .lookup(addr)
-            .map_or(u32::MAX, |rule| 1u32 << rule.dev)
     }
 
     pub fn register_rx_waker(

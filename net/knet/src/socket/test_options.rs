@@ -237,32 +237,15 @@ fn test_bindtodevice_option_default_and_unbind() {
 }
 
 #[def_test]
-fn test_bindtodevice_unbind_restores_addr_device_mask() {
+fn test_bindtodevice_unbind_uses_all_devices() {
     use crate::socket::general::GeneralOptions;
     let opts = GeneralOptions::new();
-    opts.apply_bound_device_mask(0b0110);
-    assert_eq!(opts.device_mask(), 0b0110);
-
+    assert_eq!(opts.rx_device_mask(), u32::MAX);
     opts.set_bound_dev_if_for_test(3);
-    opts.apply_bound_device_mask(0b0110);
-    assert_eq!(opts.device_mask(), 0b0100);
+    assert_eq!(opts.rx_device_mask(), 0b0100);
 
     opts.set_option_inner(SetSocketOption::BindToDevice(&None))
         .unwrap();
     assert_eq!(opts.bound_dev_if(), 0);
-    assert_eq!(opts.device_mask(), 0b0110);
-}
-
-#[def_test]
-fn test_bindtodevice_unbind_without_addr_mask_uses_all_devices() {
-    use crate::socket::general::GeneralOptions;
-    let opts = GeneralOptions::new();
-    opts.set_bound_dev_if_for_test(1);
-    opts.apply_bound_device_mask(u32::MAX);
-    assert_eq!(opts.device_mask(), 1);
-
-    opts.set_option_inner(SetSocketOption::BindToDevice(&None))
-        .unwrap();
-    assert_eq!(opts.bound_dev_if(), 0);
-    assert_eq!(opts.device_mask(), u32::MAX);
+    assert_eq!(opts.rx_device_mask(), u32::MAX);
 }

@@ -215,6 +215,10 @@ impl UdpSocketState {
         )
     }
 
+    /// Registers socket-local data, error and shutdown notifications.
+    ///
+    /// Receive subscriptions remain valid across address and device changes;
+    /// ingress applies the current binding before enqueueing and waking readers.
     pub(crate) fn register_waiter(
         &self,
         context: &mut PollContext<'_>,
@@ -242,17 +246,6 @@ impl UdpSocketState {
     #[cfg(unittest)]
     pub(crate) fn set_bound_dev_if_for_test(&self, ifindex: i32) {
         self.options.set_bound_dev_if_for_test(ifindex);
-    }
-
-    pub(crate) fn set_device_mask(&self, mask: u32) {
-        self.options.apply_bound_device_mask(mask);
-    }
-
-    pub(crate) fn register_rx_waker(
-        &self,
-        context: &mut PollContext<'_>,
-    ) -> Result<(), PollRegisterError> {
-        self.options.register_rx_waker(context).map(|_| ())
     }
 
     pub(crate) fn register_tx_waker(

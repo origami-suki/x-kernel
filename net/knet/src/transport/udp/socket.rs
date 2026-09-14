@@ -108,8 +108,7 @@ impl UdpSocket {
         let reuse_address = self.state().reuse_address();
         registry::bind_udp_pcb(self.pcb.clone(), local_endpoint, reuse_address)?;
         let endpoint = registry::listen_endpoint(local_endpoint);
-        self.state()
-            .set_device_mask(SERVICE.device_mask_for(&endpoint));
+
         info!("UDP socket: bound on {}", endpoint);
         Ok(())
     }
@@ -125,8 +124,7 @@ impl UdpSocket {
             Ipv4Address::UNSPECIFIED.into(),
             reuse_address,
         )?;
-        self.state()
-            .set_device_mask(SERVICE.device_mask_for(&registry::listen_endpoint(endpoint)));
+
         info!(
             "UDP socket: bound on {}",
             registry::listen_endpoint(endpoint)
@@ -138,16 +136,11 @@ impl UdpSocket {
         self.state().set_peer_endpoint(None);
         self.state().clear_error_queue();
         if registry::is_udp_pcb_explicitly_bound(&self.pcb) {
-            if let Some(local) = self.state().local_endpoint() {
-                self.state()
-                    .set_device_mask(SERVICE.device_mask_for(&registry::listen_endpoint(local)));
-            }
             return;
         }
 
         registry::unregister_udp_pcb(&self.pcb);
         self.state().set_local_endpoint(None);
-        self.state().set_device_mask(0);
     }
 
     fn send_reader(
@@ -396,8 +389,7 @@ impl SocketOps for UdpSocket {
                 local_addr.ip().into(),
                 reuse_address,
             )?;
-            self.state()
-                .set_device_mask(SERVICE.device_mask_for(&registry::listen_endpoint(endpoint)));
+
             info!(
                 "UDP socket: bound on {}",
                 registry::listen_endpoint(endpoint)
@@ -428,8 +420,7 @@ impl SocketOps for UdpSocket {
         let source_addr = self.source_addr_for(remote_endpoint.addr)?;
         self.state()
             .set_peer_endpoint(Some((remote_endpoint, source_addr)));
-        self.state()
-            .set_device_mask(SERVICE.device_mask_for_addr(&remote_endpoint.addr));
+
         debug!("UDP socket: connected to {}", remote_endpoint);
         Ok(())
     }
@@ -588,14 +579,12 @@ impl Pollable for UdpSocket {
         context: &mut PollContext<'_>,
         events: IoEvents,
     ) -> Result<(), PollRegisterError> {
-        if events.intersects(IoEvents::IN | IoEvents::RDNORM | IoEvents::RDBAND) {
-            self.state().register_rx_waker(context)?;
-        }
         if events.intersects(IoEvents::OUT | IoEvents::WRNORM | IoEvents::WRBAND) {
             self.state().register_tx_waker(context)?;
         }
-        // Network progress and socket-local state changes use separate wake
-        // sources, so a read-write waiter is intentionally registered in both.
+        // RX processing runs independently through NetRx and the task poller.
+        // Enqueue, errors and shutdown notify this socket's wait sets, so read
+        // waiters need no device RX or shared protocol-timer subscription.
         if events.intersects(
             IoEvents::IN
                 | IoEvents::RDNORM
@@ -622,10 +611,113 @@ impl Drop for UdpSocket {
 
 #[cfg(unittest)]
 mod tests {
-    use ::core::net::{Ipv4Addr, SocketAddrV4};
+    use alloc::task::Wake;
+
+    use ::core::{
+        net::{Ipv4Addr, SocketAddrV4},
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Waker},
+    };
+    use kpoll::PollRegistrations;
     use unittest::def_test;
 
     use super::{super::output::has_valid_udp_checksum, *};
+    use crate::{
+        buf::{PacketBuf, PacketOwner},
+        udp::{InputDisposition, PreparedUdpPacket, deliver_ipv4_packet},
+    };
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn received_packet(ifindex: i32, local: IpEndpoint) -> PreparedUdpPacket {
+        let remote = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 2), 4321).into();
+        let packet = PacketBuf::from_ip_packet_vec(ifindex, vec![42], PacketOwner::Ipv4Stack);
+        PreparedUdpPacket::new(packet, 0, 1, local.into(), remote).unwrap()
+    }
+
+    // Serial: exercises the shared UDP registry; socket Drop unregisters both PCBs.
+    #[def_test(serial)]
+    fn receive_waiter_isolated_from_other_sockets_and_device_binding_changes() {
+        let socket = UdpSocket::new();
+        let other = UdpSocket::new();
+        let local_addr = Ipv4Address::new(192, 0, 2, 1).into();
+        let local =
+            registry::bind_udp_auto_ephemeral_pcb(socket.pcb.clone(), local_addr, false).unwrap();
+        let other_local =
+            registry::bind_udp_auto_ephemeral_pcb(other.pcb.clone(), local_addr, false).unwrap();
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(counter.clone());
+        let context = Context::from_waker(&waker);
+        let mut registrations = PollRegistrations::new();
+        socket
+            .register(&mut registrations.context(&context), IoEvents::IN)
+            .unwrap();
+
+        assert_eq!(
+            deliver_ipv4_packet(received_packet(2, other_local)).0,
+            InputDisposition::Accepted
+        );
+        assert!(other.pcb.has_recv_data());
+        assert!(!socket.pcb.has_recv_data());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+
+        socket.state().set_bound_dev_if_for_test(1);
+        let (disposition, rejected) = deliver_ipv4_packet(received_packet(2, local));
+        assert_eq!(disposition, InputDisposition::NoSocket);
+        drop(rejected);
+        socket.state().set_bound_dev_if_for_test(0);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+
+        // The original read subscription remains valid after unbinding, even
+        // when a matching datagram arrives through a different interface.
+        assert_eq!(
+            deliver_ipv4_packet(received_packet(2, local)).0,
+            InputDisposition::Accepted
+        );
+        assert!(socket.pcb.has_recv_data());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+
+        socket
+            .register(&mut registrations.context(&context), IoEvents::IN)
+            .unwrap();
+        drop(registrations);
+        assert_eq!(
+            deliver_ipv4_packet(received_packet(1, local)).0,
+            InputDisposition::Accepted
+        );
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[def_test]
+    fn receive_waiter_observes_errors_and_shutdown() {
+        let socket = UdpSocket::new();
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(counter.clone());
+        let context = Context::from_waker(&waker);
+        let mut registrations = PollRegistrations::new();
+        for events in [IoEvents::IN, IoEvents::RDNORM, IoEvents::RDBAND] {
+            socket
+                .register(&mut registrations.context(&context), events)
+                .unwrap();
+            socket.state().record_socket_error(LinuxError::ECONNREFUSED);
+            assert_eq!(counter.0.swap(0, Ordering::Relaxed), 1);
+            assert!(socket.state().take_socket_error().is_some());
+        }
+
+        socket
+            .register(&mut registrations.context(&context), IoEvents::IN)
+            .unwrap();
+        socket.state().shutdown(Shutdown::Read);
+        assert!(socket.state().is_read_shutdown());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+    }
 
     #[def_test]
     fn error_msg_trunc_returns_original_payload_len() {

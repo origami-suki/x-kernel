@@ -141,7 +141,7 @@ core/kruntime
 | `transport::udp` | 维护 UDP PCB registry、接收队列、bind 与 connect 状态、校验和、socket option、异步错误和 IPv4 收发，并提供持久化 `UdpDatagramRelay` |
 | `SocketSetWrapper` | 串行化 smoltcp socket set 与 TCP deferred-close 元数据访问，并在新增 socket 时通知等待者 |
 | `ListenTable` | 管理 TCP listen backlog、SYN 队列、accept 队列和 accept waker |
-| `GeneralOptions` | 统一管理 nonblock、reuseaddr、超时和设备 mask |
+| `GeneralOptions` | 统一管理 nonblock、reuseaddr、超时和设备绑定 |
 | `SocketOps` | 上层 socket syscall 使用的统一操作接口 |
 | `netlink` | 提供 AF_NETLINK socket、kobject uevent 和有限 rtnetlink 协议适配，查询各 owner 的实时快照并把 mutation 交给对应 owner |
 | `unix` | 提供 Unix domain stream 与 datagram transport；pathname 地址通过 kvfs 查找或创建 socket inode |
@@ -466,7 +466,9 @@ Loopback UDP 独立于 poller 执行权，发送路径在 BH 窗口内完成 xmi
 - Unix stream 的 listener event 通知在 `ListenerState` 和源 socket `channel` 锁外执行；用户数据复制和 `PollSet` 唤醒在 `tx_order` 外执行。send 先写入未发布的 vacant 区域，再在锁内复检关闭状态并推进 write index；recv 读取为空后在锁内复查 occupied 长度和关闭状态；shutdown 完成状态发布并复制 peer endpoint 引用后释放 `channel` mutex，再执行 waiter 唤醒。
 - Unix stream 每个 endpoint 分别持有 readable、writable 和 connection-state 三组 `PollSet`。写入只唤醒 peer readable waiter，读取跨过发送缓冲低水位时只唤醒 peer writable waiter，半关闭只唤醒受影响方向，完整关闭通过 connection-state waiter 通知双方。
 - Router 直接持有配置路由、地址派生路由和动态选源状态，设备直接持有邻居表，netlink 仅承担协议解析、实时快照编码和 owner 调用。`control::network_config_lock` 串行化不同 socket 的控制面 mutation、legacy socket ioctl mutation 和 `unregister_netdev`。每个 socket 的发送事务、rx queue 和 subscriber 列表使用独立 `Mutex`。发送事务锁串行化同一 socket 的容量预检、mutation 执行和 response 入队。response 在 rx queue 锁外生成，只在容量检查和入队时持锁；锁顺序固定为发送事务锁、`network_config_lock`、Router、ingress、Interface、netlink rx queue，未涉及的锁按该序列跳过。
-- RX waker 由 `GeneralOptions::device_mask` 指向相关设备。该掩码是地址派生掩码与 `SO_BINDTODEVICE` 的交集；解绑设备时恢复地址派生掩码，而不是无条件改成全设备。`Service::register_rx_waker` 使用调用方传入的同一个 `PollContext` 注册聚合 `timeout_poll` 和支持 interrupt-driven RX 的 Ethernet RX poll source；当前该 poll source 由 `NetRx` softirq 在设备 pending 后唤醒，普通 socket polling waiter 可以通过该 source 被唤醒，后台协议推进则由同一 softirq 调度的 `knet-poller` work 执行。registration 由跨越 `Pending` 的 `PollRegistrations` 统一管理。loopback 和未 attach `NetRxScheduler` 的 Ethernet 设备仍使用 `timeout_poll` 的聚合 waker，多任务广播由 `timeout_poll` 完成；设备层不得保存调用方的裸 waker或绕过 `Service` 注册互不等价的 task waker。
+- `GeneralOptions` 使用唯一的 `bound_dev_if: AtomicI32` 保存设备绑定。UDP 接收匹配与发送、TCP/raw 的 RX 设备选择通过 Relaxed 读取取得设备编号，单字段读取允许观察并发更新前或更新后的值。绑定与解绑通过原子交换更新，实际变化后调用 `device_binding_changed: PollEvent` 广播通知；事件版本的 Release/Acquire 发布先前的标量更新。交换后尚未通知的写入会在通知时唤醒已注册 waiter。RX 注册先读取事件版本，再读取设备编号并注册设备源和配置事件，最后复查版本；注册窗口内的变化触发当前 waiter 重查，等待期间的变化触发重新注册。每轮 `PollRegistrations` 替换旧设备注册，取消或结束等待同时撤销配置事件订阅。重复写入相同设备编号保持静默。
+- TCP 与 raw IP 的 RX waker 由 `GeneralOptions::rx_device_mask` 选择设备。显式 `SO_BINDTODEVICE` 选择对应设备，默认与解绑状态选择全部设备。socket 地址与路由变化保持 RX 选择独立，报文交付由协议接收路径过滤。`Service::register_rx_waker` 使用调用方传入的同一个 `PollContext` 注册聚合 `timeout_poll` 和支持 interrupt-driven RX 的 Ethernet RX poll source；当前该 poll source 由 `NetRx` softirq 在设备 pending 后唤醒，TCP 与 raw IP 的 waiter 可以通过该 source 被唤醒，后台协议推进则由同一 softirq 调度的 `knet-poller` work 执行。registration 由跨越 `Pending` 的 `PollRegistrations` 统一管理。loopback 和未 attach `NetRxScheduler` 的 Ethernet 设备仍使用 `timeout_poll` 的聚合 waker，多任务广播由 `timeout_poll` 完成；设备层只接收 `Service` 提供的聚合 source waker。
+- UDP 纯接收等待只订阅 `UdpSocketWaiters` 的 socket 事件，接收队列入队、异步错误和读关闭分别唤醒对应 waiter。地址绑定和 `SO_BINDTODEVICE` 在 UDP lookup 中过滤报文，绑定变化期间原有接收订阅保持有效。Ethernet RX softirq 独立调度 `knet-poller`，loopback 完整 UDP 在 `NetRx` 或发送路径的 task fallback 中入队；其余 loopback 工作由发送方的 TX 通知推进，协议及分片重组 timer 到期后独立通知后台 poller。接收 waiter 因此与设备 RX 广播及聚合 `timeout_poll` 解耦，同一设备上其他 socket 的流量也保持隔离。发送等待继续订阅网络进展事件，包含读写两个方向的等待保留 TX 所需的设备和 timer 订阅。所有 socket 事件注册由 `PollRegistrations` 持有，并在注册后复查就绪状态。
 - 每次 `Interface::poll` 也会刷新独立的协议 timer，使 TCP 重传等 deadline 不依赖阻塞中的 socket waiter。
 
 ## 设计决策
@@ -510,12 +512,12 @@ POSIX send 和 socket file write 在各自入口区分协议，仅在 netlink �
 
 ### 设备 mask 驱动 RX 唤醒
 
-每个 socket 根据 bind 或 connect 结果记录设备 mask。
+每个 socket 根据 `SO_BINDTODEVICE` 派生 RX 设备 mask，默认与解绑状态选择全部设备。
 等待 RX 时只向相关设备注册 waker，同时注册 smoltcp poll timeout。
 smoltcp `poll_at` 使用传入 timestamp 的同一 epoch 返回期限；兼容边界在
 `SmoltcpInstant` 与 `MonotonicInstant` 之间直接映射时间点。过期的 smoltcp deadline
 因此仍是过期的单调 deadline，不再计算有符号 delay，也不会经过 `as u64` 窄化。
-这个设计减少无关设备中断唤醒，但依赖路由和地址同步保持 mask 准确。
+显式设备绑定收窄设备 RX 订阅；默认状态接受额外的无关设备唤醒，并由实际 readiness 决定用户可见事件。地址绑定、连接与路由变化保持设备选择独立。UDP 已在 demux 检查绑定设备，TCP/raw 的绑定设备过滤及 IPv6 scope 完整语义仍属单独的协议兼容性工作。
 
 ### 后续 Ethernet NetRx direct progress 里程碑
 
