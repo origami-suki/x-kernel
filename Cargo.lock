@@ -2694,7 +2694,6 @@ dependencies = [
 name = "kplat-loongarch64"
 version = "0.2.0-rc2"
 dependencies = [
- "chrono",
  "console-driver",
  "kaddr_layout",
  "karch",
@@ -2715,6 +2714,7 @@ dependencies = [
  "loongArch64",
  "memspace",
  "of",
+ "rtc-driver",
  "unittest",
 ]
 
@@ -4492,8 +4492,10 @@ name = "rtc-driver"
 version = "0.2.0-rc2"
 dependencies = [
  "arm_pl031",
+ "chrono",
  "khal",
  "ktime_types",
+ "log",
  "memspace",
  "of",
  "riscv_goldfish",

@@ -17,6 +17,9 @@ independent of timer queues and system timekeeping policy.
 - `src/pl031.rs` samples an ARM PL031 MMIO RTC.
 - `src/goldfish.rs` samples a Goldfish MMIO RTC.
 - `src/cmos.rs` samples the x86 platform RTC through its port-I/O backend.
+- `src/ls7a.rs` samples the Loongson LS7A RTC TOY counters. The year and
+  date/time halves are read non-atomically, so it re-samples until the year
+  is stable to avoid pairing an old year with a new-year date.
 
 ```text
 firmware/platform description -> RtcConfig -> mapping -> device sample
@@ -51,3 +54,12 @@ the correlation published by `ktime`.
   different wall-clock value.
 - Missing RTCs are reported with `Option`; each platform decides whether that
   condition is fatal or whether epoch-plus-uptime fallback is acceptable.
+- The LS7A TOY counters are not read atomically; a torn sample straddling
+  new-year is avoided by re-reading until the year halves agree (a normal
+  crossing resolves on the next sample), and a year that never stabilizes
+  rejects the read with `None` (logged) so each platform applies its own
+  failed-sample policy instead of publishing a torn value.
+- LS7A TOY bit fields are wider than the valid calendar ranges, so register
+  contents that decode to no real timestamp (e.g. month or day 0) are
+  rejected with `None` instead of panicking; each platform decides whether
+  that is fatal or acceptable.

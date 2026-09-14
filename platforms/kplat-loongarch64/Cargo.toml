@@ -13,11 +13,10 @@ ignored = ["kcpu", "kspin"]
 
 [features]
 fp-simd = ["kcpu/fp-simd", "kernel_boot/fp-simd"]
-rtc = ["dep:chrono"]
+rtc = ["rtc_driver/ls7a"]
 smp = ["kplat/smp", "kspin/smp"]
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, optional = true }
 console_driver = { workspace = true, features = ["ns16550-mmio"] }
 kspin = { workspace = true }
 lazyinit = "0.2"
@@ -38,6 +37,7 @@ kplat = { workspace = true }
 kbuild_config = { workspace = true }
 kernel_boot = { workspace = true }
 memspace = { workspace = true }
+rtc_driver = { workspace = true }
 unittest = { workspace = true }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]

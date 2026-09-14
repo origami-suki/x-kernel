@@ -14,9 +14,15 @@ use ktime_types::SystemTime;
 mod cmos;
 #[cfg(feature = "goldfish")]
 mod goldfish;
+#[cfg(feature = "ls7a")]
+mod ls7a;
 #[cfg(feature = "pl031")]
 mod pl031;
 
+// The `cmos` gate mirrors the callers below: `cmos.rs` also normalizes its
+// raw seconds through this helper, and without the gate an x86_64 build that
+// enables only `cmos` would fail to resolve it.
+#[cfg(any(feature = "pl031", feature = "goldfish", feature = "cmos", unittest))]
 fn system_time_from_unsigned_seconds(seconds: u64) -> Option<SystemTime> {
     i64::try_from(seconds)
         .ok()
@@ -32,6 +38,8 @@ pub enum RtcKind {
     Pl031,
     /// PC-compatible CMOS RTC.
     Cmos,
+    /// Loongson LS7A RTC (LS7A bridge TOY counters).
+    Ls7a,
 }
 
 /// Transport used to access an RTC device.
@@ -169,6 +177,7 @@ pub fn read_from_device_tree() -> Option<SystemTime> {
                 RtcKind::Goldfish => "goldfish-rtc",
                 RtcKind::Pl031 => "pl031",
                 RtcKind::Cmos => "rtc",
+                RtcKind::Ls7a => "ls7a-rtc",
             };
             RtcConfig::mmio_mapped(
                 kind,
@@ -197,6 +206,8 @@ pub fn read(config: RtcConfig) -> Option<SystemTime> {
         (RtcKind::Pl031, RtcTransport::MmioMapped { vaddr }) => pl031::read_mapped(vaddr),
         #[cfg(all(feature = "cmos", target_arch = "x86_64"))]
         (RtcKind::Cmos, RtcTransport::Platform) => cmos::read_platform(),
+        #[cfg(feature = "ls7a")]
+        (RtcKind::Ls7a, RtcTransport::MmioMapped { vaddr }) => ls7a::read_mapped(vaddr),
         (kind, transport) => {
             panic!("unsupported rtc configuration: kind={kind:?} transport={transport:?}");
         }
