@@ -530,6 +530,33 @@ fn test_thread_signal_manager_send_signal_ignored_and_blocked_paths() {
 }
 
 #[def_test]
+fn test_send_signal_default_continue_is_implicitly_ignored() {
+    let thread = new_thread_manager();
+
+    // A default-disposition SIGCONT acts as an implicit ignore (Linux
+    // SIG_KERNEL_IGNORE_MASK): it must be dropped instead of queued, so it
+    // cannot wake interruptible waiters out of nanosleep- or poll-style waits.
+    assert!(!thread.send_signal(SignalInfo::new_kernel(Signo::SIGCONT)));
+    assert!(!thread.pending().has(Signo::SIGCONT));
+    assert_eq!(
+        thread
+            .process()
+            .send_signal(SignalInfo::new_kernel(Signo::SIGCONT)),
+        None
+    );
+    assert!(!thread.process().pending().has(Signo::SIGCONT));
+
+    // A blocked SIGCONT still becomes pending: userspace may install a
+    // handler before unblocking it.
+    let mut set = SignalSet::default();
+    set.add(Signo::SIGCONT);
+    thread.set_blocked(set);
+
+    assert!(!thread.send_signal(SignalInfo::new_kernel(Signo::SIGCONT)));
+    assert!(thread.pending().has(Signo::SIGCONT));
+}
+
+#[def_test]
 fn test_process_signal_manager_can_restart_and_signal_ignored() {
     let thread = new_thread_manager();
     let proc = thread.process();

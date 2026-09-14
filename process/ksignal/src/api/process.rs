@@ -188,7 +188,9 @@ impl ProcessSignalManager {
     ///
     /// Ignored signals are dropped only when no live thread currently blocks
     /// them. If a signal is blocked, it remains pending because userspace may
-    /// install a handler before unblocking it.
+    /// install a handler before unblocking it. The implicitly ignored set
+    /// covers default dispositions whose action is a no-op for a running
+    /// process (Linux `SIG_KERNEL_IGNORE_MASK`), including default `SIGCONT`.
     #[must_use]
     pub fn send_signal(&self, sig: SignalInfo) -> Option<u32> {
         let signo = sig.signo();
@@ -227,7 +229,18 @@ pub(super) fn signal_ignored_by(actions: &SignalActions, signo: Signo) -> bool {
     match &actions[signo].disposition {
         SignalDisposition::Ignore => true,
         SignalDisposition::Default => {
-            matches!(signo.default_action(), DefaultSignalAction::Ignore)
+            // Mirrors Linux's SIG_KERNEL_IGNORE_MASK {SIGCONT, SIGCHLD,
+            // SIGWINCH, SIGURG}: SIGCONT classifies as `Continue` rather than
+            // `Ignore`, but its default action only resumes a stopped process
+            // and has no effect on a running one. Treating the default
+            // disposition as ignored keeps a default SIGCONT from being queued
+            // and from waking interruptible waiters; otherwise a timer- or
+            // kill-sent SIGCONT spuriously aborts nanosleep- and poll-style
+            // waits that Linux lets run to completion.
+            matches!(
+                signo.default_action(),
+                DefaultSignalAction::Ignore | DefaultSignalAction::Continue
+            )
         }
         _ => false,
     }
