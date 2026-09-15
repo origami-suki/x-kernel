@@ -33,8 +33,11 @@
   只有 `Resolved` 和 retry-class outcome 可以转换为 trap handled；unmapped、
   permission denied、bus error、OOM、no-progress 和 generic failure 必须转换为
   user-copy / atomic-user 失败，而不是继续重试。
-- 普通复制在 resolved 后再次失败时返回 `NoAccess`，不会把部分初始化缓冲区
-  报告为完整成功；读写分别使用 READ/WRITE fault 权限，不能绕过只读映射。
+- 普通复制允许同一页在 resolved 后继续缺页，以完成分阶段映射和写权限准备。
+  每页的全部缺页处理调用共用 16 次预算，包括 resolved 和 retry-class outcome；
+  显式 `NoProgress` 立即失败，预算耗尽仍不能复制则返回 `NoAccess`。
+  不能把部分初始化缓冲区报告为完整成功；读写分别使用 READ/WRITE fault 权限，
+  不能绕过只读映射。
 - 字符串 helper 只在成功读取完整字节流后再做 UTF-8 解释。
 
 ## 线程安全

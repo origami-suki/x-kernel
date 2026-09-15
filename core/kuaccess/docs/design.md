@@ -52,9 +52,16 @@ syscall / runtime
 4. 普通复制不打开 trap 内回填窗口。缺页时通过 exception-table fixup 返回，
    随后在调用任务中调用当前进程的 `MmSpace::handle_page_fault()`。这样不会在
    IRQ 被屏蔽的异常上下文里等待 IRQ 驱动的磁盘完成。
-5. `Resolved` 后重试当前页复制；retry-class outcome 重新进行 fault 处理；
+5. 使用单一进度循环，每轮先尝试复制当前页片段：成功则推进 offset 并重置
+   当前页的缺页次数；失败则最多处理一次缺页，再进入下一轮复制。
+   `Resolved`、`Retry` 和 `CowConflictRetry` 都允许重试复制；
    unmapped、permission、bus、OOM、no-progress 和 generic failure 返回 `NoAccess`。
-6. 回填后复制仍失败（如并发撤销映射）时返回 `NoAccess`，不无限重试。
+6. `Resolved` 后复制仍失败时继续处理当前页缺页，允许共享文件的
+   “未映射 → 只读 PTE → 可写 PTE”分阶段完成。每个用户页最多调用缺页处理
+   16 次，`Resolved` 和 retry-class outcome 共用该预算，下一页重新计数。
+   预算耗尽后复制仍失败则返回 `NoAccess`，防止后端反复报告成功或重试却
+   无实际进展时无限循环。该上限是防止无限重试的策略，并非通过次数判断 PTE 进展；
+   持续并发修改映射也可能耗尽预算并导致失败。
    已映射页不需要取得地址空间锁；成功返回保证全部输出已初始化。
 
 ### 用户态原子访问
@@ -93,4 +100,6 @@ syscall / runtime
 
 `src/copy_tests.rs` 使用要求 `PreparedTaskWait` 可用的按需映射后端，验证普通
 复制的缺页处理发生在异常外的可睡眠任务上下文，并覆盖跨页读、首次写缺页、
-只读保护和撤销映射。该测试不依赖真实磁盘或 IRQ 的时序。
+只读保护和撤销映射。分阶段写缺页测试跨越多个页面并超过单页恢复预算，验证同一页连续缺页后
+复制结果完整；无进展测试覆盖反复报告成功、反复报告 COW retry 的有界退出，
+以及显式 `NoProgress` 的立即失败。测试不依赖真实磁盘或 IRQ 的时序。

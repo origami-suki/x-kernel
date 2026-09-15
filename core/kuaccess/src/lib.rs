@@ -72,6 +72,10 @@ fn fault_outcome_to_trap_result(outcome: PageFaultOutcome) -> bool {
 // Adapter instantiated by the osvm external-trait entry points.
 struct Vm;
 
+// Bound all fault outcomes, including backends that repeatedly report success
+// without enabling the access. Leave room for staged faults and transient races.
+const MAX_USER_PAGE_FAULT_ATTEMPTS: usize = 16;
+
 // Retry only the current user page after returning through the assembly fixup.
 // File-backed faults can wait for disk I/O here, outside exception context.
 fn copy_user_pages(
@@ -82,33 +86,36 @@ fn copy_user_pages(
 ) -> MemResult {
     check_access(start, len)?;
     let mut offset = 0;
+    let mut fault_attempts = 0;
     while offset < len {
         let address = start + offset;
         let count = (PAGE_SIZE_4K - address % PAGE_SIZE_4K).min(len - offset);
-        if copy_fn(offset, count) != 0 {
-            let curr = current();
-            let thread = curr.try_as_thread().ok_or(MemError::NoAccess)?;
-            let address_space = thread
-                .process()
-                .address_space()
-                .map_err(|_| MemError::NoAccess)?;
-            loop {
-                let outcome = address_space
-                    .lock()
-                    .handle_page_fault(VirtAddr::from_usize(address), access_flags);
-                match outcome {
-                    PageFaultOutcome::Resolved => break,
-                    PageFaultOutcome::Retry | PageFaultOutcome::CowConflictRetry => continue,
-                    _ => return Err(MemError::NoAccess),
-                }
-            }
-            // A mapping revoked after resolution is still reported as a copy
-            // failure; never read uninitialized output or spin on no progress.
-            if copy_fn(offset, count) != 0 {
-                return Err(MemError::NoAccess);
-            }
+        if copy_fn(offset, count) == 0 {
+            offset += count;
+            fault_attempts = 0;
+            continue;
         }
-        offset += count;
+        if fault_attempts == MAX_USER_PAGE_FAULT_ATTEMPTS {
+            return Err(MemError::NoAccess);
+        }
+        fault_attempts += 1;
+        let curr = current();
+        let thread = curr.try_as_thread().ok_or(MemError::NoAccess)?;
+        let address_space = thread
+            .process()
+            .address_space()
+            .map_err(|_| MemError::NoAccess)?;
+        let outcome = address_space
+            .lock()
+            .handle_page_fault(VirtAddr::from_usize(address), access_flags);
+        // Retry the copy after each recoverable fault. Shared file writes may
+        // first install a read-only PTE, then fault again to enable writing.
+        match outcome {
+            PageFaultOutcome::Resolved
+            | PageFaultOutcome::Retry
+            | PageFaultOutcome::CowConflictRetry => continue,
+            _ => return Err(MemError::NoAccess),
+        }
     }
     Ok(())
 }
