@@ -1,56 +1,101 @@
-# ktty - 设计文档
+# ktty — Design
 
-## 定位
+## Purpose
 
-`ktty` 实现 X-Kernel 的终端、行规程、伪终端和 POSIX 作业控制接口。
-设备文件层把 `/dev/console`、`/dev/tty` 和 PTY 请求转发到本 crate，进程、
-进程组与 session 身份由 `kprocess` 持有。
+`ktty` implements the X-Kernel terminal layer: terminal devices, the line
+discipline, pseudo-terminals, and the POSIX job-control interface. The
+device-file layer forwards `/dev/console`, `/dev/tty`, and PTY requests to
+this crate; process, process-group, and session identity stay owned by
+`kprocess`.
 
-## 范围
+## Scope
 
-- `src/terminal/job.rs`：控制终端关联的 session、前台进程组和前台变化通知。
-- `src/terminal/ldisc.rs`：输入处理、规范模式和信号字符处理。
-- `src/tty/mod.rs`：TTY 文件操作与 `TC*`/`TIOC*` ioctl 边界。
-- `src/tty/ntty.rs`、`src/tty/pty.rs`：console TTY 与 PTY 后端。
+- `src/terminal/job.rs`: controlling-terminal session association, the
+  foreground process group, and foreground-change notification.
+- `src/terminal/ldisc.rs`: input processing, canonical mode, and signal
+  character handling.
+- `src/terminal/termios.rs`: the `Termios` terminal attribute layout and
+  flag/character constants shared by the ioctl boundary.
+- `src/tty/mod.rs`: TTY file operations and the `TC*`/`TIOC*` ioctl
+  boundary.
+- `src/tty/ntty.rs`, `src/tty/pty.rs`: the console TTY and PTY backends.
 
-## 控制终端状态
+## Non-Responsibilities
 
-`TIOCSCTTY` 仅允许 session leader 获取控制终端。绑定成功时，`ktty` 同时：
+- No terminal device drivers: UART hardware belongs to the console/serial
+  drivers; `ktty` consumes byte streams through the TTY backend trait.
+- No process, session, or credential ownership: sessions and process
+  groups live in `kprocess`; `ktty` only holds weak references and asks
+  it to resolve PGIDs.
+- No pseudo-terminal allocation policy: `/dev/ptmx` open-path decisions
+  belong to the devfs/pty layers; `ktty` implements the master/slave
+  data path and job-control semantics.
+- No signal delivery policy: control characters that generate signals
+  are turned into `ksignal` requests by the line discipline; `ktty`
+  does not decide delivery.
+- No user-memory policy: user pointers appear only at the ioctl boundary
+  and are copied through the checked user-access helpers.
 
-1. 在 `kprocess::Session` 中安装控制终端对象；
-2. 在 `JobControl` 中记录相同 session；
-3. 将调用者所在进程组设为初始前台进程组。
+## Controlling Terminal State
 
-这与 Linux 获取控制终端后的可观察行为一致，使随后执行的 shell 能通过
-`TIOCGPGRP` 取得有效前台 PGID。任一步失败时，新安装的 session/terminal
-状态会回滚。每个 TTY 的关联事务锁串行化绑定、解绑和回滚，防止旧事务撤销
-同一 TTY 上已经成功的新绑定。
+`TIOCSCTTY` only lets a session leader acquire the controlling terminal.
+On a successful bind, `ktty` simultaneously:
 
-`TIOCSPGRP` 从用户空间读取目标 PGID，在进程表中解析目标进程组，并要求：
+1. installs the controlling-terminal object in `kprocess::Session`;
+2. records the same session in `JobControl`;
+3. makes the caller's process group the initial foreground process group.
 
-- 调用者属于该控制终端关联的 session；
-- 目标进程组也属于同一 session。
+This matches Linux's observable behavior after acquiring a controlling
+terminal, so a shell started afterwards obtains a valid foreground PGID
+through `TIOCGPGRP`.
 
-`TIOCGPGRP` 和 `TIOCGSID` 仅向该控制终端所属 session 的调用者返回状态；跨
-session 查询返回 `ENOTTY`。与 Linux 一致，PTY master 可以查询其配对 slave 的
-作业控制状态。显式前台切换与初次控制终端绑定共享
-`JobControl::set_foreground`，成功后唤醒等待前台状态变化的读操作。
+Known limitation: Linux's privileged cross-session forced acquisition
+(`TIOCSCTTY` with `arg == 1`) is not implemented; that request returns
+`EPERM`, and other non-zero `arg` values return `EINVAL` (see the Known
+Limitations section of `docs/security.md`). If any step fails, the newly installed
+session/terminal state is rolled back. A per-TTY association-transaction
+lock serializes bind, unbind, and rollback, preventing an older
+transaction from undoing a newer successful binding on the same TTY.
 
-TTY `open` 还实现 Linux 的隐式控制终端获取：未指定 `O_NOCTTY`、当前用户进程是
-session leader 且尚无 controlling TTY 时，打开的终端会通过同一 `bind_to` 流程成为
-控制终端并初始化 foreground。PTY master 不参与隐式或显式控制终端绑定，只有 slave
-端可成为 controlling TTY。内核线程发起的 open 没有用户 session，因此不会触发该
-状态转换；启动脚本的 fallback shell 会在用户态重新打开 `/dev/console`。
+`TIOCSPGRP` reads the target PGID from user space, resolves the target
+process group in the process table, and requires:
 
-## 调用约束
+- the caller to belong to the session associated with the controlling
+  terminal;
+- the target process group to belong to the same session.
 
-TTY ioctl 路径要求当前任务是用户进程线程，因为权限与 session 校验依赖
-`current_user_thread()`。用户指针只在 ioctl 边界读写，内部作业控制逻辑只接收
-内核持有的 PGID、`Session` 和 `ProcessGroup`。该路径不可在中断上下文调用。
-TTY open 可由内核线程调用；这种情况下只完成文件打开，不尝试分配 controlling TTY。
+`TIOCGPGRP` and `TIOCGSID` return state only to callers in the session of
+the controlling terminal; cross-session queries get `ENOTTY`. As in
+Linux, a PTY master may query the job-control state of its paired slave.
+Explicit foreground changes and the initial controlling-terminal bind
+share `JobControl::set_foreground`, which wakes readers waiting for
+foreground state changes on success.
 
-## 并发模型
+TTY `open` also implements Linux's implicit controlling-terminal
+acquisition: when `O_NOCTTY` is not set, the current user process is a
+session leader, and no controlling TTY exists yet, the opened terminal
+becomes the controlling terminal through the same `bind_to` flow and
+initializes the foreground. PTY masters never take part in implicit or
+explicit controlling-terminal binding; only a slave can become a
+controlling TTY. Opens issued by kernel threads have no user session and
+therefore never trigger the transition; a boot script's fallback shell
+re-opens `/dev/console` in user mode.
 
-控制终端的 session 和 foreground 分别由 `SpinNoIrq` 保护；TTY 级关联事务锁保护
-跨 `Session`、`JobControl` 和 foreground 的多阶段绑定与解绑。状态更新不跨越可能
-阻塞的操作；前台进程组变化后通过 `PollSet` 唤醒等待者。
+## Calling Constraints
+
+TTY ioctl paths require the current task to be a user-process thread,
+because permission and session checks depend on `current_user_thread()`.
+User pointers are read or written only at the ioctl boundary; internal
+job-control logic receives only kernel-held PGIDs, `Session`, and
+`ProcessGroup` values. The ioctl path must not be called from interrupt
+context. TTY `open` may be called from kernel threads; in that case only
+the file open completes and no controlling-terminal assignment is
+attempted.
+
+## Concurrency Model
+
+The controlling-terminal session and foreground are each protected by
+`SpinNoIrq`; a per-TTY association-transaction lock protects the
+multi-phase binds and unbinds that span `Session`, `JobControl`, and the
+foreground. State updates never cross a potentially blocking operation;
+after a foreground change, waiters are woken through `PollSet`.

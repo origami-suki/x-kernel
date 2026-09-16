@@ -81,6 +81,13 @@ struct InputReader<R, W> {
     clear_line_buf: Arc<AtomicBool>,
 }
 impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
+    /// Pulls bytes from the reader into the line buffer and pushes
+    /// processed bytes toward the consumer.
+    ///
+    /// # Panics
+    ///
+    /// Only via the internal `try_push(..).unwrap()` if the output ring
+    /// were full; the `is_full` guard above the push excludes that path.
     pub fn poll(&mut self) -> bool {
         if self.clear_line_buf.swap(false, Ordering::Relaxed) {
             self.line_buf.clear();

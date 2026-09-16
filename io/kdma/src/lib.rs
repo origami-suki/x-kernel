@@ -6,6 +6,41 @@
 // See LICENSES for license details.
 
 //! DMA allocation helpers and bus address types.
+//!
+//! `kdma` is the kernel's DMA memory layer: [`allocate_dma_memory`] and
+//! [`deallocate_dma_memory`] manage coherent, device-reachable memory;
+//! [`map_dma_buffer`] / [`unmap_dma_buffer`] stage ordinary buffers
+//! through a coherent bounce pool for temporary transactions; [`p2b`] /
+//! [`b2p`] convert between physical and bus addresses. See
+//! `docs/design.md` for the full boundary contracts.
+//!
+//! # Example
+//!
+//! Map a driver-owned buffer for a device read (DeviceToDriver), then
+//! unmap it once the device is done. Kernel code only; this crate cannot
+//! compile in a host doctest environment, so the example is `ignore`.
+//!
+//! ```ignore
+//! use core::ptr::NonNull;
+//! use kdma::{map_dma_buffer, unmap_dma_buffer, DmaDirection};
+//!
+//! # fn stage(buffer: NonNull<[u8]>) -> Result<(), alloc_engine::AllocError> {
+//! // 1. Stage the driver-owned buffer through the coherent bounce pool.
+//! let dma = unsafe { map_dma_buffer(buffer, DmaDirection::DeviceToDriver) }?;
+//!
+//! // 2. Program the device with dma.bus_addr and wait for completion.
+//! // device.submit(dma.bus_addr, buffer.len());
+//!
+//! // 3. Unmap exactly once with the same address and buffer.
+//! unsafe { unmap_dma_buffer(dma.bus_addr, buffer, DmaDirection::DeviceToDriver) };
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For persistent device-reachable memory (descriptor rings, shared
+//! queues), use [`allocate_dma_memory`] instead, which returns a
+//! [`DMAInfo`] whose bus address stays valid until
+//! [`deallocate_dma_memory`].
 #![no_std]
 
 extern crate alloc;
@@ -52,6 +87,11 @@ pub fn b2p(baddr: DmaBusAddress) -> PhysAddr {
 /// memory, such as the starting address and size. If it's not possible to
 /// allocate memory meeting the criteria, returns [`None`].
 ///
+/// # Errors
+///
+/// Returns `AllocError::NoMemory` when pages cannot be allocated, the
+/// mapping-attribute update fails, or the platform `prepare` hook fails.
+///
 /// # Safety
 ///
 /// The caller must free the returned allocation exactly once with
@@ -85,8 +125,11 @@ pub unsafe fn deallocate_dma_memory(dma: DMAInfo, layout: Layout) {
 /// Direction for a temporary DMA mapping of an existing buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmaDirection {
+    /// The device reads data the CPU produced (e.g. a TX descriptor ring).
     DriverToDevice,
+    /// The device produces data the CPU reads (e.g. an RX descriptor ring).
     DeviceToDriver,
+    /// The buffer is both read and written by the device.
     Bidirectional,
 }
 
@@ -96,6 +139,13 @@ pub enum DmaDirection {
 /// memory. Keeping this behind `kdma` lets future implementations restore
 /// direct-map optimizations with stricter page-granularity safety checks
 /// without changing driver code.
+///
+/// # Errors
+///
+/// Returns `AllocError::InvalidInput` for a zero-length buffer or a bus
+/// address that is already actively mapped, and
+/// `AllocError::NoMemory` when the bounce pool cannot satisfy the
+/// request.
 ///
 /// # Safety
 ///
@@ -117,6 +167,17 @@ pub unsafe fn map_dma_buffer(
 /// `dma_addr` must be the still-active bus address previously returned by
 /// [`map_dma_buffer`] for the same `buffer`, and unmapping must happen exactly
 /// once for that mapping.
+/// # Panics
+///
+/// Panics when `dma_addr` is not an active mapping or when `buffer`'s
+/// length does not match the length recorded at [`map_dma_buffer`] time;
+/// both are caller contract violations, not runtime conditions.
+///
+/// # Example
+///
+/// The unmap must repeat the exact address, buffer, and length from the
+/// matching [`map_dma_buffer`] call — see the crate-level
+/// [example](crate#example) for the full map → device → unmap sequence.
 pub unsafe fn unmap_dma_buffer(
     dma_addr: DmaBusAddress,
     buffer: NonNull<[u8]>,
