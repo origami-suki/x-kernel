@@ -234,7 +234,13 @@ pub mod tests_deferred {
             run_hardirq_exit_deferred(DeferredRunContext::new(1, None)),
             DeferredRunResult::Ran
         );
-        assert_eq!(FIRST_HOOK_CALLS.load(Ordering::Relaxed), 1);
+        // The hook slot is globally visible, so IRQ tails on other CPUs can
+        // invoke the restored executor concurrently with this check; the
+        // scoped pin only masks interrupts on the CPU running the test.
+        // Requiring our own call to have run is still a full check: first_hook
+        // executes only through the published slot, so a misrestored or
+        // cleared slot would leave the counter at zero.
+        assert!(FIRST_HOOK_CALLS.load(Ordering::Relaxed) >= 1);
         assert!(!register_deferred_executor(DeferredExecutorHooks {
             on_hardirq_exit: Some(second_hook),
         }));
