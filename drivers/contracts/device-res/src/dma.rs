@@ -157,6 +157,13 @@ impl DmaCoherent {
     }
 
     /// The CPU-visible virtual address of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle was already dropped (used-after-drop is a
+    /// programming error: the Rust type keeps the allocation alive until
+    /// drop, so this indicates re-entry), or if the stored CPU address
+    /// was null, which the provider contract forbids.
     pub fn cpu_ptr(&self) -> NonNull<u8> {
         NonNull::new(
             self.allocation
@@ -168,6 +175,10 @@ impl DmaCoherent {
     }
 
     /// The device-visible bus address of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle was already released.
     pub fn bus_addr(&self) -> u64 {
         self.allocation
             .as_ref()
@@ -176,6 +187,10 @@ impl DmaCoherent {
     }
 
     /// The buffer length in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle was already released.
     pub fn len(&self) -> usize {
         self.allocation
             .as_ref()

@@ -13,36 +13,57 @@ use lazyinit::LazyInit;
 
 type MemRange = (usize, usize);
 
+/// ACPI boot descriptor: the firmware-passed RSDP physical address.
+///
+/// All later table lookups walk from this root. Stored once by
+/// [`init`] and read back through [`desc`] / [`rsdp_addr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcpiDesc {
     rsdp_addr: usize,
 }
 
 impl AcpiDesc {
+    /// Wraps a raw RSDP physical address.
     pub const fn new(rsdp_addr: usize) -> Self {
         Self { rsdp_addr }
     }
 
+    /// Returns the RSDP physical address.
     pub const fn rsdp_addr(self) -> usize {
         self.rsdp_addr
     }
 }
 
+/// Failure to initialize the ACPI subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpiInitError {
+    /// `init` was called with a zero RSDP address.
     MissingRsdp,
 }
 
+/// Safe snapshot of an ACPI System Description Table header.
+///
+/// Produced only after the raw header passed signature and checksum
+/// validation.
 #[derive(Debug, Clone, Copy)]
 pub struct AcpiTableHeader {
+    /// Four-character table signature (e.g. `APIC`, `MCFG`, `FACP`).
     pub signature: [u8; 4],
+    /// Total table length in bytes, header included.
     pub length: u32,
+    /// Table revision number.
     pub revision: u8,
+    /// Whole-table checksum byte (sum with the body must be 0 mod 256).
     pub checksum: u8,
+    /// Six-character OEM identifier.
     pub oem_id: [u8; 6],
+    /// Eight-character OEM table identifier.
     pub oem_table_id: [u8; 8],
+    /// OEM revision of the table.
     pub oem_revision: u32,
+    /// Utility that created the table.
     pub creator_id: u32,
+    /// Revision of the creating utility.
     pub creator_revision: u32,
 }
 
@@ -62,32 +83,48 @@ impl From<AcpiSdtHeader> for AcpiTableHeader {
     }
 }
 
+/// One PCI MMIO configuration space allocation from the MCFG table.
 #[derive(Clone, Copy)]
 pub struct McfgAllocation {
+    /// 64-bit physical base address of the ECAM window.
     pub base_address: u64,
+    /// PCI segment (domain) this allocation covers.
     pub pci_segment: u16,
+    /// First bus number covered.
     pub start_bus: u8,
+    /// Last bus number covered (inclusive).
     pub end_bus: u8,
 }
 
+/// MADT table header facts: the legacy Local APIC address and flags.
 #[derive(Debug, Clone, Copy)]
 pub struct MadtInfo {
+    /// Physical address of the local APIC register block.
     pub local_apic_address: u32,
+    /// Raw MADT flags (e.g. PC-AT compatibility bit).
     pub flags: u32,
 }
 
+/// Summarized APIC topology extracted from the MADT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApicInfo {
+    /// Physical address of the local APIC register block.
     pub local_apic_address: usize,
+    /// Physical address of the first I/O APIC, if the MADT describes one.
     pub io_apic_address: Option<usize>,
 }
 
-/// One memory window advertised by a PCI host bridge `_CRS` resource template.
+/// One memory window advertised by a PCI host bridge `_CRS` resource
+/// template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciHostMemWindow {
+    /// CPU physical base address of the window.
     pub base: u64,
+    /// Window size in bytes.
     pub size: u64,
+    /// Whether the descriptor marks the window prefetchable.
     pub prefetchable: bool,
+    /// Whether the window came from a QWord (64-bit) descriptor.
     pub is_64bit: bool,
 }
 
@@ -101,38 +138,58 @@ pub struct Pm1aControlBlock {
     pub length: u8,
 }
 
+/// One processor entry from the MADT (type 0).
 #[derive(Debug, Clone, Copy)]
 pub struct LocalApicEntry {
+    /// Processor UID as listed by the firmware (often the ACPI UID).
     pub processor_uid: u8,
+    /// APIC id used to address the processor's local APIC.
     pub apic_id: u8,
+    /// Raw MADT flags; bit 0 is the enabled bit (see [`LocalApicEntry::enabled`]).
     pub flags: u32,
 }
 
 impl LocalApicEntry {
+    /// Returns whether the firmware marked this processor usable.
     pub const fn enabled(self) -> bool {
         (self.flags & 0x1) != 0
     }
 }
 
+/// One I/O APIC entry from the MADT (type 1).
 #[derive(Debug, Clone, Copy)]
 pub struct IoApicEntry {
+    /// I/O APIC id as listed by the firmware.
     pub id: u8,
+    /// Physical address of the I/O APIC register block.
     pub address: u32,
+    /// First global system interrupt number routed through this APIC.
     pub global_system_interrupt_base: u32,
 }
 
+/// A parsed MADT entry, narrowed to the kinds the kernel consumes.
 #[derive(Debug, Clone, Copy)]
 pub enum MadtEntry {
+    /// Processor entry (MADT type 0).
     LocalApic(LocalApicEntry),
+    /// I/O APIC entry (MADT type 1).
     IoApic(IoApicEntry),
 }
 
+/// Iterator over the variable-length entries of a validated MADT.
+///
+/// Skips entry kinds the kernel does not model; panics on entries that
+/// would run past the table end.
+#[derive(Clone, Copy)]
 pub struct MadtEntryIter {
     current: usize,
     end: usize,
 }
 
 impl McfgAllocation {
+    /// Computes the mapped `(base, size)` ECAM range for this allocation:
+    /// 1 MiB per bus, starting at `start_bus`. Returns `None` when the
+    /// address does not fit `usize` or the bus arithmetic overflows.
     pub fn ecam_region(self) -> Option<MemRange> {
         let base = usize::try_from(self.base_address).ok()?;
         let start = base.checked_add((self.start_bus as usize) << 20)?;
@@ -143,6 +200,14 @@ impl McfgAllocation {
 
 static ACPI_DESC: LazyInit<AcpiDesc> = LazyInit::new();
 
+/// Stores the boot RSDP physical address; must run before any lookup.
+///
+/// The first successful call wins; later calls with different addresses
+/// have no effect.
+///
+/// # Errors
+///
+/// Returns [`AcpiInitError::MissingRsdp`] when `rsdp_addr` is zero.
 pub fn init(rsdp_addr: usize) -> Result<(), AcpiInitError> {
     if rsdp_addr == 0 {
         return Err(AcpiInitError::MissingRsdp);
@@ -151,18 +216,27 @@ pub fn init(rsdp_addr: usize) -> Result<(), AcpiInitError> {
     Ok(())
 }
 
+/// Returns the boot descriptor, or `None` before [`init`].
 pub fn desc() -> Option<AcpiDesc> {
     ACPI_DESC.get().copied()
 }
 
+/// Returns the boot RSDP physical address, or `None` before [`init`].
 pub fn rsdp_addr() -> Option<usize> {
     desc().map(AcpiDesc::rsdp_addr)
 }
 
+/// Finds the first segment-0 MCFG allocation using the boot RSDP.
 pub fn find_mcfg_from_init() -> Option<McfgAllocation> {
     find_mcfg(rsdp_addr()?)
 }
 
+/// Finds the MADT using the boot-initialized RSDP.
+///
+/// # Panics
+///
+/// Panics when ACPI was never initialized, when the MADT is shorter than
+/// its fixed header, or when a validated table fails re-validation.
 pub fn find_madt() -> Option<(MadtInfo, MadtEntryIter)> {
     let (table_addr, header) = find_table(*b"APIC")?;
     assert!(
@@ -186,11 +260,23 @@ pub fn find_madt() -> Option<(MadtInfo, MadtEntryIter)> {
     ))
 }
 
+/// Finds the MADT from the boot RSDP.
+///
+/// # Panics
+///
+/// Panics when [`rsdp_addr`] is `None` (ACPI was never initialized) or
+/// when the MADT is shorter than its fixed header.
 pub fn find_madt_from_init() -> Option<(MadtInfo, MadtEntryIter)> {
     let rsdp_addr = rsdp_addr().unwrap_or_else(|| panic!("ACPI RSDP is not initialized"));
     find_madt_from_rsdp(rsdp_addr)
 }
 
+/// Finds the MADT from an explicit RSDP address.
+///
+/// # Panics
+///
+/// Panics when the MADT is shorter than its fixed header or fails
+/// header validation.
 pub fn find_madt_from_rsdp(rsdp_addr: usize) -> Option<(MadtInfo, MadtEntryIter)> {
     let (table_addr, header) = find_table_from_rsdp(rsdp_addr, *b"APIC")?;
     assert!(
@@ -214,10 +300,12 @@ pub fn find_madt_from_rsdp(rsdp_addr: usize) -> Option<(MadtInfo, MadtEntryIter)
     ))
 }
 
+/// Returns the local APIC register address from the boot MADT.
 pub fn find_local_apic_address_from_init() -> Option<usize> {
     find_madt_from_init().map(|(info, _)| info.local_apic_address as usize)
 }
 
+/// Summarizes local APIC and first I/O APIC addresses from the boot MADT.
 pub fn find_apic_from_init() -> Option<ApicInfo> {
     let (info, entries) = find_madt_from_init()?;
     let io_apic_address = entries.into_iter().find_map(|entry| match entry {
@@ -230,6 +318,7 @@ pub fn find_apic_from_init() -> Option<ApicInfo> {
     })
 }
 
+/// Returns the first I/O APIC entry from the boot MADT.
 pub fn find_io_apic_from_init() -> Option<IoApicEntry> {
     let (_, mut entries) = find_madt_from_init()?;
     entries.find_map(|entry| match entry {
@@ -436,11 +525,24 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Finds a table by four-character signature from the boot RSDP.
+///
+/// # Panics
+///
+/// Panics when ACPI was never initialized, when the RSDP fails
+/// validation, when the RSDP names neither XSDT nor RSDT, or when the
+/// requested table is missing from the root table.
 pub fn find_table(signature: [u8; 4]) -> Option<(usize, AcpiTableHeader)> {
     let rsdp_addr = rsdp_addr().unwrap_or_else(|| panic!("ACPI RSDP is not initialized"));
     find_table_from_rsdp(rsdp_addr, signature)
 }
 
+/// Finds a table by signature starting from an explicit RSDP address.
+///
+/// # Panics
+///
+/// Panics when the RSDP fails validation, when it names neither XSDT nor
+/// RSDT, or when the requested table is missing from the root table.
 pub fn find_table_from_rsdp(
     rsdp_addr: usize,
     signature: [u8; 4],
@@ -460,6 +562,8 @@ pub fn find_table_from_rsdp(
     Some((table_addr, read_sdt_header(table_addr).into()))
 }
 
+/// Finds the MCFG table from an explicit RSDP address and parses the first
+/// segment-0 allocation.
 pub fn find_mcfg(rsdp_addr: usize) -> Option<McfgAllocation> {
     let rsdp = validate_rsdp(rsdp_addr)?;
     let rsdp_revision = rsdp.revision;

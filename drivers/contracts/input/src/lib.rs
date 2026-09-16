@@ -14,14 +14,23 @@ use strum::FromRepr;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, FromRepr)]
 pub enum EventType {
+    /// Marker event used to separate input event epochs (value 0x00).
     Synchronization = 0x00,
+    /// Key press/release events (value 0x01).
     Key             = 0x01,
+    /// Relative pointer motion events (value 0x02).
     Relative        = 0x02,
+    /// Absolute pointer/tablet positioning events (value 0x03).
     Absolute        = 0x03,
+    /// Miscellaneous event codes (value 0x04).
     Misc            = 0x04,
+    /// Switch state events (value 0x05).
     Switch          = 0x05,
+    /// LED state events (value 0x11).
     Led             = 0x11,
+    /// Sound output events (value 0x12).
     Sound           = 0x12,
+    /// Force feedback effect events (value 0x15).
     ForceFeedback   = 0x15,
 }
 

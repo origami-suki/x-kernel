@@ -27,14 +27,21 @@ use crate::{
 /// Description of a boot/runtime handoff object that is already active before
 /// the generic driver probe pipeline runs.
 pub struct ActiveDeviceAdoption {
+    /// Bus instance the device is attached to.
     pub bus_id: BusId,
     /// Optional parent device under which this object should be attached.
     pub parent: Option<DeviceId>,
+    /// Where on the bus hierarchy the device lives.
     pub location: DeviceLocation,
+    /// Which firmware source described the device.
     pub origin: DiscoveryOrigin,
+    /// Bus-specific identity used for matching bookkeeping.
     pub identity: DeviceIdentity,
+    /// Upper-layer transport descriptor, if any.
     pub transport: Option<crate::TransportInfo>,
+    /// Resources already acquired for the running device.
     pub resources: ResourceSet,
+    /// Driver that owns the running device and will be recorded as bound.
     pub driver: Arc<DriverObject>,
 }
 

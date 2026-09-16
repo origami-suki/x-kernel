@@ -1,6 +1,15 @@
-# device-res-xkernel — 安全与可靠性分析
+# device-res-xkernel — Security And Reliability
 
-## 信任模型
+## Scope
+
+This analysis covers the entire crate: `src/lib.rs`
+(`XKernelResourceProvider`), `src/mmio.rs`, `src/dma.rs`, `src/irq.rs`,
+and `src/time.rs` — the five provider-trait adapters. No modules are
+excluded; the crate adds no state of its own and forwards to `memspace`
+/ `kirq` / `kdma`, whose own security documents cover those subsystems.
+
+
+## Trust Model
 
 ```text
 device-res provider contract
@@ -13,66 +22,76 @@ device-res-xkernel
         └── kdma DMA allocation / mapping
 ```
 
-`device-res-xkernel` 信任：
+`device-res-xkernel` trusts:
 
-- `memspace::iomap_device` 拒绝非法 MMIO 物理地址范围；
-- `kirq` 校验 IRQ descriptor、管理 shared action lifecycle、in-flight
-  synchronization 和 teardown；
-- `kdma` 返回配对的 coherent/streaming DMA allocation metadata；
-- `khal::time::monotonic_time()` 返回单调不倒退的时间；
-- driver remove 路径在 devres cleanup 前已经停止设备 DMA 和中断源。
+- `memspace::iomap_device` to reject invalid MMIO physical ranges;
+- `kirq` to validate IRQ descriptors, manage the shared action
+  lifecycle, in-flight synchronization, and teardown;
+- `kdma` to return paired coherent/streaming DMA allocation metadata;
+- `khal::time::monotonic_time()` to return a monotonic, never-backwards
+  time;
+- the driver remove path to have stopped device DMA and interrupt sources
+  before devres cleanup runs.
 
-`device-res-xkernel` 不暴露 driver-facing `devm_*` helper，也不直接安装全局
-provider；资源申请必须通过 `device_res` provider contract。`kdriver::resource`
-持有静态 `XKernelResourceProvider` 实例，显式传给 `device_res::devm_*_with_provider()`
-和 VirtIO PCI/MSI-X 等需要直接 provider 能力的内部适配路径。
+The crate exposes no driver-facing `devm_*` helpers and never installs a
+global provider itself; resource acquisition must go through the
+`device_res` provider contract. `kdriver::resource` holds the static
+`XKernelResourceProvider` instance and passes it explicitly to
+`device_res::devm_*_with_provider()` and to internal adaptation paths
+such as VirtIO PCI/MSI-X that need direct provider capabilities.
 
-## Unsafe 边界
+## Unsafe Boundaries
 
 ### DMA allocation
 
-`alloc_coherent()` 通过 `Layout::from_size_align()` 验证 `DmaSpec` 后调用
-`kdma::allocate_dma_memory()`。
+`alloc_coherent()` validates the `DmaSpec` through
+`Layout::from_size_align()` before calling `kdma::allocate_dma_memory()`.
 
-不变量：
+Invariants:
 
-- layout 非零且对齐合法；
-- 返回的 buffer 由 `device_res::DmaCoherent` 或 devres cleanup 独占；
-- 释放时使用同一个 `DmaSpec` 重建 layout。
+- the layout is non-zero with a legal alignment;
+- the returned buffer is owned exclusively by a `device_res::DmaCoherent`
+  or a devres cleanup;
+- release rebuilds the layout from the same `DmaSpec`.
 
 ### DMA free
 
-`free_coherent()` 从 `DmaAllocation` 重建 `kdma::DMAInfo` 并调用
-`kdma::deallocate_dma_memory()`。
+`free_coherent()` rebuilds `kdma::DMAInfo` from the `DmaAllocation` and
+calls `kdma::deallocate_dma_memory()`.
 
-不变量：
+Invariants:
 
-- `DmaAllocation` 来自本 provider 的 `alloc_coherent()`；
-- 每个 allocation 只释放一次；
-- 驱动已停止可能访问该 buffer 的设备 DMA。
+- the `DmaAllocation` came from this provider's `alloc_coherent()`;
+- each allocation is freed exactly once;
+- the driver has stopped any device DMA that could touch the buffer.
 
 ### Streaming DMA map/unmap
 
-`map_streaming()` 和 `unmap_streaming()` 根据 `DmaDirection` 调用 `kdma` streaming API。
+`map_streaming()` and `unmap_streaming()` call the `kdma` streaming API
+according to `DmaDirection`.
 
-不变量：
+Invariants:
 
-- 调用者提供的 buffer 在 mapping 生命周期内有效；
-- `unmap_streaming()` 消费的是同一 provider 返回的 `DmaMapping`；
-- direction 与原 mapping 一致。
+- the caller's buffer remains valid for the mapping lifetime;
+- `unmap_streaming()` consumes the same provider-returned `DmaMapping`;
+- the direction matches the original mapping.
 
-## 并发与生命周期
+## Concurrency And Lifecycle
 
-- Provider 自身无可变共享状态；`kdriver::resource` 持有静态 provider 引用并在
-  资源申请时显式传递。
-- IRQ action list 同步由 `kirq` 保护。
-- `TimeOp::monotonic_time()` 不维护本 crate 状态，只转发到 X-Kernel 时间源。
-- Devres cleanup 按 `DeviceObject` LIFO 顺序执行；释放 IRQ 时会通过 `kirq` 等待旧
-  hardirq snapshot 退出。
+- The provider itself has no mutable shared state; `kdriver::resource`
+  holds the static provider reference and passes it explicitly at
+  acquisition time.
+- IRQ action-list synchronization is protected by `kirq`.
+- `TimeOp::monotonic_time()` keeps no crate state and forwards to the
+  X-Kernel time source.
+- Devres cleanup runs in `DeviceObject` LIFO order; releasing an IRQ
+  waits through `kirq` for stale hardirq snapshots to drain.
 
-## 已知限制
+## Known Limitations
 
-- `device_res` 已预留 threaded IRQ provider contract，但当前 X-Kernel provider
-  基于 main 分支的 `kirq` 只支持 shared hardirq request；threaded request 仍返回
-  `ResError::Unsupported`。
-- MSI-X 仅在 x86_64 backend 上实现，其他架构返回 `ResError::Unsupported`。
+- `device_res` has reserved the threaded IRQ provider contract, but the
+  current X-Kernel provider, built on the mainline `kirq`, supports only
+  shared hardirq requests; threaded requests still return
+  `ResError::Unsupported`.
+- MSI-X is implemented on the x86_64 backend only; other architectures
+  return `ResError::Unsupported`.

@@ -138,6 +138,13 @@ impl<T> ClassDevice<T> {
     }
 
     /// Name of the driver that activated this device.
+    /// Returns the bound driver's name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parent device has no bound driver; publication
+    /// through [`publish`](crate::prelude) validates this, so tripping
+    /// the check indicates a bypass of the publish path.
     pub fn driver_name(&self) -> &'static str {
         self.inner
             .parent
@@ -146,6 +153,13 @@ impl<T> ClassDevice<T> {
     }
 
     /// The registered driver that activated this device.
+    /// Returns the bound driver's id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parent device has no bound driver; publication
+    /// validates this, so tripping the check indicates a bypass of the
+    /// publish path.
     pub fn driver_id(&self) -> DriverId {
         self.inner
             .parent

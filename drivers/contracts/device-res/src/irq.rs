@@ -18,9 +18,13 @@ use crate::{ResError, ResResult};
 /// never lose firmware-described trigger information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrqTrigger {
+    /// Interrupt asserted on the rising edge.
     EdgeRising,
+    /// Interrupt asserted on the falling edge.
     EdgeFalling,
+    /// Interrupt active while the line is high.
     LevelHigh,
+    /// Interrupt active while the line is low.
     LevelLow,
     /// Trigger mode not described by firmware; carries raw flag bits (0 if none).
     Unknown(u32),
@@ -32,9 +36,13 @@ pub enum IrqTrigger {
 /// into this enum when describing a discovered interrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrqController {
+    /// ARM Generic Interrupt Controller (GIC v2/v3/v4) family.
     Gic,
+    /// RISC-V Platform-Level Interrupt Controller.
     Plic,
+    /// x86 I/O APIC.
     IoApic,
+    /// LoongArch Extend I/O interrupt controller.
     LoongArchExtioi,
     /// Controller not described by firmware / unknown.
     Unknown,

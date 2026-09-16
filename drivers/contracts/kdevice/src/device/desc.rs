@@ -15,6 +15,7 @@ use crate::{BusId, DriverId, ResourceSet};
 pub struct DeviceDescId(u64);
 
 impl DeviceDescId {
+    /// Wraps a raw numeric descriptor id.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -30,6 +31,7 @@ impl DeviceDescId {
 pub struct DeviceId(u64);
 
 impl DeviceId {
+    /// Wraps a raw numeric device id.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -98,23 +100,41 @@ impl DeviceState {
 pub enum DeviceLocation {
     /// PCI Bus / Device / Function.
     Pci {
+        /// PCI segment (domain) number.
         segment: u16,
+        /// Bus number within the segment.
         bus: u8,
+        /// Device number on the bus.
         device: u8,
+        /// Function number of the device.
         function: u8,
     },
     /// MMIO transport (e.g. virtio-mmio).
-    Mmio { base: usize, size: usize },
+    Mmio {
+        /// Physical base address of the transport registers.
+        base: usize,
+        /// Size of the transport register region in bytes.
+        size: usize,
+    },
     /// Firmware-described platform device.
-    FirmwareNode { id: u16 },
+    FirmwareNode {
+        /// Backend-local firmware node id.
+        id: u16,
+    },
     /// Non-enumerable platform-static device.
-    PlatformStatic { id: u16 },
+    PlatformStatic {
+        /// Stable backend-local id for the static device.
+        id: u16,
+    },
     /// Bus controller / bridge published by a backend (e.g. PCI host bridge).
     ///
     /// Devices at this location are not matched by endpoint drivers; the
     /// owning backend adopts them directly so they can serve as parents for
     /// the endpoints they enumerate.
-    Bridge { domain: u16 },
+    Bridge {
+        /// PCI domain (segment) owned by the bridge.
+        domain: u16,
+    },
 }
 
 /// Where the device description originally came from.
@@ -131,9 +151,13 @@ pub enum DiscoveryOrigin {
 /// PCI device identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciIdentity {
+    /// PCI vendor id from the configuration-space vendor register.
     pub vendor_id: u16,
+    /// PCI device id from the configuration-space device register.
     pub device_id: u16,
+    /// PCI base class code.
     pub class: u8,
+    /// PCI subclass code within the base class.
     pub subclass: u8,
 }
 
@@ -155,7 +179,10 @@ pub struct PlatformIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportInfo {
     /// VirtIO transport (PCI or MMIO underneath, distinguished by bus).
-    Virtio { device_type: u32 },
+    Virtio {
+        /// VirtIO device type code (1 = net, 2 = block, ...).
+        device_type: u32,
+    },
 }
 
 /// Identity information used for driver matching.
@@ -176,13 +203,21 @@ pub enum DeviceIdentity {
 /// runtime device instance and must not carry bound-driver or lifecycle state.
 #[derive(Debug, Clone)]
 pub struct DeviceDesc {
+    /// Descriptor id assigned by the backend's enumeration context.
     id: DeviceDescId,
+    /// Bus instance the device was discovered on.
     bus_id: BusId,
+    /// Parent device (controller / bridge), if discovery named one.
     parent: Option<DeviceId>,
+    /// Where on the bus hierarchy the device lives.
     location: DeviceLocation,
+    /// Which firmware source described the device.
     origin: DiscoveryOrigin,
+    /// Bus-specific identity used for driver matching.
     identity: DeviceIdentity,
+    /// Upper-layer transport descriptor, if any.
     transport: Option<TransportInfo>,
+    /// Resources (MMIO, IRQ, ...) described for the device.
     resources: ResourceSet,
 }
 
@@ -335,19 +370,31 @@ impl DeviceState {
 /// Metadata-only snapshot of a live device object.
 #[derive(Debug, Clone)]
 pub struct DeviceRecord {
+    /// Globally-unique device id.
     pub id: DeviceId,
+    /// Bus instance the device lives on.
     pub bus_id: BusId,
+    /// Parent controller / bridge device, if any.
     pub parent: Option<DeviceId>,
     /// Bus instance produced by this device, if it is a controller / bridge.
     pub child_bus: Option<BusId>,
+    /// Where on the bus hierarchy the device lives.
     pub location: DeviceLocation,
+    /// Which firmware source described the device.
     pub origin: DiscoveryOrigin,
+    /// Bus-specific identity used for driver matching.
     pub identity: DeviceIdentity,
+    /// Upper-layer transport descriptor, if any.
     pub transport: Option<TransportInfo>,
+    /// Resources (MMIO, IRQ, ...) described for the device.
     pub resources: ResourceSet,
+    /// Name of the bound driver, once bound.
     pub driver_name: Option<&'static str>,
+    /// Id of the bound driver, once bound.
     pub driver_id: Option<DriverId>,
+    /// Device kind reported at publish, once active.
     pub device_kind: Option<DeviceKind>,
+    /// Current lifecycle state.
     pub state: DeviceState,
 }
 

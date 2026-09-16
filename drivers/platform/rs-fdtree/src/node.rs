@@ -29,6 +29,8 @@ impl FdtProperty {
     }
 }
 
+/// A device-tree node: its name plus borrowed views of its property bytes
+/// and (optionally) its parent's property bytes for `#*-cells` lookups.
 #[derive(Debug, Clone, Copy)]
 pub struct FdtNode<'b, 'a> {
     /// Node name (may include unit address, e.g., "uart@10000000")
@@ -188,9 +190,12 @@ pub(crate) fn all_nodes<'b, 'a: 'b>(
     })
 }
 
+/// A raw property: its name and uninterpreted big-endian payload bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct NodeProperty<'a> {
+    /// Property name as stored in the strings block.
     pub name: &'a str,
+    /// Property payload bytes, in firmware byte order.
     pub value: &'a [u8],
 }
 
@@ -228,12 +233,18 @@ impl Default for CellSizes {
     }
 }
 
+/// A physical memory region described by the device tree: a start address
+/// and a size in bytes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MemoryRegion {
+    /// Start address (physical for firmware-described regions).
     pub starting_address: *const u8,
+    /// Region size in bytes.
     pub size: usize,
 }
 
+/// Iterator over the `reg` entries of one node, decoding address/size
+/// pairs with the node's `#address-cells` / `#size-cells` widths.
 #[derive(Debug, Clone)]
 pub struct RegIter<'a> {
     stream: FdtData<'a>,
@@ -241,6 +252,7 @@ pub struct RegIter<'a> {
 }
 
 impl<'a> RegIter<'a> {
+    /// Creates an iterator over `reg` entries decoded with `sizes`.
     pub fn new(stream: FdtData<'a>, sizes: CellSizes) -> Self {
         Self { stream, sizes }
     }
@@ -270,6 +282,9 @@ impl<'a> Iterator for RegIter<'a> {
 }
 
 impl<'b, 'a: 'b> FdtNode<'b, 'a> {
+    /// Returns an iterator over this node's `reg` entries, honoring the
+    /// parent's cell widths; `None` when the node has no `reg` property or
+    /// the cell widths exceed the supported 2-cell maximum.
     pub fn reg(self) -> Option<RegIter<'a>> {
         let sizes = self.parent_cell_sizes();
         if sizes.address_cells > 2 || sizes.size_cells > 2 {
@@ -282,6 +297,8 @@ impl<'b, 'a: 'b> FdtNode<'b, 'a> {
         ))
     }
 
+    /// Returns this node's `#address-cells` / `#size-cells`, falling back
+    /// to the spec defaults (2 and 1).
     pub fn cell_sizes(self) -> CellSizes {
         let mut cell_sizes = CellSizes::default();
 

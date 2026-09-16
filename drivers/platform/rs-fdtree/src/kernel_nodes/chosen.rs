@@ -5,16 +5,21 @@
 //! Linux kernel /chosen helpers.
 use crate::node::FdtNode;
 
+/// The `/chosen` node: firmware-to-kernel runtime parameters selected by
+/// the boot loader.
 #[derive(Debug, Clone, Copy)]
 pub struct Chosen<'b, 'a> {
     pub(crate) node: FdtNode<'b, 'a>,
 }
 
 impl<'b, 'a: 'b> Chosen<'b, 'a> {
+    /// Returns the kernel command line chosen by the boot loader.
     pub fn bootargs(self) -> Option<&'a str> {
         self.node.property_str("bootargs")
     }
 
+    /// Returns the path of the node the boot loader designated as the
+    /// console output device.
     pub fn stdout_path(self) -> Option<&'a str> {
         self.node
             .property_str("stdout-path")

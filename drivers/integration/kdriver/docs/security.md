@@ -1,5 +1,15 @@
 # kdriver — Security and Reliability Analysis
 
+## Scope
+
+This analysis covers the entire crate: `src/lib.rs`, `src/manager.rs`,
+`src/enumeration.rs`, `src/resource.rs`, `src/block_completion*.rs`,
+`src/block_irq.rs`, `src/bus/`, and `src/driver_registry/` (including
+the VirtIO, block, char, and net driver glue), plus `src/tests/`, which
+is test-only. Reusable concrete drivers behind the registry are audited
+in their own crates; this document covers the host integration glue.
+
+
 ## Trust Model
 
 ```text

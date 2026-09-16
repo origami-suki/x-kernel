@@ -2,6 +2,35 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
+//! Early-boot console: UART drivers plus console/emergency-output runtime.
+//!
+//! This crate owns the dedicated boot console path that runs before the
+//! bus manager and driver registry exist. `serial` provides PL011 and
+//! NS16550 (MMIO or IO-port) UART drivers; `runtime` owns console
+//! adoption, the emergency output sink, and handoff to later users.
+//!
+//! # Example
+//!
+//! Console use is mediated by the runtime entry points rather than the
+//! UART objects directly — platform init registers the adopted device
+//! ([`runtime::register_console_runtime`]), and later subsystems emit
+//! output through the active console
+//! ([`runtime::write_active_console`]) or read it via
+//! [`runtime::read_active_console`]. A production call site is the
+//! emergency-output path in `core/kruntime` (panic/early-print
+//! handling), which drives `write_active_console` after console
+//! adoption completes.
+//!
+//! ```ignore
+//! // Kernel code only: the console must have been adopted during
+//! // platform init (register_console_runtime) before these calls.
+//! use console_driver::runtime;
+//!
+//! runtime::write_active_console(b"[kinit] starting services\n");
+//! if let Some(Ok(n)) = runtime::read_active_console(&mut buf) {
+//!     // `n` bytes of console input are available in `buf`.
+//! }
+//! ```
 #![no_std]
 
 extern crate alloc;

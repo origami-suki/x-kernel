@@ -7,8 +7,11 @@
 /// Possible errors when working with a Flattened Device Tree.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FdtError {
+    /// The blob's header magic is not `0xd00dfeed`.
     BadMagic,
+    /// A null pointer was passed where a DTB pointer was required.
     BadPtr,
+    /// The buffer is shorter than the header-declared total size.
     BufferTooSmall,
 }
 

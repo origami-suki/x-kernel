@@ -1,5 +1,14 @@
 # console-driver — Emergency Output Security and Reliability
 
+## Scope
+
+This analysis covers the entire crate: `src/lib.rs` (IRQ handler
+registration and console state), `src/runtime.rs` (console adoption and
+the active-console runtime), and `src/serial.rs` (PL011/NS16550 UART
+drivers). No modules are excluded; the emergency-output path is
+reachable from the audited entry points.
+
+
 ## Trust Model and External Boundaries
 
 Port construction trusts the platform/device layer to provide valid UART addresses,

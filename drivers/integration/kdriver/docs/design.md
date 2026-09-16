@@ -1,32 +1,41 @@
-# kdriver — 设计文档
+# kdriver — Design
 
-## 定位
+## Purpose
 
-`kdriver` 是 x-kernel 的设备驱动编排和 host integration crate。
-它拥有总线后端(bus backend)管理、驱动注册与匹配、设备发现→绑定→激活的完整流水线，
-以及基于 devres 生命周期的资源管理(mmio / irq / dma / time)能力。
-所有激活的运行时设备最终发布到对应类型的 `kclass` 注册表中。
+`kdriver` is x-kernel's device-driver orchestration and host-integration
+crate. It owns bus-backend management, driver registration and matching,
+the full discover → bind → activate pipeline, and devres-lifecycle-based
+resource management (mmio / irq / dma / time). All activated runtime
+devices are ultimately published into the matching typed `kclass`
+registries.
 
-`kdriver` 允许接触 X-Kernel host API，但只能作为 provider 实现持有者、总线发现
-后端或具体驱动 glue。可复用具体驱动仍必须只依赖 driver subsystem contract。
+`kdriver` is allowed to touch X-Kernel host APIs, but only as a provider
+implementation holder, bus discovery backend, or concrete driver glue.
+Reusable concrete drivers must still depend only on driver subsystem
+contracts.
 
-目标读者是添加新总线后端、新设备驱动或修改设备发现/匹配策略的开发者。
+The intended audience is developers adding new bus backends, new device
+drivers, or changing device discovery/matching policy.
 
-## 背景
+## Background
 
-Linux 设备模型的核心是总线(bus)、设备(device)、驱动(driver)三者分离：
-总线负责发现设备，驱动声明自己支持的设备特征，内核在中间完成匹配与绑定。
-`kdriver` 把这一架构落实为 crate 级抽象：
+The core of the Linux device model separates bus, device, and driver: the
+bus discovers devices, drivers declare the device characteristics they
+support, and the kernel performs matching and binding in between.
+`kdriver` lands that architecture as crate-level abstractions:
 
-- 总线后端抽象为 `BusBackend` trait，支持 PCI 和 platform 两种实例；
-- 设备描述符(`DeviceDesc`)由总线发现阶段产生，不直接生成运行时对象；
-- 驱动通过 `DeviceDriver` trait 声明匹配器和探测回调；
-- `kdevice` 提供共享设备核心(device core)，管理 `BusInstance`、`DeviceObject`、`DriverObject` 的持久化拓扑；
-- `kclass` 按设备类别(net / block / display / input / vsock / char / 9p)提供类型化发布入口。
+- bus backends are abstracted behind the `BusBackend` trait, with PCI and
+  platform instances;
+- device descriptors (`DeviceDesc`) are produced by bus discovery and do
+  not directly create runtime objects;
+- drivers declare matchers and probe callbacks through the `DeviceDriver`
+  trait;
+- `kdevice` provides the shared device core, owning the persistent
+  topology of `BusInstance`, `DeviceObject`, and `DriverObject`;
+- `kclass` provides the typed publication entry per category
+  (net / block / display / input / vsock / char / 9p).
 
-## 范围
-
-涉及的源文件：
+## Scope
 
 ```text
 drivers/integration/kdriver/
@@ -35,53 +44,82 @@ drivers/integration/kdriver/
 │   ├── design.md
 │   └── security.md
 └── src/
-    ├── lib.rs                   # crate 入口，init_drivers、ownership summary API
-    ├── manager.rs               # DeviceManager 与统一发现流水线
-    ├── enumeration.rs           # EnumerationContext，总线后端写入的描述符缓冲
+    ├── lib.rs                   # crate entry, init_drivers, ownership summary API
+    ├── manager.rs               # DeviceManager and the unified discovery pipeline
+    ├── enumeration.rs           # EnumerationContext, descriptor buffer bus backends write
     ├── resource.rs              # provider holder and DriverResult wrappers
     ├── block_completion.rs      # block wait/signals host provider
+    ├── block_completion_dispatch.rs  # block completion reclaimer (softirq batches)
+    ├── block_irq.rs             # shared block IRQ request adapter
     ├── bus/
-    │   ├── mod.rs               # 总线模块 root
+    │   ├── mod.rs               # bus module root
     │   ├── backend.rs           # BusBackend trait
-    │   ├── manager.rs           # BusManager 多后端管理
-    │   ├── pci_backend.rs       # PCI 总线发现实现
-    │   ├── pci_support.rs       # PCI BAR 分配与设备配置
-    │   ├── platform_backend.rs  # Platform 总线(firmware + 静态设备)
-    │   └── local_id.rs          # 总线后端本地 ID 分配器
-    └── driver_registry/
-        ├── mod.rs               # DriverRegistrar，ownership summary 类型
-        ├── firmware_specs.rs    # 平台驱动的固件匹配规格
-        ├── virtio/
-        │   ├── mod.rs           # VirtIO 驱动描述符与激活逻辑
-        │   ├── ids.rs           # VirtIO 设备类型码与 PCI ID 映射
-        │   └── glue.rs          # VirtIoHal 实现，绑定 kdma/iomap
-        ├── block/mod.rs         # 块设备驱动注册
-        ├── char/mod.rs          # 字符设备驱动注册(console)
-        └── net/mod.rs           # 网络设备驱动注册
+    │   ├── manager.rs           # BusManager multi-backend management
+    │   ├── pci_backend.rs       # PCI bus discovery
+    │   ├── pci_support.rs       # PCI BAR allocation and device configuration
+    │   ├── platform_backend.rs  # platform bus (firmware + static devices)
+    │   └── local_id.rs          # bus-backend local id allocator
+    ├── driver_registry/
+    │   ├── mod.rs               # DriverRegistrar, ownership summary types
+    │   ├── firmware_specs.rs    # firmware match specs for platform drivers
+    │   ├── virtio/
+    │   │   ├── mod.rs           # VirtIO driver descriptors and activation
+    │   │   ├── ids.rs           # VirtIO device type codes and PCI id mapping
+    │   │   └── glue.rs          # VirtIoHal implementation, kdma/iomap binding
+    │   ├── block/               # block driver registration
+    │   │   ├── mod.rs           #   ahci, bcm2835_sdhci, ramdisk, sdmmc registry
+    │   │   ├── ahci.rs          #   AHCI platform driver glue
+    │   │   ├── bcm2835_sdhci.rs #   BCM2835 SDHCI glue
+    │   │   ├── ramdisk.rs       #   ramdisk glue
+    │   │   └── sdmmc.rs         # sdmmc glue
+    │   ├── char/
+    │   │   ├── mod.rs           # char device driver registration (console)
+    │   │   └── serial.rs        # serial/UART platform driver glue
+    │   └── net/
+    │       ├── mod.rs           # net device driver registration
+    │       ├── fxmac.rs         # FXMAC platform driver glue
+    │       ├── ixgbe.rs         # ixgbe PCI driver glue
+    │       └── ixgbe_hal.rs     # ixgbe HAL adapter
+    └── tests/                   # block host tests (physically grouped)
+        ├── block_completion.rs
+        ├── block_completion_dispatch.rs
+        ├── block_irq.rs
+        ├── block_requests.rs
+        └── virtio_block_activation.rs
 ```
 
-## 架构
+## Architecture
 
-启用 `block` 时，`block_completion::prepare_block_wait` 实现 block 的等待契约，
-以 `PrepareBlockWait` 函数指针注入。
-`HostSignals` 拥有两个私有 `kpoll::Completion`：admission 使用可消耗 token，terminal
-使用永久 `complete_all`，从不 reinit。`HostBlockWaiter` 先通过 `PreparedTaskWait`
-验证任务上下文，再创建 source 并注册 terminal。独立的 terminal registration guard
-跨准入等待及虚假唤醒保存，Drop 时先撤销注册，再释放 signals 和 task 引用。
-准备函数直接返回 boxed waiter，waiter.signals() 克隆其已有的通知状态 Arc，
-terminal 只持一个
-`PollRegistration`，不使用多注册容器；admission 每轮也持有单个局部 guard。
+When `block` is enabled, `block_completion::prepare_block_wait` implements
+the block waiting contract, injected as a `PrepareBlockWait` function
+pointer. `HostSignals` owns two private `kpoll::Completion`s: admission
+uses consumable tokens, terminal uses a permanent `complete_all` and is
+never re-initialized. `HostBlockWaiter` verifies task context through
+`PreparedTaskWait` before creating sources and registering the terminal.
+A separate terminal-registration guard is held across the admission wait
+and spurious wakeups; on Drop it first revokes the registration, then
+releases the signals and task references. The prepare function directly
+returns the boxed waiter; `waiter.signals()` clones its existing
+notification-state `Arc`; the terminal holds a single
+`PollRegistration` rather than a multi-registration container, and
+admission also holds a single local guard per round.
 
-admission 每轮 check/register/recheck 后 park；terminal 仅 try_wait/park。
-两个等待源使用同一个预备 waker，不会让 admission 的注册轮次清除 terminal 注册。
-admission 在每轮返回/park 后释放该轮 guard；下一轮注册前到达的通知保留为 token。
-该 provider 已注入 virtio-blk IRQ probe。ktask/kpoll 依赖只由 block feature
-开启，不传递给具体驱动；现有文件系统仍使用相同的通用 block 接口。
+Admission parks after each check/register/recheck round; terminal only
+try_waits or parks. Both wait sources share one prepared waker, so an
+admission registration round cannot clear the terminal registration.
+Admission releases that round's guard after each return/park; a
+notification arriving before the next round's registration is retained as
+a token. This provider is injected into the virtio-blk IRQ probe.
+ktask/kpoll dependencies are enabled only by the block feature and are not
+propagated to concrete drivers; existing filesystems keep using the same
+generic block interface.
 
-每次 prepare_block_wait 有五个 metadata heap object：boxed waiter、HostSignals Arc、
-两个 PollSet inner Arc、KWaker Arc。一次私有注册适配 kpoll 的 inline storage，
-无需额外扩容；不新增数据 buffer 或数据复制。已有 EEVDF wake 路径可能分配，
-不能把本层不新增 wake bookkeeping 分配描述为整个唤醒链零分配。
+Each `prepare_block_wait` allocates five metadata heap objects: the boxed
+waiter, the HostSignals `Arc`, two PollSet inner `Arc`s, and a KWaker
+`Arc`. One private registration fits kpoll's inline storage with no extra
+growth; no data buffers or data copies are added. The existing EEVDF wake
+path may allocate, so this layer adding no wake bookkeeping allocations
+must not be described as the whole wakeup chain being allocation-free.
 
 ```text
                         init_drivers()
@@ -111,7 +149,7 @@ admission 在每轮返回/park 后释放该轮 guard；下一轮注册前到达�
             │ publish
             ▼
      ┌──────────────┐
-     │ kclass 注册表 │
+     │ kclass registries │
      │ net / block  │
      │ display      │
      │ input / vsock│
@@ -119,18 +157,18 @@ admission 在每轮返回/park 后释放该轮 guard；下一轮注册前到达�
      └──────────────┘
 ```
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |------|------|
-| `DeviceManager` | 持有 `BusManager` + `DriverRegistrar`，编排「发现→匹配→绑定→激活」完整流水线 |
-| `BusManager` | 管理多个共存的后端实例；负责 `early_init` → `enumerate` → `rescan` → `quiesce` → `remove` 生命周期 |
-| `BusBackend` | 总线后端 trait；实现者通过 `EnumerationContext` 写入 `DeviceDesc` |
-| `EnumerationContext` | 描述符缓冲：记录发现阶段产生的设备描述符，随后执行统一 probe |
-| `DriverRegistrar` | 驱动注册门面：把 `DeviceDriver` 实现注册到 `kdevice` 驱动核心 |
-| `PlatformBackend` | 统一平台总线：firmware 描述的(device-tree / ACPI) + 编译期已知的静态设备 |
-| `PciBackend` | PCI 总线：ECAM/MmioCam 枚举，BAR 分配，host bridge / PCI-to-PCI bridge adoption |
-| `device-res-xkernel` | x-kernel 资源提供者实现；对接 `memspace`(iomap)、`kirq`(irq)、`kdma`(dma) |
-| VirtIO 驱动族 | 每条 VirtIO 设备类型生成 PCI/MMIO 两个 `DeviceDriver` 描述符，共享同一激活路径 |
-| Platform 驱动族 | ramdisk、AHCI、bcm2835-sdhci、sdmmc、fxmac 等平台设备驱动 |
+| `DeviceManager` | Holds `BusManager` + `DriverRegistrar`; orchestrates the full discover → match → bind → activate pipeline |
+| `BusManager` | Manages coexisting backend instances; owns the `early_init` → `enumerate` → `rescan` → `quiesce` → `remove` lifecycle |
+| `BusBackend` | Bus-backend trait; implementers write `DeviceDesc`s through `EnumerationContext` |
+| `EnumerationContext` | Descriptor buffer: records descriptors produced during discovery, then runs the unified probe |
+| `DriverRegistrar` | Driver registration facade: registers `DeviceDriver` impls into the `kdevice` driver core |
+| `PlatformBackend` | Unified platform bus: firmware-described (device-tree / ACPI) plus compile-time-known static devices |
+| `PciBackend` | PCI bus: ECAM/MmioCam enumeration, BAR allocation, host-bridge / PCI-to-PCI-bridge adoption |
+| `device-res-xkernel` | x-kernel resource provider implementation; bridges `memspace` (iomap), `kirq` (irq), `kdma` (dma) |
+| VirtIO driver family | Each VirtIO device type yields two `DeviceDriver` descriptors (PCI/MMIO) sharing one activation path |
+| Platform driver family | ramdisk, AHCI, bcm2835-sdhci, sdmmc, fxmac, and other platform device drivers |
 
 ## Block Device Completion Processing
 
@@ -235,39 +273,48 @@ Block host tests are physically grouped in src/tests/. Each unit test file is
 included under its owning module with #[path], preserving private access and
 the existing test namespace without a test-only directory per runtime module.
 
-## 初始化路径
+## Initialization Paths
 
-初始化分为三条刻意分离的路径：
+Initialization is split into three deliberately separate paths:
 
-### 1. 平台早期初始化 (`early_driver_init`)
+### 1. Platform early init (`early_driver_init`)
 
-在通用驱动模型之前运行，负责 timer、IRQ 和 boot console 等必须提前工作的子系统。
-此阶段不经过总线枚举——由平台 HAL 直接启动。
+Runs before the generic driver model and brings up the subsystems that must
+work earliest: timer, IRQ, and the boot console. This stage does not go
+through bus enumeration — the platform HAL starts it directly.
 
-### 2. 描述符优先路径 (descriptor-first)
+### 2. The descriptor-first path
 
-这是主路径，由 `init_drivers()` → `discover_unified()` 驱动：
+This is the main path, driven by `init_drivers()` → `discover_unified()`:
 
-1. **总线枚举**：`PlatformBackend` 和 `PciBackend` 各自枚举设备，通过 `EnumerationContext::register_device` 写入 `DeviceDesc` 到 `kdevice` 共享核心。
-2. **驱动匹配**：`EnumerationContext::probe_pending()` 对每个描述符执行 `kdevice::probe_device_desc`，在已注册的 `DeviceDriver` 中按 `bus_type` + `matcher` 匹配。
-3. **绑定与激活**：匹配成功后调用 `DeviceDriver::probe_device`，驱动在其中完成硬件初始化并把运行时设备发布到 `kclass` 注册表。
-4. **未匹配设备**：没有匹配驱动的描述符进入 `unclaimed` 列表，日志记录但不阻断系统启动。
+1. **Bus enumeration**: `PlatformBackend` and `PciBackend` each enumerate
+   devices, writing `DeviceDesc`s into the `kdevice` shared core through
+   `EnumerationContext::register_device`.
+2. **Driver matching**: `EnumerationContext::probe_pending()` runs
+   `kdevice::probe_device_desc` for every descriptor, matching against
+   registered `DeviceDriver`s by `bus_type` + `matcher`.
+3. **Binding and activation**: on a match, `DeviceDriver::probe_device` is
+   called; the driver performs hardware initialization and publishes the
+   runtime device into the `kclass` registries.
+4. **Unmatched devices**: descriptors with no matching driver land in the
+   `unclaimed` list — logged, but never blocking boot.
 
-### 3. adoption 路径
+### 3. The adoption path
 
-预留给已在早期初始化中运行但缺少运行时设备模型对象的设备（如 boot console）。
-通过 `kdevice::adopt_active_device` 把已运行的设备注册到设备树中，
-使后续的 sysfs/设备查询路径能发现它。
+Reserved for devices that already run from early init but lack runtime
+device-model objects (such as the boot console).
+`kdevice::adopt_active_device` registers the running device into the device
+tree so later sysfs/device query paths can discover it.
 
-## 状态机
+## State Machine
 
-### 设备核心状态
+### Device core states
 
-`kdevice` 中每个 `DeviceRecord` 经历以下状态迁移：
+Each `DeviceRecord` in `kdevice` moves through:
 
 ```text
                     ┌──────────┐
-                    │Discovered│  ← 总线枚举 create
+                    │Discovered│  ← bus enumeration create
                     └────┬─────┘
                          │ driver matched
                          ▼
@@ -282,7 +329,7 @@ the existing test namespace without a test-only directory per runtime module.
                          │ activate (probe success)
                          ▼
                     ┌──────────┐
-                    │  Active  │  ← 运行时设备已发布到 kclass
+                    │  Active  │  ← runtime device published to kclass
                     └────┬─────┘
                          │ remove
                          ▼
@@ -296,19 +343,19 @@ the existing test namespace without a test-only directory per runtime module.
                     └──────────┘
 ```
 
-| 从 | 到 | 触发条件 |
+| From | To | Trigger |
 |----|----|----------|
-| — | Discovered | 总线后端 `enumerate` 调用 `register_device` |
-| Discovered | Matched | `probe_device_desc` 找到匹配驱动 |
-| Matched | Bound | 驱动绑定成功，设备-驱动关系建立 |
-| Bound | Active | `DeviceDriver::probe_device` 返回 `Ok` |
-| Matched/Bound/Active | Removing | `remove_device_managed` 被调用 |
-| Removing | Removed | devres 清理完成，驱动 remove 回调执行完毕 |
+| — | Discovered | bus backend `enumerate` calls `register_device` |
+| Discovered | Matched | `probe_device_desc` finds a matching driver |
+| Matched | Bound | binding succeeds; device-driver relation established |
+| Bound | Active | `DeviceDriver::probe_device` returns `Ok` |
+| Matched/Bound/Active | Removing | `remove_device_managed` is called |
+| Removing | Removed | devres cleanup completes and the driver remove callback ran |
 
-未匹配的设备停留在 `Discovered` 但进入 `unclaimed` 列表，
-不生成 `DeviceObject`。
+Unmatched devices stay `Discovered` but enter the `unclaimed` list and
+never get a `DeviceObject`.
 
-### 总线后端生命周期
+### Bus backend lifecycle
 
 ```text
 BusManager::register(backend)
@@ -319,61 +366,87 @@ Registered ──► early_init() ──► enumerate() ──► probe_pending(
                    │                 ├─ Activated (→ kclass publish)
                    │                 └─ Unclaimed (log + skip)
                    │
-              rescan() ◄── 热插拔 / 重扫描
+              rescan() ◄── hotplug / rescan
                    │
-              quiesce() ──► 暂停事件 (shutdown / suspend)
+              quiesce() ──► suspend events (shutdown / suspend)
                    │
-              remove() ──► 总线拆除 (orderly shutdown)
+              remove() ──► bus teardown (orderly shutdown)
 ```
 
-## 算法流程
+## Flows
 
-### PCI 总线枚举
+### PCI bus enumeration
 
-1. 根据 `pci_cam_kind()` 选择 ECAM 或 MmioCam 访问方式。
-2. 打开 `PciBus`，获取 config space 访问能力。
-3. Adoption host bridge：在 platform 总线上创建 `pci-host` 设备作为 PCI 设备树的根。
-4. **Pass 1**：遍历 bus 0..bus_end 所有 BDF，按 `HeaderType` 分流：
-   - `Standard` → endpoint 列表
-   - `PciPciBridge` → bridge 列表，读取 secondary/subordinate bus 号
-   - 其他 → 跳过并记录日志
-5. **Pass 2**：为每个 PCI-to-PCI bridge 调用 `adopt_active_device` 创建 `pci-bridge` 设备对象，
-   同时创建对应的 secondary `BusInstance`。
-6. **Pass 3**：遍历 endpoint 列表，对每个设备：
-   - 调用 `configure_pci_device_if_needed` 分配未分配的 BAR、启用 command 寄存器
-   - 读取 BAR 信息构建 `ResourceSet` (MMIO / IO Port / Legacy INTx IRQ)
-   - 检测是否为 VirtIO-over-PCI 设备，若是则附加 `TransportInfo::Virtio`
-   - 通过 `EnumerationContext::register_device_with_parent` 注册，parent 指向 host bridge 或 parent bridge
+1. Pick ECAM or MmioCam access per `pci_cam_kind()`.
+2. Open `PciBus` and obtain configuration-space access.
+3. Adopt the host bridge: create a `pci-host` device on the platform bus as
+   the root of the PCI device tree.
+4. **Pass 1**: walk all BDFs on bus 0..bus_end, dispatching on `HeaderType`:
+   - `Standard` → endpoint list;
+   - `PciPciBridge` → bridge list, reading secondary/subordinate bus
+     numbers;
+   - others → skipped with a log entry.
+5. **Pass 2**: call `adopt_active_device` per PCI-to-PCI bridge to create
+   the `pci-bridge` device object, plus the corresponding secondary
+   `BusInstance`.
+6. **Pass 3**: walk the endpoint list; for each device:
+   - call `configure_pci_device_if_needed` to assign unassigned BARs and
+     enable the command register;
+   - read BAR info and build the `ResourceSet` (MMIO / IO port / legacy
+     INTx IRQ);
+   - detect VirtIO-over-PCI devices and attach `TransportInfo::Virtio`;
+   - register through `EnumerationContext::register_device_with_parent`,
+     with the parent pointing at the host bridge or parent bridge.
 
-### Platform 总线枚举
+### Platform bus enumeration
 
-1. **Firmware 阶段**：遍历 firmware 描述的设备节点 (DT compatible / ACPI)。
-   - 对每个节点，查询已注册的 `FirmwareMatchSpec`（如 AHCI、sdmmc、fxmac 等）完成 compatible 匹配。
-   - VirtIO MMIO 特殊处理：检测 `virtio,mmio` compatible，映射 MMIO 探测 VirtIO 设备类型。
-   - 构建 `ResourceSet`（MMIO + IRQ），通过 `EnumerationContext` 注册。
-2. **UART/serial 节点**：DT 中的 UART 节点（含 stdout）在此阶段被枚举。stdout UART 由 serial 驱动经 `take_early_port` 复用早期 boot 实例（同一硬件、不重新映射），其余 UART 各自映射并发布为独立 char 设备。
-3. **静态设备阶段**：注册编译期已知的平台设备（ramdisk 始终注册；AHCI/sdmmc/bcm2835-sdhci 仅在无 firmware 描述时注册）。
+1. **Firmware stage**: walk firmware-described device nodes (DT compatible
+   / ACPI).
+   - For each node, query the registered `FirmwareMatchSpec`s (AHCI,
+     sdmmc, fxmac, ...) for compatible matching.
+   - VirtIO MMIO is special-cased: the `virtio,mmio` compatible is
+     detected and the MMIO region mapped to probe the VirtIO device type.
+   - Build the `ResourceSet` (MMIO + IRQ) and register through the
+     `EnumerationContext`.
+2. **UART/serial nodes**: UART nodes in the DT (including the stdout
+   console) are enumerated here. The stdout UART is reused by the serial
+   driver through `take_early_port` (same hardware, no re-map); other
+   UARTs map their own ports and publish as independent char devices.
+3. **Static device stage**: register compile-time-known platform devices
+   (ramdisk is always registered; AHCI/sdmmc/bcm2835-sdhci only when no
+   firmware description exists).
 
-   > ramdisk 的存储后端由 `KFEAT_DRIVER_RAMDISK_STATIC` 控制：关闭时为 16 MiB 全零堆内存（仅用于驱动验证）；开启时由构建期嵌入的文件系统镜像零拷贝承载（路径由 Makefile 变量 `RAMDISK_IMG` 指定，格式由 `RAMDISK_IMG_FS` 控制，默认 ext4，由 `make ramdisk_img` 生成空镜像），从而可挂载为真实的可读写 root 文件系统。详见 `drivers/contracts/block/src/ramdisk_image.rs`。
+   > The ramdisk storage backend is controlled by `KFEAT_DRIVER_RAMDISK_STATIC`:
+   > when off it is 16 MiB of zeroed heap memory (driver validation only); when
+   > on it is zero-copy backed by a filesystem image embedded at build time (path
+   > from the Makefile variable `RAMDISK_IMG`, format from `RAMDISK_IMG_FS`,
+   > default ext4, an empty image generated by `make ramdisk_img`), so it can be
+   > mounted as a real read-write root filesystem. See
+   > `drivers/contracts/block/src/ramdisk_image.rs`.
 
-### 驱动匹配与激活
+### Driver matching and activation
 
-1. `EnumerationContext::probe_pending` 取出所有 pending 描述符。
-2. 对每个描述符调用 `kdevice::probe_device_desc`：
-   - 按 `bus_type` 筛选驱动
-   - 调用 `DeviceDriver::matcher().matches(identity)` 判断是否匹配
-   - 匹配时执行 bind → activate
-3. 激活成功的设备：运行时对象已发布到对应 `kclass` 注册表。
-4. 未匹配(`Unclaimed`)或被请求重排队(`Requeue`)的描述符进入 `unclaimed` 列表。
+1. `EnumerationContext::probe_pending` takes all pending descriptors.
+2. For each descriptor it calls `kdevice::probe_device_desc`:
+   - filter drivers by `bus_type`;
+   - call `DeviceDriver::matcher().matches(identity)` to test the match;
+   - on a match, run bind → activate.
+3. Successfully activated devices have their runtime objects published to
+   the matching `kclass` registries.
+4. Unmatched (`Unclaimed`) or requeue-requested (`Requeue`) descriptors
+   enter the `unclaimed` list.
 
-### VirtIO 设备激活
+### VirtIO device activation
 
-VirtIO 驱动在 PCI 和 MMIO 两条传输路径上共享同一激活入口：
+VirtIO drivers share one activation entry across the PCI and MMIO
+transports:
 
-1. **PCI 路径**：从 `DeviceLocation::Pci` 中提取 BDF，重新打开 `PciBus` 执行 `probe_pci_device`，
-   确认传输层上报的 `DeviceKind` 与驱动声明一致。
-2. **MMIO 路径**：从 `DeviceLocation::Mmio` 中提取物理地址和大小，`iomap_mmio` 后执行 `probe_mmio_device`。
-3. **分发**：`dispatch_virtio_try_new` 按 `DeviceKind` 分发到对应构造器：
+1. **PCI path**: extract the BDF from `DeviceLocation::Pci`, reopen
+   `PciBus`, and run `probe_pci_device`, confirming the transport's
+   reported `DeviceKind` matches the driver's declaration.
+2. **MMIO path**: extract the physical address and size from
+   `DeviceLocation::Mmio`, `iomap_mmio`, then run `probe_mmio_device`.
+3. **Dispatch**: `dispatch_virtio_try_new` dispatches on `DeviceKind`:
    - `DeviceKind::Net` → `VirtIoNet::try_new` → `kclass::publish_net`
    - `DeviceKind::Block` → `block::activate` → IRQ setup → `kclass::publish_block`
    - `DeviceKind::Display` → `VirtIoGpu::try_new` → `kclass::publish_display`
@@ -381,161 +454,203 @@ VirtIO 驱动在 PCI 和 MMIO 两条传输路径上共享同一激活入口：
    - `DeviceKind::Vsock` → `VirtIoSocket::try_new` → `kclass::publish_vsock`
    - `DeviceKind::Fs9p` → `VirtIo9p::try_new` → `kclass::publish_virtio_9p`
 
-### 资源管理 (devres)
+### Resource management (devres)
 
-`device-res-xkernel` 提供 X-Kernel 对 `device-res` provider contract 的实现类型；
-driver-facing 资源 API 由 `kdriver::resource` 以 `DeviceResourceExt` 暴露给驱动。
-`kdriver::resource` 持有静态 `XKernelResourceProvider`，并把它显式传给
-`device_res::devm_*_with_provider()`，资源释放时 RAII handle 回到创建它的同一个
-provider：
+`device-res-xkernel` provides x-kernel's implementation type for the
+`device-res` provider contract; the driver-facing resource API is exposed
+to drivers by `kdriver::resource` as `DeviceResourceExt`.
+`kdriver::resource` holds the static `XKernelResourceProvider` and passes
+it explicitly to `device_res::devm_*_with_provider()`; on release the RAII
+handles return to the same provider that created them:
 
-- **`device.devm_iomap`**：通过 `memspace::iomap_device` 映射 MMIO，probe 失败或设备 remove 时自动 `iounmap`。
-- **`device.devm_request_irq`**：把 devres IRQ handler 适配成 `kirq` shared action，并注册到
-  `kirq` 的 IRQ core action list。
-- **`device.devm_request_threaded_irq` / `device.devm_request_threaded_irq_default`**：把
-  devres primary/thread handler 绑定到 provider contract。当前基于 main 的
-  `device-res-xkernel` provider 尚未覆盖 threaded IRQ 方法，因此返回
-  `DriverError::Unsupported`；后续 kirq threadirq 分支会补齐 xkernel 实现。
-  `device-res-xkernel` 是 devres IRQ resource 与 kernel IRQ core 的适配层，负责把
-  `device_res` 的 trigger/controller/event/handler 转换到 `kirq` 自有类型；`kirq`
-  不反向依赖 devres。
-  后续 IRQ core 能力扩展必须放在 `kirq`，驱动框架只通过该适配层向驱动暴露内核
-  IRQ 能力。
-- **`device.devm_alloc_coherent`**：通过 `kdma::allocate_dma_memory` 分配一致性 DMA 缓冲区，release 时调用 `kdma::deallocate_dma_memory`。
-- **`resource_provider().monotonic_time`**：仅供 X-Kernel glue 向可复用驱动传入
-  `device_res::TimeOp`；具体驱动不能直接调用 `khal::time`。
+- **`device.devm_iomap`**: maps MMIO through `memspace::iomap_device`;
+  automatically `iounmap`s on probe failure or device remove.
+- **`device.devm_request_irq`**: adapts the devres IRQ handler into a
+  `kirq` shared action registered on the `kirq` IRQ core action list.
+- **`device.devm_request_threaded_irq` /
+  `device.devm_request_threaded_irq_default`**: bind devres primary/thread
+  handlers to the provider contract. The current mainline
+  `device-res-xkernel` provider does not yet cover the threaded IRQ
+  methods, so they return `DriverError::Unsupported`; a later kirq
+  threadirq branch will supply the xkernel implementation.
+  `device-res-xkernel` is the adaptation layer between devres IRQ
+  resources and the kernel IRQ core, translating `device_res`
+  trigger/controller/event/handler values into `kirq`'s own types; `kirq`
+  does not depend back on devres.
+  Future IRQ core capability extensions belong in `kirq`; the driver
+  framework exposes kernel IRQ capability to drivers only through this
+  adapter.
+- **`device.devm_alloc_coherent`**: allocates a coherent DMA buffer via
+  `kdma::allocate_dma_memory`; release calls
+  `kdma::deallocate_dma_memory`.
+- **`resource_provider().monotonic_time`**: only X-Kernel glue passes
+  `device_res::TimeOp` into reusable drivers; concrete drivers must not
+  call `khal::time` directly.
 
-释放顺序与申请顺序相反（LIFO），避免资源依赖错乱。
+Release runs in reverse acquisition order (LIFO) so resource dependencies
+are never inverted.
 
-### IRQ 分发机制
+### IRQ dispatch mechanism
 
-`device-res-xkernel::XKernelResourceProvider` 不维护本地 IRQ line state。它把
-`device_res::IrqResource` 转换为 `kirq::IrqSpec`，把 `device_res::IrqHandler`
-包装为 `kirq::IrqHandler`，再按 API 选择注册到 IRQ core：
+`device-res-xkernel::XKernelResourceProvider` keeps no local IRQ line
+state. It converts `device_res::IrqResource` into `kirq::IrqSpec`, wraps
+`device_res::IrqHandler` as `kirq::IrqHandler`, and registers with the IRQ
+core per API:
 
-1. `request_irq` 调用 `kirq::try_register_shared()`，由 `kirq` 分配 line-local
-   `IrqActionToken` 并保存 action identity；provider 返回
-   `device_res::IrqHandlerToken::SharedAction(id)` 给 devres。
-2. `request_threaded_irq` / `request_threaded_irq_default` 当前沿用 `device_res::IrqOp`
-   默认实现，返回 `Unsupported`，等待 kirq threadirq provider override。
-3. 中断到达时，`kirq` 从 `IrqDescRuntimeState` 复制 action snapshot，按顺序
-   调用每个 handler，并把 resolved `virq` 作为 handler 参数传入。每个 wrapper 再把
-   devres handler 返回的 `device_res::IrqEvent` 转换为 `kirq::IrqEvent`。
-4. `kirq` 在整条 line fanout 完成后合并 source bitmap，并由 `kirq::notify`
-   直接唤醒 line/source waiter。`kdriver` 不再安装 dispatch hook，也不参与 async
-   wake bridge。
-5. `release_irq` 对 shared hardirq token 调用 `kirq::free_irq_action()`，只移除当前
-   devres handler 对应的 action。
+1. `request_irq` calls `kirq::try_register_shared()`; `kirq` allocates a
+   line-local `IrqActionToken` and stores the action identity; the provider
+   returns `device_res::IrqHandlerToken::SharedAction(id)` to devres.
+2. `request_threaded_irq` / `request_threaded_irq_default` currently reuse
+   the `device_res::IrqOp` default implementations, returning
+   `Unsupported` until a kirq threadirq provider override lands.
+3. When an interrupt arrives, `kirq` snapshots the actions from
+   `IrqDescRuntimeState`, invokes each handler in order, and passes the
+   resolved `virq` as the handler argument. Each wrapper then converts the
+   devres handler's `device_res::IrqEvent` into `kirq::IrqEvent`.
+4. After the whole line's fanout, `kirq` merges the source bitmap and
+   `kirq::notify` wakes line/source waiters directly. `kdriver` installs
+   no dispatch hook and takes no part in the async wake bridge.
+5. `release_irq` calls `kirq::free_irq_action()` for shared hardirq
+   tokens, removing only the action belonging to this devres handler.
 
-注册和释放路径允许分配，IRQ dispatch 路径不分配堆内存。
+Registration and release paths may allocate; the IRQ dispatch path does
+not allocate from the heap.
 
-## 并发模型
+## Concurrency Model
 
-- `DeviceManager::bus_mgr` 使用 `SpinNoPreempt`：总线枚举、重扫描、quiesce、remove 操作在 process context 中执行，互斥访问。
-- `EnumerationContext` 自身没有 interior locking：它是总线后端和 probe 之间的单线程桥梁，仅在 `bus_mgr` 锁内被填充。
-- IRQ action fanout、threaded wake/ONESHOT、token teardown 和 `in_flight` 同步由
-  `kirq` 拥有；`device-res-xkernel` 只保存 devres token 与 `kirq` release 入口的
-  适配关系，`kdriver` 不维护 IRQ core 状态。
-- `PCI_BAR_ALLOCATOR` 使用 `SpinNoPreempt`：BAR 分配仅在 process context（枚举或 probe）中发生。
-- `kdevice` 共享核心的内部锁由 `kdevice` crate 自行管理，`kdriver` 不直接持有其锁。
+- `DeviceManager::bus_mgr` uses `SpinNoPreempt`: bus enumeration, rescan,
+  quiesce, and remove run in process context with mutual exclusion.
+- `EnumerationContext` has no interior locking: it is a single-threaded
+  bridge between bus backends and probe, filled only inside the `bus_mgr`
+  lock.
+- IRQ action fanout, threaded wake/ONESHOT, token teardown, and
+  `in_flight` synchronization are owned by `kirq`; `device-res-xkernel`
+  only stores the mapping from devres tokens to `kirq` release calls, and
+  `kdriver` keeps no IRQ core state.
+- `PCI_BAR_ALLOCATOR` uses `SpinNoPreempt`: BAR allocation happens only in
+  process context (enumeration or probe).
+- The `kdevice` shared core's internal locks are managed by the `kdevice`
+  crate itself; `kdriver` never holds them directly.
 
-## 设计决策
+## Design Decisions
 
-### 描述符优先，而非直接创建设备对象
+### Descriptor-first instead of creating device objects directly
 
-**选择**：总线枚举阶段只产生 `DeviceDesc` 描述符，不直接创建 `DeviceObject`。
+**Choice**: bus enumeration only produces `DeviceDesc` descriptors; it does
+not directly create `DeviceObject`s.
 
-**Trade-off**：这增加了一次中间表示和批量 probe 步骤，但换取以下好处：
+**Trade-off**: one extra intermediate representation and a batched probe
+step, in exchange for:
 
-- 未匹配设备的描述符不浪费 `DeviceObject` 的内存和 devres 开销；
-- 所有描述符在 probe 前已收集完毕，便于日志汇总和诊断未匹配设备；
-- 未来可实现描述符去重（如 ACPI 和 DT 同时描述同一设备），在 probe 前合并。
+- unmatched descriptors never pay `DeviceObject` memory or devres costs;
+- all descriptors are collected before probing, making unmatched-device
+  logging and diagnosis a single summary;
+- descriptor deduplication (e.g. ACPI and DT describing the same device)
+  can be implemented before probe.
 
-**拒绝的方案**：Linux 内核的 `device_register` 模式——枚举即注册。
-该模式在发现阶段直接创建设备对象，简化了代码路径，
-但引入了注册与匹配的时序耦合（驱动必须在设备注册前加载）。
-对于 x-kernel 当前所有驱动均为 built-in 的场景，描述符优先更简洁。
+**Rejected alternative**: the Linux `device_register` model — register at
+enumeration. It creates device objects during discovery, simplifying the
+code path, but couples registration to matching in time (drivers must be
+loaded before device registration). With all x-kernel drivers built in,
+descriptor-first is simpler.
 
-### 总线后端 trait 化替代编译期分支
+### Bus backends as a trait instead of compile-time branches
 
-**选择**：PCI 和 platform 总线实现为 `BusBackend` trait 的不同实现，
-在 `default_bus_manager()` 中注册。
+**Choice**: PCI and platform buses are separate implementations of the
+`BusBackend` trait, registered in `default_bus_manager()`.
 
-**Trade-off**：引入动态分发（`Box<dyn BusBackend>`）的微小开销，
-但获得以下好处：
+**Trade-off**: the minor dynamic-dispatch cost of `Box<dyn BusBackend>`, in
+exchange for:
 
-- 同一内核镜像可同时支持 PCI 和 platform 设备，不再需要编译期二选一；
-- 新增总线类型（如 USB、I2C）只需实现 `BusBackend` trait 并注册，
-  无需修改 `BusManager` 核心逻辑；
-- 总线后端的生命周期管理（init/enumerate/rescan/quiesce/remove）统一在
-  `BusManager` 中，减少了每个后端重复的调度代码。
+- one kernel image supports PCI and platform devices simultaneously — no
+  compile-time either/or;
+- a new bus type (USB, I2C, ...) is one `BusBackend` implementation plus
+  registration, with no `BusManager` core changes;
+- backend lifecycle management (init/enumerate/rescan/quiesce/remove) is
+  unified in `BusManager`, removing per-backend scheduling boilerplate.
 
-**拒绝的方案**：编译期 `cfg` 分支在 `BusManager` 内硬编码单一总线类型。
-该方案无动态分发开销，但无法同时支持多种总线，
-且每增加一种总线就需要修改 `BusManager` 内部逻辑。
+**Rejected alternative**: `cfg` branches hard-coding one bus type inside
+`BusManager`. No dispatch overhead, but no multi-bus support, and every new
+bus edits `BusManager` internals.
 
-### PCI BAR 在枚举阶段一次性配置
+### PCI BARs configured once at enumeration
 
-**选择**：PCI 后端在枚举阶段完成 BAR 分配和 command 寄存器配置。
+**Choice**: the PCI backend completes BAR allocation and command-register
+configuration during enumeration.
 
-**Trade-off**：枚举阶段耗时略增（需遍历 endpoint 列表两次——先收集再配置），
-但激活路径简化为纯读取：
+**Trade-off**: slightly longer enumeration (the endpoint list is walked
+twice — collect, then configure), in exchange for a pure-read activation
+path:
 
-- `configure_pci_device_if_needed` 在激活阶段因 BAR 已非零而退化为 no-op；
-- 避免了激活路径中重新查找 firmware MMIO 窗口信息（`pci_bar_allocation_range`）；
-- 如果配置失败，设备在枚举阶段就被跳过，不会产生未配置的 `DeviceDesc`。
+- `configure_pci_device_if_needed` degrades to a no-op at activation since
+  BARs are already non-zero;
+- the activation path never re-derives the firmware MMIO window
+  (`pci_bar_allocation_range`);
+- a configuration failure skips the device at enumeration, so no
+  unconfigured `DeviceDesc` is ever created.
 
-**拒绝的方案**：延迟配置——在驱动 probe 阶段才分配 BAR。
-该方案将 BAR 配置推迟到真正需要时，减少无用配置，
-但增加了 probe 路径的复杂性（probe 需要持有 PCI bus lock 和 BAR allocator lock），
-且配置失败时需要在 probe 中途回滚已注册的 `DeviceObject`。
+**Rejected alternative**: deferring configuration — allocate BARs at
+driver probe. It avoids useless work for unprobed devices but complicates
+probe (which would hold the PCI bus lock and BAR allocator lock) and
+requires rolling back a registered `DeviceObject` mid-probe on failure.
 
-### VirtIO PCI/MMIO 双描述符
+### VirtIO PCI/MMIO dual descriptors
 
-**选择**：每个 VirtIO 设备类型生成两个 `DeviceDriver` 描述符（PCI 和 MMIO），
-分别注册到各自的 bus type。
+**Choice**: each VirtIO device type yields two `DeviceDriver` descriptors
+(PCI and MMIO), registered on their respective bus types.
 
-**Trade-off**：驱动描述符数量翻倍（6 种设备类型 × 2 = 12 个描述符），
-但获得以下好处：
+**Trade-off**: twice the descriptor count (6 device types × 2 = 12), in
+exchange for:
 
-- 匹配器(`VirtioTypeMatcher`)基于 VirtIO 类型码而非 PCI vendor/device ID 或 DT compatible，
-  PCI 和 MMIO 发现的设备都能正确匹配到对应的功能驱动；
-- PCI 和 MMIO 激活路径的差异封装在 `activate_virtio_pci` / `activate_virtio_mmio` 中，
-  上层 `dispatch_virtio_try_new` 完全统一，不关心传输类型。
+- the matcher (`VirtioTypeMatcher`) works on the VirtIO type code rather
+  than PCI vendor/device ids or DT compatibles, so devices discovered via
+  PCI and MMIO both match the same functional driver;
+- the PCI vs MMIO activation differences are sealed inside
+  `activate_virtio_pci` / `activate_virtio_mmio`; the upper
+  `dispatch_virtio_try_new` is fully transport-agnostic.
 
-**拒绝的方案**：单一描述符 + 运行时判断传输类型。
-该方案减少了描述符数量，但要求匹配器同时比较 bus type 和 VirtIO type，
-且 `probe_device` 入口需要分支处理 PCI 和 MMIO 两种传输初始化逻辑。
+**Rejected alternative**: one descriptor with runtime transport detection.
+Fewer descriptors, but the matcher would compare bus type and VirtIO type
+together, and `probe_device` would branch between two transport init
+logics.
 
-### IRQ handler 通过 device-res-xkernel 接入 kirq
+### IRQ handlers reach kirq through device-res-xkernel
 
-**选择**：`device-res-xkernel` 作为 `device_res` provider，把驱动的 devres IRQ
-请求适配到 `kirq`；`kirq` 保存同一 IRQ line 上的 shared action list，并通过 token
-管理 devres handler 的生命周期。
+**Choice**: `device-res-xkernel` is the `device_res` provider adapting
+driver devres IRQ requests onto `kirq`; `kirq` keeps the shared action
+list per IRQ line and manages devres handler lifetimes via tokens.
 
-**Trade-off**：共享 IRQ fanout 从 `kdriver` 下沉到 `kirq`，使 IRQ core action state
-更复杂；但：
+**Trade-off**: shared IRQ fanout moved from `kdriver` down into `kirq`,
+making IRQ core action state more complex; but:
 
-- shared、oneshot、threaded IRQ、per-action stats 和 free/synchronize 语义都能集中在
-  IRQ core；
-- 设备 handler 自带上下文，不需要按 slot 生成 trampoline，也没有全局 IRQ 数量上限；
-- token 允许释放单个共享 handler，其他同线设备继续接收中断；
-- 固定长度 action 快照保证 dispatch 路径不分配；
-- 中断释放按 token 删除设备 handler，最后一个 handler 删除后由 `kirq` 统一 mask 和
-  teardown。
+- shared, oneshot, threaded IRQ, per-action stats, and free/synchronize
+  semantics all concentrate in the IRQ core;
+- device handlers carry their own context — no per-slot trampolines and no
+  global IRQ count limit;
+- tokens allow freeing one shared handler while other devices on the line
+  keep receiving interrupts;
+- fixed-length action snapshots keep the dispatch path allocation-free;
+- interrupt release removes a device handler by token; after the last
+  handler goes, `kirq` masks and tears down the line.
 
-**拒绝的方案**：预分配静态 `IrqSlot` 数组并生成 trampoline。该方案需要维护
-slot 身份映射和硬编码 IRQ 总数上限。
+**Rejected alternative**: a preallocated static `IrqSlot` array with
+generated trampolines. That would need slot identity bookkeeping and a
+hard-coded total IRQ limit.
 
-## Drop / 资源释放
+## Drop / Resource Release
 
-- devres 资源在 `DeviceObject` 的 remove 路径中按 LIFO 顺序释放。
-- `PciBackend` 不持有需在 drop 中释放的持久资源（`PciBus` 在 `enumerate` 返回时释放）。
-- `PlatformBackend` 仅持有 `LocalIdAlloc`（栈上 u16），无需显式释放。
-- 中断释放按 token 删除设备 handler，最后一个 handler 删除后注销 `kirq` handler。
-- 共享 DMA buffer 在 last handle drop 后由 `kdma::deallocate_dma_memory` 回收。
+- devres resources are released in LIFO order in the `DeviceObject` remove
+  path.
+- `PciBackend` holds no persistent resources needing drop-time release
+  (`PciBus` is released when `enumerate` returns).
+- `PlatformBackend` holds only a `LocalIdAlloc` (a stack `u16`), with no
+  explicit release.
+- Interrupt release removes the device handler by token; once the last
+  handler goes, the `kirq` handler is deregistered.
+- Shared DMA buffers are reclaimed by `kdma::deallocate_dma_memory` after
+  the last handle drops.
 
-## Feature 门控关系
+## Feature Gating
 
 ```text
 virtio ────────► virtio-blk ──► block  + virtio + virtio/block
@@ -554,5 +669,6 @@ fxmac ─────────► any_firmware_driver + net
 ixgbe ─────────► net (placeholder)
 ```
 
-`any_firmware_driver` 是一个 umbrella feature：当任一 DT/ACPI 平台驱动启用时为 true，
-`cfg(feature = "any_firmware_driver")` 用于替代冗长的 `any(ahci, bcm2835-sdhci, sdmmc, fxmac)` 条件。
+`any_firmware_driver` is an umbrella feature: true whenever any DT/ACPI
+platform driver is enabled; `cfg(feature = "any_firmware_driver")`
+replaces the verbose `any(ahci, bcm2835-sdhci, sdmmc, fxmac)` condition.

@@ -63,6 +63,13 @@ static RAMDISK_CALLED: AtomicBool = AtomicBool::new(false);
 /// hands out a one-time `&'static mut [u8]` view over the image; it must be
 /// called at most once, and the ramdisk driver's `probe_device` path is the
 /// only intended caller.
+/// Returns the ramdisk backing image, consuming the embedded static.
+///
+/// # Panics
+///
+/// Panics if called more than once: the returned [`RamDisk`] takes
+/// exclusive ownership of the backing storage, so a second call would
+/// alias it.
 pub fn ramdisk() -> crate::ramdisk_static::RamDisk {
     assert!(
         !RAMDISK_CALLED.swap(true, Ordering::AcqRel),

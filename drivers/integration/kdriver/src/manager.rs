@@ -137,6 +137,12 @@ impl Default for DeviceManager {
 }
 
 /// Acquire the long-lived device manager.
+/// Returns the global device manager, initializing it on first call.
+///
+/// # Panics
+///
+/// Only if the one-time initialization recorded success but the slot is
+/// still empty, which is impossible and would indicate memory corruption.
 pub fn device_manager() -> &'static DeviceManager {
     DEVICE_MANAGER.call_once(DeviceManager::new);
     DEVICE_MANAGER

@@ -15,62 +15,97 @@ pub use rs_fdtree::{
     RegIter,
 };
 
+/// Failure to initialize the global device-tree handle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FirmwareInitError {
+    /// The boot pointer was null.
     MissingDeviceTreePtr,
+    /// The blob did not validate as a flattened device tree.
     BadDeviceTree(FdtError),
 }
 
 static FDT: LazyInit<LinuxFdt<'static>> = LazyInit::new();
 
+/// Interrupt trigger mode decoded from firmware cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptTrigger {
+    /// Interrupt asserted on the rising edge.
     EdgeRising,
+    /// Interrupt asserted on the falling edge.
     EdgeFalling,
+    /// Interrupt active while the line is high.
     LevelHigh,
+    /// Interrupt active while the line is low.
     LevelLow,
+    /// Undecoded trigger flags; carries the raw flag bits.
     Unknown(u32),
 }
 
+/// Interrupt controller family owning a decoded interrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptControllerKind {
+    /// ARM GIC (v2/v3/v4) family.
     Gic,
+    /// RISC-V PLIC.
     Plic,
+    /// Controller whose compatible string this crate does not know.
     Unknown,
 }
 
+/// Configuration access mechanism of a generic PCI host bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PciHostCam {
+    /// Legacy memory-mapped config access (256 bytes per device function).
     Cam,
+    /// PCI Express enhanced configuration access mechanism (4 KiB per device).
     Ecam,
 }
 
+/// Facts about a generic PCI host bridge: config window, mechanism, and bus
+/// range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciHostInfo {
+    /// Config access mechanism (`Cam` or `Ecam`).
     pub cam: PciHostCam,
+    /// Physical base of the config space window.
     pub ecam_base: u64,
+    /// Size of the config space window in bytes.
     pub ecam_size: u64,
+    /// First bus number in the bridge's `bus-range`.
     pub bus_start: u8,
+    /// Last bus number in the bridge's `bus-range`.
     pub bus_end: u8,
 }
 
+/// One CPU-visible memory window from a PCI host bridge's `ranges`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciRangeInfo {
+    /// CPU physical base address of the window.
     pub cpu_base: u64,
+    /// Window size in bytes.
     pub size: u64,
+    /// Whether the range is marked prefetchable.
     pub prefetchable: bool,
 }
 
+/// A fully decoded interrupt: number, trigger mode, and owning controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterruptInfo {
+    /// Global IRQ number (GIC SPI/PPI numbering applied).
     pub irq: usize,
+    /// Decoded trigger mode.
     pub trigger: InterruptTrigger,
+    /// Controller family the interrupt belongs to.
     pub controller: InterruptControllerKind,
 }
 
+/// A reserved-memory region together with its DT node name (or
+/// `memreserve` provenance), for debugging and policy decisions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NamedMemoryRegion {
+    /// The reserved region itself.
     pub region: crate::MemoryRegion,
+    /// Node name or `dtb memreserve` tag the region came from.
     pub name: &'static str,
 }
 
@@ -87,18 +122,23 @@ fn property_u32_cells<const N: usize>(node: FdtNode<'_, '_>, name: &str) -> Opti
     Some(cells)
 }
 
+/// Reads a named property as a big-endian `u32`.
 pub fn property_u32(node: FdtNode<'static, 'static>, name: &str) -> Option<u32> {
     node.property_u32(name)
 }
 
+/// Returns whether the node declares `device_type = "cpu"`.
 pub fn is_cpu_node(node: FdtNode<'_, '_>) -> bool {
     node.property_str("device_type") == Some("cpu")
 }
 
+/// Returns whether the node is a CPU node whose `status` is not `disabled`.
 pub fn is_enabled_cpu_node(node: FdtNode<'_, '_>) -> bool {
     is_cpu_node(node) && node.property_str("status") != Some("disabled")
 }
 
+/// Returns the first `reg` address of a CPU node, honoring the parent's
+/// `#address-cells` width.
 pub fn cpu_node_reg(node: FdtNode<'_, '_>) -> Option<u64> {
     if !is_cpu_node(node) {
         return None;
@@ -117,6 +157,7 @@ fn node_reg(node: FdtNode<'_, '_>) -> Option<u64> {
     }
 }
 
+/// Iterates all CPU nodes that are not `status = "disabled"`.
 pub fn enabled_cpu_nodes<'dt>(
     fdt: &'dt LinuxFdt<'dt>,
 ) -> impl Iterator<Item = FdtNode<'dt, 'dt>> + 'dt {
@@ -224,11 +265,18 @@ fn interrupt_parent_node(node: FdtNode<'static, 'static>) -> Option<FdtNode<'sta
     find_node_by_phandle(phandle)
 }
 
+/// Returns the global device-tree view initialized at boot; `None` before
+/// `init_device_tree_ptr` has run.
 pub fn fdt() -> Option<&'static LinuxFdt<'static>> {
     FDT.get()
 }
 
 /// Read the total size of the DTB referenced by `ptr`.
+///
+/// # Errors
+///
+/// Returns [`FirmwareInitError::BadDeviceTree`] when the blob fails
+/// `rs_fdtree` validation (a null pointer is reported the same way).
 ///
 /// # Safety
 ///
@@ -241,11 +289,19 @@ pub unsafe fn dtb_total_size_from_ptr(ptr: *const u8) -> Result<usize, FirmwareI
     Ok(fdt.total_size())
 }
 
+/// Returns the total size in bytes of the initialized DTB.
 pub fn dtb_total_size() -> Option<usize> {
     Some(fdt()?.total_size())
 }
 
 /// Initialize the global DTB handle from a raw pointer.
+///
+/// # Errors
+///
+/// Returns [`FirmwareInitError::BadDeviceTree`] when the blob fails
+/// `rs_fdtree` validation (a null pointer is reported the same way).
+/// The [`FirmwareInitError::MissingDeviceTreePtr`] variant is not
+/// produced by this function.
 ///
 /// # Safety
 ///
@@ -259,38 +315,48 @@ pub unsafe fn init_device_tree_ptr(ptr: *const u8) -> Result<(), FirmwareInitErr
     Ok(())
 }
 
+/// Returns the kernel command line from the `/chosen` node.
 pub fn chosen_bootargs() -> Option<&'static str> {
     fdt()?.chosen_bootargs()
 }
 
+/// Returns the root node's `model` string.
 pub fn root_model() -> Option<&'static str> {
     fdt()?.root_model()
 }
 
+/// Returns the root node's first `compatible` string.
 pub fn root_compatible() -> Option<&'static str> {
     fdt()?.root_compatible()
 }
 
+/// Finds the first node whose `compatible` list contains the string.
 pub fn find_compatible(compatible: &str) -> Option<FdtNode<'static, 'static>> {
     fdt()?.find_compatible(compatible)
 }
 
+/// Finds the generic PCI host bridge node (`pci-host-ecam-generic` or
+/// `pci-host-cam-generic`).
 pub fn generic_pci_host() -> Option<FdtNode<'static, 'static>> {
     find_compatible("pci-host-ecam-generic").or_else(|| find_compatible("pci-host-cam-generic"))
 }
 
+/// Finds a node by absolute device-tree path.
 pub fn find_node(path: &str) -> Option<FdtNode<'static, 'static>> {
     fdt()?.find_node(path)
 }
 
+/// Returns the console device path from the `/chosen` node.
 pub fn chosen_stdout_path() -> Option<&'static str> {
     fdt()?.chosen_stdout_path()
 }
 
+/// Returns the `/chosen` node wrapper.
 pub fn chosen() -> Option<Chosen<'static, 'static>> {
     fdt()?.chosen()
 }
 
+/// Resolves a path or an `/aliases` alias to a node.
 pub fn resolve_node(path_or_alias: &str) -> Option<FdtNode<'static, 'static>> {
     fdt()?.resolve_node(path_or_alias)
 }
@@ -398,6 +464,8 @@ pub fn pmu_irq_or(fallback: usize) -> usize {
     resolved
 }
 
+/// Describes the generic PCI host bridge: mechanism, config window, and
+/// bus range.
 pub fn generic_pci_host_info() -> Option<PciHostInfo> {
     let node = generic_pci_host()?;
     let cam = if node.is_compatible("pci-host-cam-generic") {
@@ -416,6 +484,8 @@ pub fn generic_pci_host_info() -> Option<PciHostInfo> {
     })
 }
 
+/// Returns the host bridge's memory window from `ranges`, preferring the
+/// non-prefetchable one and falling back to a prefetchable window.
 pub fn generic_pci_non_prefetchable_mem_range() -> Option<PciRangeInfo> {
     const PCI_ADDR_SPACE_MASK: u32 = 0x0300_0000;
     const PCI_ADDR_SPACE_MEM32: u32 = 0x0200_0000;
@@ -466,6 +536,8 @@ pub fn generic_pci_non_prefetchable_mem_range() -> Option<PciRangeInfo> {
     preferred.or(fallback)
 }
 
+/// Resolves a legacy INTx route through the bridge's `interrupt-map` for a
+/// (bus, device, function, pin) address.
 pub fn generic_pci_legacy_interrupt(
     bus: u8,
     device: u8,
@@ -547,10 +619,12 @@ pub fn generic_pci_legacy_interrupt(
     None
 }
 
+/// Returns the first node carrying an `interrupt-controller` property.
 pub fn interrupt_controller() -> Option<InterruptController<'static, 'static>> {
     fdt()?.interrupt_controller()
 }
 
+/// Returns the Open DICE reserved-memory region, if the tree describes one.
 pub fn dice_region() -> Option<crate::MemoryRegion> {
     fdt()?.dice()?.regions()?.next()
 }
@@ -666,6 +740,8 @@ pub unsafe fn read_reserved_memory_regions_from_ptr<const N: usize>(
     ))
 }
 
+/// Collects `/memory` regions into a fixed-capacity array; returns the
+/// zeroed array and a count of 0 when the tree is unavailable.
 pub fn read_memory_regions<const N: usize>() -> ([crate::MemoryRegion; N], usize) {
     fdt()
         .map(|fdt| collect_regions(fdt.memory_regions()))
@@ -678,6 +754,9 @@ pub fn read_memory_regions<const N: usize>() -> ([crate::MemoryRegion; N], usize
         ))
 }
 
+/// Collects memreserve entries plus `/reserved-memory` children into a
+/// fixed-capacity array; returns the zeroed array and a count of 0 when the
+/// tree is unavailable.
 pub fn read_reserved_memory_regions<const N: usize>() -> ([crate::MemoryRegion; N], usize) {
     fdt()
         .map(|fdt| {
@@ -692,6 +771,8 @@ pub fn read_reserved_memory_regions<const N: usize>() -> ([crate::MemoryRegion; 
         ))
 }
 
+/// Collects reserved regions with their node names / `memreserve` tags;
+/// returns the zeroed array and a count of 0 when the tree is unavailable.
 pub fn read_named_reserved_memory_regions<const N: usize>() -> ([NamedMemoryRegion; N], usize) {
     fdt()
         .map(|fdt| {

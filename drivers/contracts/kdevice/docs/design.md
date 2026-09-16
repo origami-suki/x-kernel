@@ -1,34 +1,41 @@
-# kdevice — 设计文档
+# kdevice — Design
 
-## 定位
+## Purpose
 
-`kdevice` 是 x-kernel 的共享设备模型类型 crate。
-它为总线(bus)、设备(device)、驱动(driver)三元组提供稳定的类型定义、
-全局对象注册表、生命周期状态机和事件分发基础设施。
+`kdevice` is x-kernel's shared device-model type crate. It provides the
+stable type definitions for the bus / device / driver triple, the global
+object registries, the lifecycle state machine, and the event
+distribution infrastructure.
 
-`kdevice` 是设备驱动栈的最底层——`kdriver`（驱动编排）和 `kclass`（类型化 class 层）
-都构建在它之上，但 `kdevice` 自身不依赖它们。
-所有持久化的设备拓扑信息（总线实例、设备对象、驱动对象、发现描述符）都在 `kdevice` 中管理。
+`kdevice` is the bottom of the device-driver stack — `kdriver` (driver
+orchestration) and `kclass` (the typed class layer) are built on top of
+it, but `kdevice` itself depends on neither. All persistent device
+topology information (bus instances, device objects, driver objects,
+discovery descriptors) is managed here.
 
-目标读者是实现新总线类型匹配器、修改设备生命周期状态机或扩展全局注册表查询能力的开发者。
+The intended audience is developers implementing new bus matchers,
+modifying the device lifecycle state machine, or extending global registry
+queries.
 
-## 背景
+## Background
 
-Linux 内核的设备模型通过 `device`、`device_driver`、`bus_type` 三个核心结构体
-以及 `devres`（device resource）机制提供设备发现→绑定→激活→移除的完整生命周期管理。
-x-kernel 的 `kdevice` 将这套机制落入 Rust 的类型系统和所有权模型：
+The Linux kernel device model provides complete
+discover → bind → activate → remove lifecycle management through its three
+core structures (`device`, `device_driver`, `bus_type`) plus the devres
+(device resource) mechanism. x-kernel's `kdevice` lands that mechanism in
+Rust's type system and ownership model:
 
-- **类型安全**：总线实例、设备对象、驱动对象各自是独立的 Rust 类型，
-  通过 `Arc` 共享，通过 `SpinNoPreempt` 保护可变状态；
-- **所有权明确**：`DeviceObject` 拥有其 devres 清理回调；
-  `DeviceRegistry` 拥有全局索引；
-  生命周期状态转换由 `AtomicU8` + CAS 保证原子性；
-- **事件驱动**：生命周期事件（Published/Matched/Bound/Activated/Removed）
-  通过分桶(bucketed) subscriber 机制分发给 `kclass` 等观察者。
+- **Type safety**: bus instances, device objects, and driver objects are
+  separate Rust types, shared via `Arc`, with mutable state protected by
+  `SpinNoPreempt`;
+- **Explicit ownership**: `DeviceObject` owns its devres cleanup entries;
+  `DeviceRegistry` owns the global indexes; lifecycle transitions are
+  atomic through `AtomicU8` + CAS;
+- **Event-driven**: lifecycle events (Published/Matched/Bound/Activated/
+  Removed) are delivered to observers such as `kclass` through bucketed
+  subscribers.
 
-## 范围
-
-涉及的源文件：
+## Scope
 
 ```text
 drivers/contracts/kdevice/
@@ -37,40 +44,40 @@ drivers/contracts/kdevice/
 │   ├── design.md
 │   └── security.md
 └── src/
-    ├── lib.rs                    # crate 入口，re-export 所有公开类型
+    ├── lib.rs                    # crate entry, re-exports all public types
     ├── bus/
     │   ├── mod.rs                # BusId, BusInfo, BusInstance
     │   └── bus_type.rs           # BusTypeId, BusType trait, BusTypeObject,
     │                             #   PciBusTypeMatcher, PlatformBusTypeMatcher
     ├── device/
-    │   ├── mod.rs                # 设备子模块 root
+    │   ├── mod.rs                # device submodule root
     │   ├── desc.rs               # DeviceDesc, DeviceId, DeviceLocation,
     │   │                         #   DeviceIdentity, DeviceState, DeviceRecord
-    │   ├── object.rs             # DeviceObject（核心运行时对象）,
-    │   │                         #   DeviceUse（RAII 使用计数 guard）
+    │   ├── object.rs             # DeviceObject (core runtime object),
+    │   │                         #   DeviceUse (RAII usage-count guard)
     │   ├── handles.rs            # BusHandle, DeviceCore, DriverCore
-    │   └── resource.rs           # 资源类型 re-export
+    │   └── resource.rs           # resource type re-exports
     ├── driver/
     │   └── mod.rs                # DriverId, DriverInfo, DriverObject,
-    │                             #   DeviceDriver trait, 各种 DeviceMatcher,
-    │                             #   ProbeStats, priority 模块
+    │                             #   DeviceDriver trait, DeviceMatcher impls,
+    │                             #   ProbeStats, priority module
     ├── lifecycle/
-    │   ├── mod.rs                # 生命周期编排：
+    │   ├── mod.rs                # lifecycle orchestration:
     │   │                         #   register_bus_instance, register_driver_object,
     │   │                         #   probe_device_desc, adopt_active_device,
-    │   │                         #   remove_device_managed, attach/detach parent
-    │   ├── dispatch.rs           # 事件分发与状态转换通知
+    │   │                         #   remove_device_managed, parent attach/detach
+    │   ├── dispatch.rs           # event distribution and state transition notify
     │   ├── event.rs              # DeviceEvent, DeviceEventKind
-    │   └── subscribers.rs        # DeviceEventSubscribers（分桶存储）
+    │   └── subscribers.rs        # DeviceEventSubscribers (bucketed storage)
     ├── registry/
-    │   └── mod.rs                # DeviceRegistry（全局 BTreeMap 索引）,
-    │                             #   查询/快照/测试辅助函数
+    │   └── mod.rs                # DeviceRegistry (global BTreeMap indexes),
+    │                             #   query/snapshot/test helpers
     └── topology/
-        └── mod.rs                # DeviceTopology（只读拓扑快照）,
+        └── mod.rs                # DeviceTopology (read-only topology snapshot),
                                   #   BusView, DeviceCoreView, DriverCoreView
 ```
 
-## 架构
+## Architecture
 
 ```text
     kdriver (enumerate, probe)    kclass (event subscriber)
@@ -101,13 +108,13 @@ drivers/contracts/kdevice/
     │                 │                             │
     │  ┌──────────────┴───────────────────────┐    │
     │  │   lifecycle::subscribers              │    │
-    │  │   分桶存储: [Published][Matched]       │    │
+    │  │   buckets: [Published][Matched]       │    │
     │  │            [Bound][Activated][Removed] │    │
     │  └──────────────────────────────────────┘    │
     │                                              │
     │  ┌──────────────────────────────────────┐    │
     │  │   registry::DeviceRegistry            │    │
-    │  │   (SpinNoPreempt 全局锁)               │    │
+    │  │   (SpinNoPreempt global lock)          │    │
     │  │                                       │    │
     │  │   descriptors: BTreeMap<DescId, ...>  │    │
     │  │   devices:     BTreeMap<DeviceId, ...>│    │
@@ -126,35 +133,36 @@ drivers/contracts/kdevice/
     │                                              │
     │  ┌──────────────────────────────────────┐    │
     │  │   topology::DeviceTopology            │    │
-    │  │   只读快照，支持按 bus/driver 过滤    │    │
+    │  │   read-only snapshot, bus/driver       │    │
+    │  │   filtering                            │    │
     │  └──────────────────────────────────────┘    │
     └─────────────────────────────────────────────┘
 ```
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |------|------|
-| `DeviceRegistry` | 全局对象索引；BTreeMap 管理 descriptors/devices/buses/drivers；ID 分配 |
-| `DeviceObject` | 核心运行时设备对象；`AtomicU8` 生命周期状态 + CAS 转换；devres 清理链表；usage 计数 |
-| `DeviceUse` | RAII guard；持有期间阻止设备 remove |
-| `BusInstance` | 运行时总线实例；controller / devices / drivers 列表；probe 统计 |
-| `BusTypeObject` | 总线匹配域；管理 pending descriptor 队列和已注册 driver；委托 BusType trait 做匹配 |
-| `DriverObject` | 已注册驱动对象；bound device 列表；probe 统计 |
-| `DeviceDesc` | 发现阶段描述符；携带 bus_id/location/identity/transport/resources |
-| `DeviceDriver` trait | 驱动接口：name/device_kind/bus_types/matcher/probe_device/remove/suspend/resume/shutdown |
-| `DeviceMatcher` trait | 开放式匹配器；内置 PciIdsMatcher/VirtioTypeMatcher/CompatibleAliasMatcher/FirmwareMatchSpec/NeverMatcher |
-| `DeviceEvent` / `DeviceEventKind` | 5 种生命周期事件；分桶 subscriber |
-| `DeviceTopology` | 只读拓扑快照；提供按 bus/driver 过滤的迭代器 |
-| 生命周期 API | `register_bus_instance`、`register_driver_object`、`probe_device_desc`、`adopt_active_device`、`remove_device_managed` |
+| `DeviceRegistry` | Global object index; BTreeMaps for descriptors/devices/buses/drivers; id allocation |
+| `DeviceObject` | Core runtime device object; `AtomicU8` lifecycle state + CAS transitions; devres cleanup list; usage count |
+| `DeviceUse` | RAII guard; blocks device removal while held |
+| `BusInstance` | Runtime bus instance; controller / devices / drivers lists; probe statistics |
+| `BusTypeObject` | Bus matching domain; manages the pending descriptor queue and registered drivers; delegates matching to the `BusType` trait |
+| `DriverObject` | Registered driver object; bound-device list; probe statistics |
+| `DeviceDesc` | Discovery-phase descriptor; carries bus_id/location/identity/transport/resources |
+| `DeviceDriver` trait | Driver interface: name/device_kind/bus_types/matcher/probe_device/remove/suspend/resume/shutdown |
+| `DeviceMatcher` trait | Open matcher; built-ins PciIdsMatcher/VirtioTypeMatcher/CompatibleAliasMatcher/FirmwareMatchSpec/NeverMatcher |
+| `DeviceEvent` / `DeviceEventKind` | The 5 lifecycle events; bucketed subscribers |
+| `DeviceTopology` | Read-only topology snapshot; bus/driver-filtered iterators |
+| Lifecycle API | `register_bus_instance`, `register_driver_object`, `probe_device_desc`, `adopt_active_device`, `remove_device_managed` |
 
-## 状态机
+## State Machine
 
-### DeviceRecord 生命周期
+### DeviceRecord lifecycle
 
 ```text
                          ┌────────────┐
                          │ Discovered │  ← device_desc_add / adopt_active_device
                          └─────┬──────┘
-                               │ probe_device_desc 找到匹配驱动
+                               │ probe_device_desc finds a matching driver
                                ▼
                          ┌────────────┐
                          │  Matched   │  ← mark_device_matched()
@@ -162,45 +170,46 @@ drivers/contracts/kdevice/
                                │ bind_device_to_driver()
                                ▼
                          ┌────────────┐
-                         │   Bound    │  ← driver_id/name/kind 已记录
+                         │   Bound    │  ← driver_id/name/kind recorded
                          └─────┬──────┘
-                               │ probe_device() 返回 Ok
+                               │ probe_device() returns Ok
                                ▼
                          ┌────────────┐
                          │   Active   │  ← activate_device();
-                         │            │     触发 Activated 事件
+                         │            │     Activated event fired
                          └─────┬──────┘
                                │ remove_device_managed()
                                ▼
                          ┌────────────┐
-                         │  Removing  │  ← begin_removing() CAS 提交点
+                         │  Removing  │  ← begin_removing() CAS commit point;
                          │            │     driver.remove() + bus_type.remove()
                          │            │     + run_cleanups()
                          └─────┬──────┘
                                │ remove_device_from_index()
                                ▼
                          ┌────────────┐
-                         │  Removed   │  ← 触发 Removed 事件
+                         │  Removed   │  ← Removed event fired
                          └────────────┘
 ```
 
-| 从 | 到 | 触发条件 |
+| From | To | Trigger |
 |----|----|----------|
-| — | Discovered | `device_desc_add` 或 `adopt_active_device` 创建 DeviceObject |
-| Discovered | Matched | `probe_device_desc` 找到最佳匹配驱动 |
-| Matched | Bound | `bind_device_to_driver` 记录 driver_id/name/kind |
-| Bound | Active | `DeviceDriver::probe_device` 返回 `Ok(())` |
-| Bound | Discovered (requeue) | probe 失败，desc requeue，device 对象丢弃 |
-| Active/MBound/Bound | Removing | `remove_device_managed` CAS 成功 |
-| Removing | Removed | driver.remove + bus_type.remove + run_cleanups 完成后 |
+| — | Discovered | `device_desc_add` or `adopt_active_device` creates the DeviceObject |
+| Discovered | Matched | `probe_device_desc` finds the best-matching driver |
+| Matched | Bound | `bind_device_to_driver` records driver_id/name/kind |
+| Bound | Active | `DeviceDriver::probe_device` returns `Ok(())` |
+| Bound | Discovered (requeue) | probe failed; desc requeued, device object dropped |
+| Active/MBound/Bound | Removing | `remove_device_managed` CAS succeeds |
+| Removing | Removed | driver.remove + bus_type.remove + run_cleanups complete |
 
-`begin_removing` 使用 `compare_exchange_weak` CAS 循环：
-- 只有 `Active`/`Bound`/`Matched`/`Discovered` 状态可转入 `Removing`
-- 已有 `Removing` 或 `Removed` → 拒绝（防重入）
-- usage 计数非零 → 回滚并返回 `ResourceBusy`
-- CAS 成功后状态不可逆
+The `begin_removing` CAS loop uses `compare_exchange_weak`:
 
-### DeviceDesc 生命周期（描述符优先路径）
+- only `Active`/`Bound`/`Matched`/`Discovered` may transition to `Removing`;
+- an existing `Removing` or `Removed` state is rejected (re-entry guard);
+- a non-zero usage count rolls back and returns `ResourceBusy`;
+- after a successful CAS the transition is irreversible.
+
+### DeviceDesc lifecycle (descriptor-first path)
 
 ```text
                          ┌──────────┐
@@ -209,7 +218,7 @@ drivers/contracts/kdevice/
                               │ mark_device_desc_probing
                               ▼
                          ┌──────────┐
-                         │ Probing  │  ← probe_device_desc 持有中
+                         │ Probing  │  ← held by probe_device_desc
                          └────┬─────┘
                     ┌─────────┼─────────┐
                     │ probe   │ probe   │
@@ -222,165 +231,233 @@ drivers/contracts/kdevice/
                     │ remove_device_from_index
                     ▼
               ┌──────────┐
-              │ Pending  │  ← 设备已移除，描述符重新开放匹配
+              │ Pending  │  ← device removed, descriptor re-opened
               └──────────┘
 ```
 
-关键语义：
-- `Probing` 状态防止并发 probe 同一描述符；
-- `attempted` 列表记录已失败驱动，reprobe 时跳过避免无限重试；
-- 设备 remove 时关联的描述符回到 `Pending` 且清空 `attempted`，为新驱动提供机会。
+Key semantics:
 
-## 算法流程
+- the `Probing` state prevents concurrent probes of the same descriptor;
+- the `attempted` list records failed drivers so reprobe skips them and
+  avoids infinite retries;
+- when a device is removed, its descriptor returns to `Pending` with
+  `attempted` cleared, giving new drivers a chance.
 
-### probe 流水线
+## Flows
 
-`probe_device_desc(id)` → `probe_device_desc_with_drivers(desc, candidates)`：
+### Probe pipeline
 
-1. 检查 `desc_probe_outcome`：如果描述符已 `Bound` 且设备处于终态（Active/Removing/Removed），返回 Skipped。
-2. CAS 标记描述符为 `Probing`（防并发）。
-3. 从 `bus_type` 获取候选驱动列表。
-4. 按 `match_desc` 匹配，选最高优先级驱动（排除 `attempted` 中已失败的）。
-5. 无可匹配驱动 → requeue 返回 `Requeue`。
-6. 从描述符创建 `DeviceObject`（分配 DeviceId，构造 DeviceObject）。
-7. 走标准事件序列：`mark_matched` → `bind_to_driver`。
-8. 调用 `driver.ops().probe_device(device)`：
-   - 成功 → `publish_desc_device`：写入全局索引，添加到 BusInstance，parent attach，触发 Published + Activated 事件。
-   - 失败 → `device.run_cleanups()`（devres LIFO）+ `detach_driver()` + 记录 failed driver 到 `attempted` + requeue。
+`probe_device_desc(id)` → `probe_device_desc_with_drivers(desc, candidates)`:
 
-### adoption 路径
+1. Check `desc_probe_outcome`: if the descriptor is already `Bound` and the
+   device is terminal (Active/Removing/Removed), return Skipped.
+2. CAS the descriptor to `Probing` (concurrency guard).
+3. Get the candidate driver list from the `bus_type`.
+4. Match with `match_desc`, selecting the highest-priority driver
+   (excluding drivers already in `attempted`).
+5. No matching driver → requeue and return `Requeue`.
+6. Create the `DeviceObject` from the descriptor (allocate DeviceId,
+   construct the object).
+7. Run the standard event sequence: `mark_matched` → `bind_to_driver`.
+8. Call `driver.ops().probe_device(device)`:
+   - success → `publish_desc_device`: write the global index, add to the
+     BusInstance, attach parent, fire Published + Activated events.
+   - failure → `device.run_cleanups()` (devres LIFO) + `detach_driver()` +
+     record the failed driver in `attempted` + requeue.
 
-`adopt_active_device(adoption)`：用于 boot console、PCI host bridge 等已在早期初始化的设备。
+### Adoption path
 
-1. 校验 target bus 存在，driver 的 `bus_types` 包含 target bus 的 `bus_type`。
-2. 分配 `desc_id` 和 `device_id`。
-3. 构造 `DeviceDesc` + `DeviceObject`（跳过 match/probe）。
-4. 与 probe 路径走相同的标准事件序列：Matched → Bound → Published → Activated。
-5. parent attach（如果 adoption 指定了 parent）。
+`adopt_active_device(adoption)`: for devices initialized before the core
+runs, such as the boot console or the PCI host bridge.
 
-### remove 路径
+1. Verify the target bus exists and the driver's `bus_types` include the
+   target bus's `bus_type`.
+2. Allocate `desc_id` and `device_id`.
+3. Construct `DeviceDesc` + `DeviceObject` (skipping match/probe).
+4. Run the same standard event sequence as probe:
+   Matched → Bound → Published → Activated.
+5. Attach the parent if the adoption names one.
 
-`remove_device_managed(id)`：
+### Remove path
 
-1. 从 registry 查找 device、driver、bus_type。
-2. `device.begin_removing()` — **单次提交点**：
-   - CAS 转入 `Removing`，拒绝 `Removing`/`Removed` 状态，拒绝 usage 非零。
-3. 调用 `driver.ops().remove(device)` — best-effort，错误仅记录日志不阻止继续移除。
-4. 调用 `bus_type.remove(device)` — best-effort。
-5. `device.run_cleanups()` — LIFO 执行 devres 清理。
-6. `remove_device_from_index(id)` — 从 registry 移除、更新 BusInstance/DriverObject、parent/child 解绑、触发 Removed 事件。
+`remove_device_managed(id)`:
 
-### 驱动注册后的描述符重扫描
+1. Look up device, driver, and bus_type from the registry.
+2. `device.begin_removing()` — the single commit point:
+   - CAS into `Removing`; rejects `Removing`/`Removed` states and non-zero
+     usage.
+3. Call `driver.ops().remove(device)` — best-effort; errors are logged and
+   do not stop the removal.
+4. Call `bus_type.remove(device)` — best-effort.
+5. `device.run_cleanups()` — devres cleanup in LIFO order.
+6. `remove_device_from_index(id)` — remove from the registry, update
+   BusInstance/DriverObject, detach parent/child, fire the Removed event.
 
-`register_driver_object` 注册驱动后立即扫描该驱动 bus_types 中所有 pending 描述符：
+### Descriptor rescan after driver registration
 
-1. 从各 `BusTypeObject` 收集 pending descriptor ID。
-2. 对每个 descriptor 调用 `probe_device_desc_with_drivers`（candidates 仅含新注册驱动）。
-3. 这避免了驱动加载顺序问题：后注册的驱动仍能找到已发现的设备。
+`register_driver_object` immediately scans all pending descriptors in the
+new driver's bus_types:
 
-## 锁顺序规则
+1. Collect pending descriptor ids from each `BusTypeObject`.
+2. Call `probe_device_desc_with_drivers` per descriptor (candidates
+   limited to the newly registered driver).
+3. This removes driver load-order problems: a driver registered later
+   still finds already-discovered devices.
 
-驱动核心使用多个 `SpinNoPreempt` 保护的对象。为防止死锁，所有路径必须遵守：
+## Lock Ordering Rules
 
+The driver core uses multiple `SpinNoPreempt`-protected objects. To
+prevent deadlock, every path must follow:
+
+```text
+1. Registry (DeviceRegistry)     ← always acquired first
+2. BusInstance / BusTypeObject   ← after snapshotting Arcs, drop the
+                                    registry guard before accessing
+3. DeviceObject / DriverObject   ← innermost
 ```
-1. Registry (DeviceRegistry)     ← 总先获取
-2. BusInstance / BusTypeObject   ← 从 registry 获取 Arc 后，drop registry guard 再访问
-3. DeviceObject / DriverObject   ← 最内层
-```
 
-**规则**：
-- 获取 registry guard → 快照需要的 `Arc` handle → **drop registry guard** → 访问 per-object lock。
-- **禁止**：在 per-object lock 内回调 `device_registry()`。
-- **禁止**：在 lifecycle subscriber callback 中调用 driver-core mutator。
+**Rules**:
 
-`DeviceObject::begin_removing` 的 CAS 循环不需要 per-object spinlock —
-lifecycle 字段是 `AtomicU8`，允许 lock-free read + CAS write。
+- take the registry guard → snapshot the needed `Arc` handles →
+  **drop the registry guard** → access per-object locks.
+- **Forbidden**: calling back into `device_registry()` while holding a
+  per-object lock.
+- **Forbidden**: calling driver-core mutators from a lifecycle subscriber
+  callback.
 
-## 并发模型
+The `DeviceObject::begin_removing` CAS loop needs no per-object spinlock —
+the lifecycle field is an `AtomicU8`, allowing lock-free reads plus a CAS
+write.
 
-- **`DeviceRegistry`**：全局 `SpinNoPreempt`；所有 lookup/add/remove 在此锁内。
-- **`BusInstance`**：内部 device/driver/controller 列表各用 `SpinNoPreempt` 保护。
-- **`DeviceObject`**：`lifecycle` 用 `AtomicU8` + CAS（lock-free read 路径）；`state`（parent/children/driver 绑定）用 `SpinNoPreempt`；`usage` 用 `AtomicUsize`。
-- **`DriverObject`**：`bound_devices` 用 `SpinNoPreempt`；`probe` 统计用 `AtomicU64`。
-- **`BusTypeObject`**：buses/pending_descriptors/drivers 列表各用 `SpinNoPreempt`。
-- **`ProbeCounters`**：`AtomicU64` + `Relaxed` ordering（仅统计用途）。
-- **ID 分配器**：`AtomicU64` + `Relaxed`，在 registry 锁外进行。
+## Concurrency Model
 
-所有锁均为 `SpinNoPreempt`（关抢占不关中断），因此**不能从中断上下文调用**。
+- **`DeviceRegistry`**: one global `SpinNoPreempt`; all lookup/add/remove
+  happen under it.
+- **`BusInstance`**: internal device/driver/controller lists each under
+  `SpinNoPreempt`.
+- **`DeviceObject`**: `lifecycle` is an `AtomicU8` + CAS (lock-free read
+  path); `state` (parent/children/driver binding) uses `SpinNoPreempt`;
+  `usage` uses `AtomicUsize`.
+- **`DriverObject`**: `bound_devices` under `SpinNoPreempt`; probe
+  statistics in `AtomicU64`.
+- **`BusTypeObject`**: buses/pending_descriptors/drivers lists each under
+  `SpinNoPreempt`.
+- **`ProbeCounters`**: `AtomicU64` with `Relaxed` ordering (statistics
+  only).
+- **Id allocators**: `AtomicU64` + `Relaxed`, outside the registry lock.
 
-## 设计决策
+All locks are `SpinNoPreempt` (preemption disabled, interrupts enabled), so
+**none of this may be called from interrupt context**.
 
-### 描述符优先设计
+## Design Decisions
 
-**选择**：设备发现产生 `DeviceDesc` 描述符，不直接创建 `DeviceObject`。两者生命周期解耦。
+### Descriptor-first design
 
-**Trade-off**：增加了一层抽象和状态管理，但换取以下好处：
-- 描述符可多次匹配（设备 remove 后回到 Pending，允许新驱动接管）；
-- 描述符的 `attempted` 列表可追踪已失败驱动，避免重复 probe；
-- `DeviceObject` 只有在 probe 时才创建，未匹配设备不浪费运行时对象的内存。
+**Choice**: device discovery produces a `DeviceDesc` descriptor; it does
+not directly create a `DeviceObject`. The two lifecycles are decoupled.
 
-**拒绝的方案**：发现即创建 `DeviceObject`。简化了代码但失去了描述符的独立生命周期管理能力。
+**Trade-off**: an extra layer of abstraction and state management, in
+exchange for:
 
-### 开放式 DeviceMatcher trait 替代封闭枚举
+- descriptors can match repeatedly (after device removal the descriptor
+  returns to Pending, letting a new driver take over);
+- the descriptor's `attempted` list tracks failed drivers and avoids
+  repeated probes;
+- a `DeviceObject` is created only at probe time; unmatched devices never
+  pay for a runtime object.
 
-**选择**：`DeviceMatcher` 是 trait，内置实现（PciIdsMatcher、VirtioTypeMatcher 等）与外部实现平等。
+**Rejected alternative**: creating the `DeviceObject` at discovery. Simpler
+code, but loses the descriptor's independent lifecycle management.
 
-**Trade-off**：动态分发（`&dyn DeviceMatcher`）的微小开销，但换取以下好处：
-- 外部 crate 可以定义自定义匹配器；
-- 不需要在 `kdevice` 中枚举所有可能的匹配器类型；
-- 匹配器可以携带任意状态（如 FirmwareMatchSpec 既实现 `DeviceMatcher`，也实现 `firmware_spec()` 扩展方法）。
+### Open DeviceMatcher trait instead of a closed enum
 
-**拒绝的方案**：`MatchTable` 枚举。每个新匹配器都要修改 `kdevice`，且无法支持外部定义的匹配逻辑。
+**Choice**: `DeviceMatcher` is a trait; built-in implementations
+(PciIdsMatcher, VirtioTypeMatcher, ...) are peers of external ones.
 
-### AtomicU8 生命周期 + CAS 转换
+**Trade-off**: the minor dynamic-dispatch cost of `&dyn DeviceMatcher`, in
+exchange for:
 
-**选择**：`DeviceState` 用 `#[repr(u8)]` 编码，`DeviceObject::lifecycle` 用 `AtomicU8` 存储。
+- external crates can define custom matchers;
+- `kdevice` never enumerates all possible matcher kinds;
+- matchers can carry arbitrary state (e.g. FirmwareMatchSpec implements
+  both `DeviceMatcher` and a `firmware_spec()` extension method).
 
-**Trade-off**：CAS 循环比简单的 spinlock 更复杂，但换取以下好处：
-- 热路径 `state()` 读取无需获取 per-object lock；
-- `begin_removing` 是 lock-free 的 CAS 提交点，避免在持有 spinlock 时做复杂的 teardown 决策；
-- `try_acquire` 使用 `fetch_add` + 检查状态，与 `begin_removing` 形成正确的并发协议。
+**Rejected alternative**: a `MatchTable` enum. Every new matcher would
+require editing `kdevice`, and externally defined matching logic would be
+impossible.
 
-**拒绝的方案**：所有生命周期操作在 `SpinNoPreempt` 内进行。简化了并发模型，但 `state()` 成为热路径瓶颈（ISR/poll 路径频繁读取）。
+### AtomicU8 lifecycle + CAS transitions
 
-### 事件 subscriber 分桶而非全局广播
+**Choice**: `DeviceState` is a `#[repr(u8)]` enum stored in
+`DeviceObject::lifecycle` as an `AtomicU8`.
 
-**选择**：subscriber 按 `DeviceEventKind` 分 5 个桶存储。
+**Trade-off**: a CAS loop is more complex than a plain spinlock, in
+exchange for:
 
-**Trade-off**：5 个 `Vec` 的内存开销略大于单个 `Vec`，但换取以下好处：
-- 分发 `Activated` 事件时不扫描 `Removed` 的 subscriber；
-- 每个事件的 dispatch 开销与具体 kind 的 subscriber 数量成正比。
+- hot-path `state()` reads take no per-object lock;
+- `begin_removing` is a lock-free CAS commit point, avoiding complex
+  teardown decisions while holding a spinlock;
+- `try_acquire` uses `fetch_add` + state check, forming a correct
+  concurrency protocol with `begin_removing`.
 
-**拒绝的方案**：单一 subscriber 列表 + per-event filter。简洁但分发时需要遍历全部 subscriber 并根据 event kind 过滤。
+**Rejected alternative**: doing all lifecycle operations under a
+`SpinNoPreempt`. Simpler concurrency, but `state()` becomes a hot-path
+bottleneck (read on every ISR/poll path).
 
-### Probe 失败回滚：devres LIFO + detach_driver
+### Bucketed event subscribers instead of a global broadcast
 
-**选择**：probe 失败时：
-1. `device.run_cleanups()` — 执行驱动已注册的 devres（LIFO）；
-2. `device.detach_driver()` — 清除 driver 绑定信息；
-3. 记录 failed driver 到 `attempted` 列表；
-4. requeue descriptor。
+**Choice**: subscribers are stored in 5 buckets keyed by
+`DeviceEventKind`.
 
-**Trade-off**：每个 probe 失败都执行完整的回滚，增加失败路径开销，但换取以下好处：
-- 部分初始化的设备不会泄露资源（devres 保证清理）；
-- attempted 列表保证不会无限重试同一驱动；
-- requeue 允许下一个 reprobe 尝试其他驱动。
+**Trade-off**: 5 `Vec`s cost slightly more memory than one, in exchange
+for:
 
-**拒绝的方案**：probe 失败后直接丢弃 descriptor。该方案无法支持"多个驱动都可能匹配同一设备，按优先级尝试"的场景。
+- dispatching an `Activated` event never scans `Removed` subscribers;
+- per-event dispatch cost is proportional to that kind's subscriber count.
 
-### Registry + Arc snapshot 模式（而非嵌套锁）
+**Rejected alternative**: a single subscriber list with per-event
+filtering. Simpler, but dispatch would walk every subscriber and filter by
+event kind.
 
-**选择**：在 registry 锁内获取 `Arc` handle，drop registry guard 后访问 per-object 数据。
+### Probe failure rollback: devres LIFO + detach_driver
 
-**Trade-off**：每次跨对象访问需要先获取 registry guard 再 drop，增加代码模板，但换取以下好处：
-- 消除死锁风险（registry 锁与 per-object 锁从不嵌套）；
-- `Arc` 保证对象在 registry guard drop 后仍然存活（引用计数保护）。
+**Choice**: on probe failure:
 
-**拒绝的方案**：全局大锁或嵌套锁。全局大锁简单但性能差；嵌套锁容易死锁。
+1. `device.run_cleanups()` — run driver-registered devres (LIFO);
+2. `device.detach_driver()` — clear the driver binding;
+3. record the failed driver in `attempted`;
+4. requeue the descriptor.
 
-## Drop / 资源释放
+**Trade-off**: every probe failure pays a full rollback, in exchange for:
 
-- `DeviceUse::drop`：递减 `DeviceObject::usage` 计数；计数归零后允许 `begin_removing` 通过。
-- `DeviceObject` 不实现 `Drop`——清理由 `remove_device_managed` 显式驱动（devres LIFO）。
-- `DeviceRegistry` 不实现 `Drop`——是全局静态对象。
-- `DeviceTopology` 是纯数据快照，drop 仅释放 Vec 内存。
+- partially initialized devices never leak resources (devres guarantees
+  cleanup);
+- the attempted list prevents retrying the same driver forever;
+- the requeue lets the next reprobe try a different driver.
+
+**Rejected alternative**: dropping the descriptor on probe failure. That
+cannot support "several drivers may match one device, tried by priority".
+
+### Registry + Arc snapshot pattern (instead of nested locks)
+
+**Choice**: take `Arc` handles under the registry lock, drop the registry
+guard, then access per-object data.
+
+**Trade-off**: every cross-object access takes and drops the registry
+guard (extra boilerplate), in exchange for:
+
+- no deadlock risk (registry lock and per-object locks never nest);
+- `Arc` keeps objects alive after the registry guard drops (reference
+  counting).
+
+**Rejected alternative**: one global big lock or nested locking. A global
+lock is simple but slow; nesting deadlocks easily.
+
+## Drop / Resource Release
+
+- `DeviceUse::drop` decrements `DeviceObject::usage`; `begin_removing` may
+  proceed once the count reaches zero.
+- `DeviceObject` does not implement `Drop` — cleanup is driven explicitly
+  by `remove_device_managed` (devres LIFO).
+- `DeviceRegistry` does not implement `Drop` — it is a global static.
+- `DeviceTopology` is a plain data snapshot; dropping it frees the `Vec`s.

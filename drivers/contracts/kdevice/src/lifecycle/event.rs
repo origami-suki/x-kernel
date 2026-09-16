@@ -14,24 +14,48 @@ use crate::DeviceId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceEvent {
     /// A live device object was published into the device index.
-    Published { id: DeviceId },
+    Published {
+        /// Device that was published.
+        id: DeviceId,
+    },
     /// At least one driver matched this device and probing is proceeding.
-    Matched { id: DeviceId },
+    Matched {
+        /// Device that was matched.
+        id: DeviceId,
+    },
     /// A device was successfully bound to a driver.
-    Bound { id: DeviceId, kind: DeviceKind },
+    Bound {
+        /// Device that was bound.
+        id: DeviceId,
+        /// Device kind reported by the driver.
+        kind: DeviceKind,
+    },
     /// A device was activated and is ready for subsystem consumption.
-    Activated { id: DeviceId, kind: DeviceKind },
+    Activated {
+        /// Device that was activated.
+        id: DeviceId,
+        /// Device kind reported by the driver.
+        kind: DeviceKind,
+    },
     /// A device was removed (hot-unplug or driver unbind).
-    Removed { id: DeviceId },
+    Removed {
+        /// Device that was removed.
+        id: DeviceId,
+    },
 }
 
 /// Stable discriminator for lifecycle event subscriptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceEventKind {
+    /// Subscription bucket for [`DeviceEvent::Published`].
     Published,
+    /// Subscription bucket for [`DeviceEvent::Matched`].
     Matched,
+    /// Subscription bucket for [`DeviceEvent::Bound`].
     Bound,
+    /// Subscription bucket for [`DeviceEvent::Activated`].
     Activated,
+    /// Subscription bucket for [`DeviceEvent::Removed`].
     Removed,
 }
 

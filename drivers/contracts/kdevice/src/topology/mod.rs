@@ -13,20 +13,25 @@ use crate::{
 /// Read-only view of one registered bus.
 #[derive(Clone, Copy)]
 pub struct BusView<'a> {
+    /// Bus metadata: name and registered device kinds.
     pub info: &'a BusInfo,
 }
 
 /// Read-only view of one registered driver.
 #[derive(Clone, Copy)]
 pub struct DriverCoreView<'a> {
+    /// Driver metadata: name, device kind, and id.
     pub info: &'a DriverInfo,
 }
 
 /// Read-only view of one device plus its resolved bus / driver relations.
 #[derive(Clone, Copy)]
 pub struct DeviceCoreView<'a> {
+    /// Metadata snapshot of the device.
     pub record: &'a DeviceRecord,
+    /// Bus instance the device lives on.
     pub bus: &'a BusInfo,
+    /// Bound driver, once the device is bound.
     pub driver: Option<&'a DriverInfo>,
 }
 

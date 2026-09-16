@@ -1,119 +1,137 @@
-# driver_base — 设计文档
+# driver_base — Design
 
-## 定位
+## Purpose
 
-本模块提供 x-kernel 所有设备驱动的公共基础接口，定义了设备分类枚举
-`DeviceKind`、驱动错误类型 `DriverError` / `DriverResult`，以及所有设备
-必须实现的 `Device` trait。它是 `drivers/` 下各子 crate
-（block、net、display、input、vsock、virtio、kdriver）的共同依赖，
-为内核驱动框架提供统一的类型契约。
+This module provides the common base interfaces for all x-kernel device
+drivers: the device-category enum `DeviceKind`, the driver error type
+`DriverError` / `DriverResult`, and the `Device` trait every device must
+implement. It is the shared dependency of the driver sub-crates under
+`drivers/` (block, net, display, input, vsock, virtio, kdriver) and gives
+the kernel driver framework one unified type contract.
 
-## 背景
+## Background
 
-x-kernel 运行在裸机 `no_std` 环境中，无法使用 `std::io::Error` 等标准库
-错误类型。同时，内核需要对异构设备（块设备、网络设备、显示设备等）进行
-统一管理，因此需要一套轻量、无依赖的公共接口层，使各驱动 crate 在错误
-处理和设备身份描述上保持一致。
+x-kernel runs in a bare-metal `no_std` environment and cannot use standard
+library error types such as `std::io::Error`. At the same time the kernel
+must manage heterogeneous devices (block, network, display, ...) under one
+framework, so a lightweight, dependency-free common interface layer is
+needed to keep driver crates consistent in error handling and device
+identity.
 
-## 范围
+## Scope
 
-涉及的源文件：
-
-```
-driver_base/
+```text
+drivers/contracts/driver_base/
 ├── src/
 │   └── lib.rs
-│
 └── Cargo.toml
 ```
 
-## 架构
+## Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
-│                    driver_base                               │
+│                        driver_base                           │
 │                                                              │
-│  DeviceKind ──分类──> Device                                 │
+│  DeviceKind ──classification──> Device                       │
 │       │                │                                     │
 │       │                ├── name()                            │
 │       │                ├── device_kind()                     │
 │       │                └── irq()                             │
 │       │                                                      │
-│  DriverError ──错误──> DriverResult<T>                       │
+│  DriverError ──errors──> DriverResult<T>                     │
 │       │                │                                     │
 │       ├── should_retry()                                     │
 │       └── message()                                          │
 └──────────────────────────────────────────────────────────────┘
-        ▲            ▲            ▲            ▲
-        │            │            │            │
-   block crate   net crate   display crate  virtio crate
-   (及 kdriver、input、vsock 等所有驱动子 crate)
+        ▲            ▲             ▲            ▲
+        │            │             │            │
+   block crate   net crate   display crate   virtio crate
+   (and kdriver, input, vsock, and all other driver sub-crates)
 ```
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |------|------|
-| `DeviceKind` | 枚举所有支持的设备类别（9 种），提供 `as_str()` 稳定短名 |
-| `DriverError` | 统一驱动错误码，提供重试判断和日志消息 |
-| `DriverResult<T>` | 驱动操作的专用 `Result` 类型别名 |
-| `Device` | 所有设备必须实现的 trait，定义设备身份元数据接口 |
+| `DeviceKind` | Enumerates all supported device categories (8), provides the stable short names of `as_str()` |
+| `DriverError` | Unified driver error codes, with retry classification and log messages |
+| `DriverResult<T>` | The dedicated `Result` alias for driver operations |
+| `Device` | The trait every device implements: device identity metadata |
 
-## 状态机
+## State Machine
 
-本模块为纯类型定义，无状态管理，不涉及状态机。
+None. This module is pure type definitions with no state management.
 
-## 算法流程
+## Flows
 
-本模块无复杂算法。核心逻辑仅为枚举匹配：
+The module has no complex algorithms; the core logic is enum matching:
 
-### 错误重试判断
+### Error retry classification
 
-1. 调用者收到 `DriverResult::Err(e)`
-2. 调用 `e.should_retry()` 判断是否为可重试错误（`WouldBlock` / `ResourceBusy`）
-3. 若可重试，调用者按自身策略进行退避重试
+1. The caller receives `DriverResult::Err(e)`.
+2. `e.should_retry()` reports whether the error is retryable
+   (`WouldBlock` / `ResourceBusy`).
+3. If retryable, the caller backs off and retries per its own policy.
 
-### 设备分类查询
+### Device classification dispatch
 
-1. 通过 `Device::device_kind()` 获取 `DeviceKind`
-2. 按 `DeviceKind` 变体分发到对应子系统处理
+1. `Device::device_kind()` yields the `DeviceKind`.
+2. The caller dispatches on the `DeviceKind` variant to the matching
+   subsystem.
 
-## 并发模型
+## Concurrency Model
 
-本模块仅定义类型和 trait，无内部可变状态，无并发问题。
+The module defines only types and traits: no interior mutability, no
+concurrency concerns of its own.
 
-- `Device` 要求实现者满足 `Send + Sync`，确保 trait object 可跨线程共享。
-- `DeviceKind` 和 `DriverError` 均为 `Copy` 类型，天然线程安全。
+- `Device` requires implementers to be `Send + Sync`, so trait objects can
+  be shared across threads.
+- `DeviceKind` and `DriverError` are `Copy` types and trivially thread-safe.
 
-## 设计决策
+## Design Decisions
 
-### 为什么用枚举而非字符串表示设备类别
+### Why an enum instead of strings for device categories
 
-使用 `#[repr(u8)]` 枚举而非字符串：
-- 编译期穷举匹配，遗漏变体时编译器报错
-- 零堆分配，`Copy` 语义，适合热路径
-- `as_str()` 提供人类可读名称，仅在日志/调试时使用
+A `#[repr(u8)]` enum rather than strings:
 
-### 为什么 DriverError 不实现 std::error::Error
+- exhaustive matching at compile time; a missing variant is a compiler
+  error;
+- zero heap allocation and `Copy` semantics, suitable for hot paths;
+- `as_str()` supplies human-readable names for logging/debugging only.
 
-x-kernel 为 `no_std` 环境，无法依赖 `std::error::Error` trait。
-通过实现 `core::fmt::Display` 提供基本的错误描述能力。
+### Why DriverError does not implement std::error::Error
 
-### 为什么 Device trait 只定义三个方法
+x-kernel is `no_std` and cannot rely on the `std::error::Error` trait.
+Basic error description is provided through `core::fmt::Display` instead.
 
-`Device` 故意保持最小接口，仅描述设备身份元数据：
-- `name()` / `device_kind()` / `irq()` 是所有设备都需要的身份信息
-- 具体操作（读写、配置等）由各子 crate 的专用 trait 定义，以 `Device` 为 super-trait
-- 避免在基础层引入不必要的抽象，保持正交性
+### Why the Device trait has only three methods
 
-### 为什么 irq() 返回 Option<usize> 而非 Result
+`Device` intentionally stays a minimal interface describing device
+identity metadata:
 
-部分设备（如 ramdisk）不使用中断，`Option` 语义更准确：
-- `None` 表示设备不使用中断（正常情况）
-- `Some(irq)` 表示设备使用指定中断号
-- `Result` 的 `Err` 语义暗示操作失败，不适用于"无中断"的场景
+- `name()` / `device_kind()` / `irq()` are the identity information every
+  device needs;
+- concrete operations (read/write, configuration, ...) are defined by the
+  dedicated traits of each sub-crate, with `Device` as their super-trait;
+- this avoids unnecessary abstraction in the base layer and keeps the
+  layers orthogonal.
 
-### 为什么 DeviceKind 包含 Bus 变体
+### Why irq() returns Option<usize> instead of Result
 
-总线控制器（如 PCI 主桥）本身也是需要被驱动框架管理的设备：
-- 总线驱动负责枚举和配置子设备
-- 统一纳入 `DeviceKind` 可复用设备注册和发现机制
-- 与其他设备类别享有相同的身份查询接口
+Some devices (such as ramdisks) use no interrupts, and `Option` is the
+more accurate shape:
+
+- `None` means the device uses no interrupt (a normal condition);
+- `Some(irq)` names the interrupt the device uses;
+- `Result::Err` would imply a failed operation, which "no interrupt" is
+  not.
+
+### Why DeviceKind includes a Bus variant
+
+Bus controllers (such as a PCI host bridge) are devices the driver
+framework must manage too:
+
+- bus drivers enumerate and configure their child devices;
+- folding them into `DeviceKind` reuses the device registration and
+  discovery machinery;
+- bus devices get the same identity-query interface as every other
+  category.

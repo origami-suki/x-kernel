@@ -14,9 +14,21 @@ This document focuses on the boundary between normal output and NMI emergency ou
 
 ## Architecture and Algorithms
 
+The runtime-level public entries are `runtime::write_active_console` and
+`runtime::read_active_console`: each takes the subsystem lock only to
+snapshot the active console handle (`ClassDevice<CharDeviceImpl>`),
+releases it, and then calls the handle's `CharDevice::write` /
+`CharDevice::read` delegation, which forwards into the owning driver's
+`SerialPort::write_data` / `read_data` (driver -> UART). Keeping the
+subsystem lock and the per-device lock non-nested is deliberate
+(`read_active_console` drops the subsystem lock before the IO call).
+
 ```text
-Normal output    -> SerialPort::write_data        -> inner: SpinNoIrq<Backend> -> UART
+runtime::write_active_console -> active_handle -> CharDevice::write
+                              -> SerialPort::write_data  -> inner: SpinNoIrq<Backend> -> UART
 Emergency output -> SerialPort::write_data_atomic -> EmergencyTx              -> UART
+runtime::read_active_console  -> active_handle -> CharDevice::read
+                              -> SerialPort::read_data   -> UART
 ```
 
 Port construction initializes the device and saves its virtual address or I/O-port

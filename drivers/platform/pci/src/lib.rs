@@ -145,6 +145,13 @@ pub struct PciBus {
 }
 
 impl PciBus {
+    /// Brings up the PCI bus over the resolved configuration window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PciInitError::InvalidRange`] when no config space exists,
+    /// and [`PciInitError::NoMemory`] / [`PciInitError::MappingFailed`]
+    /// when the ECAM window cannot be mapped.
     pub fn new(cam: Cam) -> Result<Self, PciInitError> {
         let (config_base, bus_end, source) = pci_config_space();
         if config_base == 0 {
@@ -368,6 +375,19 @@ pub struct PciRangeAllocator {
     cursor_addr: u64,
 }
 
+/// Assigns unassigned memory BARs from `allocator`, logs the final BAR
+/// layout, and enables IO / memory / bus-master command bits.
+///
+/// # Errors
+///
+/// Returns [`PciInitError::NoMemory`] when the allocator cannot satisfy a
+/// BAR request.
+///
+/// # Panics
+///
+/// Panics via `expect` when `allocator` is `None` while a memory BAR is
+/// unassigned — configuring BARs without an allocation range is a
+/// platform configuration error.
 pub fn configure_device<C: ConfigurationAccess>(
     root: &mut PciRoot<C>,
     bdf: DeviceFunction,

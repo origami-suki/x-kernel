@@ -73,6 +73,7 @@ impl Default for ProbeCounters {
 pub struct DriverId(u64);
 
 impl DriverId {
+    /// Wraps a raw numeric driver id.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -116,7 +117,9 @@ pub mod priority {
 /// PCI vendor/device ID pair for matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciDeviceId {
+    /// PCI vendor id to match against.
     pub vendor_id: u16,
+    /// PCI device id to match against.
     pub device_id: u16,
 }
 
@@ -196,6 +199,7 @@ impl DeviceMatcher for PciIdsMatcher {
 
 /// Match VirtIO transport (PCI or MMIO) by VirtIO device type code.
 pub struct VirtioTypeMatcher {
+    /// VirtIO device type code this matcher accepts (1 = net, 2 = block, ...).
     pub device_type: u32,
 }
 

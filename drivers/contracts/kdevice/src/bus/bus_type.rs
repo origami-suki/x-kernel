@@ -159,6 +159,12 @@ impl BusTypeObject {
     ///
     /// Panics if `id` is not one of the built-in bus types
     /// ([`BusTypeId::PCI`], [`BusTypeId::PLATFORM`]).
+    /// Creates the matcher domain for a built-in bus type.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a bus type id that has no built-in matcher (only PCI
+    /// and platform are built in).
     pub fn new_builtin(id: BusTypeId) -> Self {
         if id == BusTypeId::PCI {
             Self::new(Arc::new(PciBusTypeMatcher::new()))

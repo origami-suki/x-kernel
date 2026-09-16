@@ -1,32 +1,55 @@
-# kclass — 设计文档
+# kclass — Design
 
-## 定位
+## Purpose
 
-`kclass` 是 x-kernel 的类型化运行时设备类层（typed runtime device class layer）。
-它在 `kdevice` 的设备核心之上，为每种设备类别（net / block / char / display / input / vsock / 9p）
-提供类型安全的发布、枚举、查找和可用性订阅接口。
+`kclass` is x-kernel's typed runtime device class layer. Built on top of
+the `kdevice` device core, it provides type-safe publication, enumeration,
+lookup, and availability-subscription interfaces for each device category
+(net / block / char / display / input / vsock / 9p).
 
-驱动在 probe 成功后通过 `publish_<class>()` 把运行时能力发布到对应 class 注册表；
-子系统（如 `knet`、`fs_boot`、input 子系统）通过 `*_devices()` / `find_*_device()` / `subscribe_*_available()`
-发现和使用运行时设备，无需依赖 probe 顺序。
+After a successful probe, a driver publishes its runtime capability into
+the matching class registry through `publish_<class>()`; subsystems (such
+as `knet`, `fs_boot`, or the input subsystem) discover and use runtime
+devices through `*_devices()` / `find_*_device()` /
+`subscribe_*_available()`, without depending on probe order.
 
-目标读者是实现设备 class 适配、修改 class 注册表语义或添加新设备类别的开发者。
+The intended audience is developers implementing device class adapters,
+modifying class registry semantics, or adding new device categories.
 
-## 背景
+## Out of Scope
 
-Linux 内核的 class 机制（`/sys/class/`）提供按功能类别组织设备的视图，
-与总线拓扑（`/sys/bus/`）正交。`kclass` 在 x-kernel 中承担类似角色：
+- No framebuffer management: `/dev/fb0` emulation lives in `fbdevice`;
+  kclass only delegates `DisplayDevice` calls (see the framebuffer path
+  below).
+- No IRQ handling: interrupt registration and dispatch belong to `kirq`
+  and `device-res-xkernel`; kclass stores only the `irq` metadata value.
+- No driver binding or probing: the discover → match → bind pipeline is
+  owned by `kdevice` and `kdriver`; kclass consumes the already-bound
+  device object at publish time.
+- No device lifecycle ownership: hotplug state transitions are
+  `kdevice` events that kclass observes, never drives.
+- No runtime dispatch policy between consumers: after publication the
+  consumer holds `ClassDevice<T>` directly and kclass steps out of the
+  call path.
 
-- **kdevice** 管理设备的总线归属、生命周期状态和驱动绑定关系；
-- **kclass** 在此之上提供按功能类别（net/block/char/display/input/vsock/9p）的类型化视图；
-- **kdriver** 在驱动 probe 成功后调用 `publish_*()` 把运行时能力注入 kclass 注册表。
+## Background
 
-这种分层使得上层子系统（如网络栈、文件系统）不关心设备在 PCI 还是 platform 总线上，
-也不关心 probe 顺序——它们只需要向 class 注册表查询当前可用的设备或订阅未来的可用性通知。
+The Linux kernel class mechanism (`/sys/class/`) provides a view of
+devices organized by functional category, orthogonal to bus topology
+(`/sys/bus/`). `kclass` fills the same role in x-kernel:
 
-## 范围
+- **kdevice** owns bus attachment, lifecycle state, and driver binding;
+- **kclass** adds the typed per-category view
+  (net/block/char/display/input/vsock/9p) on top;
+- **kdriver** calls `publish_*()` after a successful probe to inject the
+  runtime capability into the kclass registries.
 
-涉及的源文件：
+This layering lets upper subsystems (network stack, filesystem) stay
+agnostic of both the bus (PCI vs platform) and the probe order — they only
+query the class registry for currently available devices or subscribe to
+future availability notifications.
+
+## Scope
 
 ```text
 drivers/contracts/kclass/
@@ -35,11 +58,11 @@ drivers/contracts/kclass/
 │   ├── design.md
 │   └── security.md
 └── src/
-    ├── lib.rs       # 宏驱动的 class 注册表 + 设备 trait 委托 + prelude
-    └── generic.rs   # ClassDevice<T>、ClassRegistry<T> 泛型原语
+    ├── lib.rs       # macro-driven class registries + device trait delegation + prelude
+    └── generic.rs   # ClassDevice<T>, ClassRegistry<T> generic primitives
 ```
 
-## 架构
+## Architecture
 
 ```text
                 kdriver (probe success)
@@ -92,20 +115,20 @@ drivers/contracts/kclass/
          knet / fs_boot / input subsystem / ...
 ```
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |------|------|
-| `ClassDevice<T>` | 类型化的运行时设备句柄；包装 `DeviceObject` + trait object，委托 trait 方法调用 |
-| `ClassDeviceInner<T>` | `ClassDevice` 的内部共享状态：parent、runtime、name、kind、irq、metadata |
-| `ClassRegistry<T>` | 类型化注册表：publish（唯一发布）、devices（枚举活跃设备）、find（按 ID 查找）、subscribe（订阅可用性）、remove（按 ID 移除） |
-| `ACTIVATION_BRIDGE` | 全局事件桥接：订阅 `kdevice` 的 `Activated` / `Removed` 事件，驱动 class 级别的 notify/remove |
-| `class_registries!` 宏 | 声明式批量生成 7 个 class 注册表及其所有配套函数 |
-| `ClassDeviceMetadata` | 可选的 class 特定元数据（当前仅 input class 携带 physical_location / unique_id） |
-| `prelude` 模块 | 集中 re-export 所有公开类型，方便 `kdriver` 等发布者统一导入 |
-| Trait delegation impls | 为需要 class handle 调用的类别实现操作 trait（如 `NetDevice`），委托到 inner runtime；net class 同时转发 `NetRxScheduler` attach/detach，block I/O 只经 block core canonical `BlockDevice` |
+| `ClassDevice<T>` | Typed runtime device handle; wraps `DeviceObject` + trait object and delegates trait method calls |
+| `ClassDeviceInner<T>` | `ClassDevice` internal shared state: parent, runtime, name, kind, irq, metadata |
+| `ClassRegistry<T>` | Typed registry: publish (unique publication), devices (enumerate available), find (lookup by id), subscribe (availability notification), remove (remove by id) |
+| `ACTIVATION_BRIDGE` | Global event bridge: subscribes to `kdevice` `Activated` / `Removed` events and drives class-level notify/remove |
+| `class_registries!` macro | Declaratively generates all 7 class registries and their companion functions |
+| `ClassDeviceMetadata` | Optional class-specific metadata (currently only the input class carries physical_location / unique_id) |
+| `prelude` module | Centralized re-export of all public types for publishers such as `kdriver` |
+| Trait delegation impls | Implement the operation traits (e.g. `NetDevice`) for categories consumed through class handles, delegating to the inner runtime; the net class also forwards `NetRxScheduler` attach/detach, while block I/O goes only through the block core canonical `BlockDevice` |
 
-## 状态机
+## State Machine
 
-### ClassDevice 生命周期
+### ClassDevice lifecycle
 
 ```text
                     driver probe_device()
@@ -113,80 +136,102 @@ drivers/contracts/kclass/
                          │ publish_<class>(parent, runtime)
                          v
                     ┌──────────┐
-                    │Published │  ← ClassDevice 创建，注册表持有
+                    │Published │  ← ClassDevice created, held by registry;
                     │(pending) │     parent.state != Active
                     └────┬─────┘
                          │ kdevice Activated event
                          ▼
                     ┌──────────┐
-                    │Available │  ← parent.state == Active
-                    │(active)  │     触发 availability callbacks
+                    │Available │  ← parent.state == Active;
+                    │(active)  │     availability callbacks fired
                     └────┬─────┘
                          │ kdevice Removed event
                          ▼
                     ┌──────────┐
-                    │ Removed  │  ← 从注册表中 swap_remove
+                    │ Removed  │  ← swap_remove from the registry
                     └──────────┘
 ```
 
-| 从 | 到 | 触发条件 |
+| From | To | Trigger |
 |----|----|----------|
-| — | Published | 驱动调用 `publish_<class>(parent, runtime)` |
-| Published | Available | `kdevice` 分发 `Activated` 事件，`notify_class_available` 调用 subscriber callbacks |
-| Published | Available (immediate) | publish 时 `parent.state()` 已经为 `Active`（desc-adoption 路径） |
-| Available | Removed | `kdevice` 分发 `Removed` 事件，`remove_class_device` 从注册表移除 |
-| Published | — | 同一 `DeviceId` 再次 publish 返回 `AlreadyExists` |
+| — | Published | Driver calls `publish_<class>(parent, runtime)` |
+| Published | Available | `kdevice` dispatches the `Activated` event; `notify_class_available` invokes subscriber callbacks |
+| Published | Available (immediate) | `parent.state()` is already `Active` at publish time (desc-adoption path) |
+| Available | Removed | `kdevice` dispatches the `Removed` event; `remove_class_device` removes the entry |
+| Published | — | Publishing the same `DeviceId` again returns `AlreadyExists` |
 
-### 注册表 publish 语义
+### Registry publish semantics
 
-`ClassRegistry::publish` 与 Linux device registration 一样拒绝重复 identity。热插拔重注册
-必须先经过 `Removed` lifecycle 删除旧对象，再发布新对象，不能静默替换 resident runtime。
+`ClassRegistry::publish` rejects duplicate identity, as Linux device
+registration does. Hotplug re-registration must first remove the old
+object through the `Removed` lifecycle and then publish a new object; a
+resident runtime is never silently replaced.
 
-## 算法流程
+## Flows
 
-### publish 流程
+### Publish flow
 
-1. 驱动在 `DeviceDriver::probe_device` 中创建运行时设备（如 `VirtIoNet::try_new`）。
-2. 调用 `publish_<class>(parent, runtime)`（macro-generated）。
-3. 从 runtime 提取 `name()`、`device_kind()`、`irq()`。
-4. 校验 `device_kind` 与注册表类型匹配，不匹配时返回 `InvalidInput`。
-5. 从 runtime 提取 `class_metadata()`（仅 input class 返回有效元数据）。
-6. 构造 `ClassDevice::try_new_with_class_metadata`：
-   - 验证 parent 有 `driver_name()` 和 `driver_id()`（必须已绑定驱动），否则返回 `BadState`。
-7. 注册表 publish（`SpinNoPreempt` 锁内）：
-   - 同一 ID 已存在 → `AlreadyExists`，撤销已经执行的 class-specific publish
-   - 否则 → push
-8. 如果设备已处于 `Active` 状态，同步触发 `notify_class_available`，通知所有已注册 subscriber。
+1. The driver creates the runtime device inside `DeviceDriver::probe_device`
+   (e.g. `VirtIoNet::try_new`).
+2. It calls `publish_<class>(parent, runtime)` (macro-generated).
+3. `name()`, `device_kind()`, and `irq()` are extracted from the runtime.
+4. The `device_kind` is checked against the registry type;
+   a mismatch returns `InvalidInput`.
+5. `class_metadata()` is extracted from the runtime (only the input class
+   returns meaningful metadata).
+6. `ClassDevice::try_new_with_class_metadata` is constructed:
+   - the parent must have `driver_name()` and `driver_id()` (i.e. a bound
+     driver), otherwise `BadState` is returned.
+7. The registry publishes under the `SpinNoPreempt` lock:
+   - if the same id already exists → `AlreadyExists`, and the
+     class-specific publish already performed is undone;
+   - otherwise → push.
+8. If the device is already `Active`, `notify_class_available` fires
+   synchronously, notifying all registered subscribers.
 
-### 设备枚举与查找
+### Device enumeration and lookup
 
-1. `*_devices()`：获取注册表锁，遍历所有条目，过滤 `is_available()`（parent.state == Active），克隆返回。
-2. `find_*_device(id)`：获取注册表锁，查找匹配 ID 且 `is_available()` 的条目。
-3. 这两个操作都返回 `ClassDevice<T>` 的克隆（`Arc` 共享），调用者可安全地跨锁边界使用。
+1. `*_devices()`: take the registry lock, iterate all entries, filter by
+   `is_available()` (parent.state == Active), and return clones.
+2. `find_*_device(id)`: take the registry lock and find the entry matching
+   the id and `is_available()`.
+3. Both operations return clones of `ClassDevice<T>` (`Arc`-shared), so
+   callers can safely use them across the lock boundary.
 
-### 可用性订阅
+### Availability subscription
 
-1. 子系统在初始化阶段调用 `subscribe_<class>_available(callback)`。
-2. callback 以 `ClassAvailabilityCallback<T> = Arc<dyn Fn(ClassDevice<T>) + Send + Sync>` 形式存储。
-3. 当设备变为 `Active` 时，`notify_class_available` 在锁外调用所有 subscriber callback。
-4. subscriber 在 callback 中可选择立即使用设备或缓存引用。
-5. callback 调用在锁外执行，避免 subscriber 回调中的重入导致死锁。
+1. A subsystem calls `subscribe_<class>_available(callback)` during init.
+2. The callback is stored as
+   `ClassAvailabilityCallback<T> = Arc<dyn Fn(ClassDevice<T>) + Send + Sync>`.
+3. When a device becomes `Active`, `notify_class_available` invokes all
+   subscriber callbacks outside the lock.
+4. A subscriber may use the device immediately or cache the reference
+   inside the callback.
+5. Callbacks run outside the lock so reentrancy inside subscriber code
+   cannot deadlock the registry.
 
-### 事件桥接
+### Event bridge
 
-`ACTIVATION_BRIDGE` 在首次 class registry 访问时惰性初始化（`ensure_event_bridge`）：
+`ACTIVATION_BRIDGE` is lazily initialized on first class-registry access
+(`ensure_event_bridge`):
 
-1. 注册 `DeviceEventKind::Activated` subscriber：收到事件后调用 `notify_class_available(kind, id)`，
-   按 `DeviceKind` 分发到对应 class 的 notify 函数。
-2. 注册 `DeviceEventKind::Removed` subscriber：收到事件后调用 `remove_class_device(id)`，
-   遍历所有 class 注册表执行 `remove`。
-3. 桥接在 `LazyInit::call_once` 中完成，保证只注册一次。
+1. A `DeviceEventKind::Activated` subscriber is registered: on each event
+   it calls `notify_class_available(kind, id)`, dispatching on
+   `DeviceKind` to the matching class notify function.
+2. A `DeviceEventKind::Removed` subscriber is registered: on each event it
+   calls `remove_class_device(id)`, which walks every class registry and
+   removes the id.
+3. The bridge completes inside `LazyInit::call_once`, guaranteeing a
+   single registration.
 
-### Device trait 委托
+### Device trait delegation
 
-需要由消费者直接持有 class handle 的 `ClassDevice<T>` 实现对应操作 trait，委托到 inner
-runtime。block class 是生命周期发布入口；I/O 消费者从 block core 取得 canonical
-`BlockDevice`，因此不再为 `ClassDevice<BlockDeviceImpl>` 重复实现整套 block operations。
+`ClassDevice<T>` implements the operation trait for categories whose
+consumers hold class handles, delegating to the inner runtime. The block
+class is the lifecycle publication entry point; I/O consumers obtain the
+canonical `BlockDevice` from the block core, so the full set of block
+operations is deliberately not re-implemented for
+`ClassDevice<BlockDeviceImpl>`.
 
 ```rust
 impl NetDevice for ClassDevice<NetDeviceImpl> {
@@ -197,109 +242,148 @@ impl NetDevice for ClassDevice<NetDeviceImpl> {
 }
 ```
 
-`with()` 方法通过 `&self.inner.runtime` 共享借用 runtime，不持有锁。
-runtime 内部的并发控制由驱动自行负责（通常通过 interior mutability）。
+The `with()` method borrows the runtime shared through
+`&self.inner.runtime` without taking a lock. Concurrency inside the
+runtime is the driver's own responsibility (usually interior mutability).
 
-### Display 设备的 framebuffer 路径
+### Display device framebuffer path
 
-`DisplayDevice` trait 只暴露分辨率 (`DisplayInfo { width, height }`) 与 scanout
-resource 接口（`create_scanout_resource` / `destroy_scanout_resource` /
-`present_scanout_resource`）。kclass 的 class adapter 对这些方法做纯委托，
-不持有任何 framebuffer 裸指针或直接内存映射。
+The `DisplayDevice` trait exposes only the resolution
+(`DisplayInfo { width, height }`) and the scanout resource interface
+(`create_scanout_resource` / `destroy_scanout_resource` /
+`present_scanout_resource`). The kclass class adapter is a pure
+delegation for those methods and holds no framebuffer raw pointers or
+direct memory mappings.
 
-`/dev/fb0` 的 framebuffer 兼容层由 `fbdevice` crate 实现：它在 `fb_init` 时向主显示
-设备分配一块 shadow buffer，通过 `create_scanout_resource` 绑定为 host 可见的 2D
-resource，再按需通过 `fb_present` 推到 scanout（无后台刷新任务：持续
-`present_scanout_resource` 会与 DRM 合成器竞争单一物理 scanout 造成闪烁，因此
-`/dev/fb0` 的写入与 `FBIOPAN_DISPLAY` ioctl 才触发呈现）。这套
-"fbdev emulation over scanout" 模型对任何 `DisplayDevice` 统一适用，无需驱动自行暴露
-直接映射的 framebuffer，因此 kclass 不再需要 framebuffer 特殊处理或 unsafe 边界。
+The `/dev/fb0` framebuffer compatibility layer lives in the `fbdevice`
+crate: at `fb_init` it allocates a shadow buffer against the primary
+display device, binds it as a host-visible 2D resource through
+`create_scanout_resource`, and pushes it to the scanout on demand via
+`fb_present` (no background refresh task: a continuous
+`present_scanout_resource` would race a DRM compositor for the single
+physical scanout and cause flicker, so only `/dev/fb0` writes and the
+`FBIOPAN_DISPLAY` ioctl trigger a present). This "fbdev emulation over
+scanout" model applies uniformly to any `DisplayDevice`, so drivers never
+need to expose a directly-mapped framebuffer, and kclass needs no
+framebuffer special-casing or unsafe boundary.
 
-## 并发模型
+## Concurrency Model
 
-- 每个 class 注册表由 `SpinNoPreempt<ClassRegistry<T>>` 保护：
-  publish / devices / find / subscribe / remove 操作在锁内完成。
-- `notify_class_available` 采用「锁内查找设备 + 锁外回调」模式：
-  - 在锁内查找设备并克隆 subscriber 列表；
-  - 在锁外遍历 subscriber 执行 callback。
-  这避免了 subscriber 回调中的重入导致死锁。
-- `ACTIVATION_BRIDGE` 的初始化由 `LazyInit` 保证线程安全。
-- `ClassDevice<T>` 通过 `Arc` 共享，`Clone` 仅增加引用计数。
-- runtime (trait object) 的并发安全由 `Box<dyn Trait + Send + Sync>` 的 Sync bound
-  和各驱动内部的 interior locking 保证。
+- Each class registry is protected by `SpinNoPreempt<ClassRegistry<T>>`:
+  publish / devices / find / subscribe / remove complete inside the lock.
+- `notify_class_available` uses the "find device inside the lock, call
+  callbacks outside" pattern:
+  - find the device and clone the subscriber list under the lock;
+  - walk subscribers and run callbacks outside the lock.
+  This prevents reentrancy inside subscriber callbacks from deadlocking
+  the registry.
+- `ACTIVATION_BRIDGE` initialization is thread-safe through `LazyInit`.
+- `ClassDevice<T>` is shared via `Arc`; `Clone` only bumps the reference
+  count.
+- Runtime (trait object) concurrency safety is guaranteed by the
+  `Send + Sync` bounds of `Box<dyn Trait + Send + Sync>` plus each
+  driver's interior locking.
 
-## 设计决策
+## Design Decisions
 
-### 宏驱动而非手写每个 class
+### Macro-driven instead of hand-written per class
 
-**选择**：使用 `class_registries!` 宏批量生成 7 个设备 class 的所有代码。
+**Choice**: generate all code for the 7 device classes with the
+`class_registries!` macro.
 
-**Trade-off**：宏的调试信息较差，但换取以下好处：
-- 每个 class 的 publish/devices/find/subscribe/notify/remove 逻辑完全一致，
-  手写 7 份会有大量重复代码；
-- 增加新 class 只需在 `class_registries!` 调用点添加一行参数，
-  无需编写重复的样板代码；
-- 宏展开后的代码与手写代码完全等价，无运行时开销。
+**Trade-off**: macro debugging is harder, in exchange for:
 
-**拒绝的方案**：手写每个 class 的完整代码。重复度高，新增 class 容易遗漏步骤
-（如忘记实现 notify 或 ensure_event_bridge 调用），宏保证了一致性。
+- identical publish/devices/find/subscribe/notify/remove logic per class;
+  writing it 7 times by hand would duplicate heavily;
+- adding a new class is one line at the `class_registries!` call site,
+  with no repeated boilerplate;
+- the expanded code is exactly what a hand-written version would be — no
+  runtime overhead.
 
-### Device trait 委托而非暴露 trait object
+**Rejected alternative**: hand-writing each class in full. High
+duplication, and new classes tend to miss steps (notify or
+ensure_event_bridge calls); the macro enforces consistency.
 
-**选择**：为 `ClassDevice<T>` 实现每个操作 trait，内部通过 `with()` 委托。
+### Device trait delegation instead of exposing the trait object
 
-**Trade-off**：每个 class 需要写 5-10 个方法的委托 impl，但换取以下好处：
-- 上层子系统使用 `ClassDevice<NetDeviceImpl>` 与使用 `&dyn NetDevice` 的体验一致；
-- `ClassDevice` 在委托调用前后可插入通用逻辑（如统计、日志、权限检查），
-  无需修改各驱动实现；
-- 封装了 `DeviceObject` 的生命周期管理，上层子系统无需关心设备状态。
+**Choice**: implement each operation trait for `ClassDevice<T>`,
+delegating through `with()`.
 
-**拒绝的方案**：暴露 `fn runtime(&self) -> &T` 让调用者直接操作。
-该方案简化了委托代码，但破坏了封装——调用者可能 bypass 设备状态检查。
+**Trade-off**: each class needs 5-10 delegating methods, in exchange for:
 
-### 事件桥接惰性初始化
+- upper subsystems use `ClassDevice<NetDeviceImpl>` exactly as they would
+  use `&dyn NetDevice`;
+- `ClassDevice` can insert common logic around delegated calls (stats,
+  logging, permission checks) without touching driver implementations;
+- `DeviceObject` lifetime management is encapsulated; consumers never
+  inspect device state.
 
-**选择**：使用 `LazyInit` + `ensure_event_bridge()` 在首次 class registry 访问时注册事件监听。
+**Rejected alternative**: expose `fn runtime(&self) -> &T` and let callers
+operate directly. That simplifies delegation code but breaks
+encapsulation — callers could bypass device state checks.
 
-**Trade-off**：首次 registry 访问有微小的初始化开销，但换取以下好处：
-- 不需要在 `init_drivers` 中显式调用 kclass 初始化；
-- kclass 的使用者无需关心初始化顺序——只要 kdevice 已初始化即可；
-- 如果编译配置未启用任何 class feature，事件桥接不会被注册，节省资源。
+### Lazily initialized event bridge
 
-**拒绝的方案**：在 `kclass` 的全局构造函数中（如 `LazyInit` of a dummy）注册事件。
-该方案更"主动"但引入了隐式的初始化依赖——kdevice 在构造 kclass 时必须已初始化。
+**Choice**: register event listeners on first class-registry access via
+`LazyInit` + `ensure_event_bridge()`.
 
-### Input class 携带运行时身份元数据
+**Trade-off**: a tiny one-time initialization cost on first access, in
+exchange for:
 
-**选择**：仅 input class 通过 `ClassDeviceMetadata` 携带 `physical_location` 和 `unique_id`。
+- no explicit kclass init call inside `init_drivers`;
+- kclass consumers need no init-order knowledge — only that kdevice is
+  initialized;
+- if no class feature is enabled in the build, the bridge is never
+  registered.
 
-**Trade-off**：`ClassDeviceMetadata` 目前 90% 时间是空的，但换取以下好处：
-- input 子系统的设备匹配（evdev device identity）需要这两个字段；
-- `ClassRuntimeMetadata` trait 的默认实现返回空元数据，
-  其他 class 无需任何代码即可工作；
-- 未来其他 class 如需携带元数据，只需覆盖 `class_metadata()` 方法。
+**Rejected alternative**: registering events from a global constructor
+(e.g. a dummy `LazyInit`). More "proactive", but it creates a hidden
+init-order dependency — kdevice would have to be initialized whenever
+kclass constructs.
 
-**拒绝的方案**：把 `physical_location` / `unique_id` 加入 `Device` trait。
-该方案会将 input 特定的概念污染通用设备抽象。
+### Input class carries runtime identity metadata
 
-### `Arc<DeviceObject>` 防止 use-after-remove
+**Choice**: only the input class carries `physical_location` and
+`unique_id` through `ClassDeviceMetadata`.
 
-**选择**：`ClassDevice` 持有 `Arc<DeviceObject>` 强引用。
+**Trade-off**: `ClassDeviceMetadata` is empty most of the time, in
+exchange for:
 
-**Trade-off**：即使设备已从 class 注册表 remove，外部持有的 `ClassDevice` 克隆仍能访问其 trait 方法。
-这对于以下场景是必要的：
-- poller / async task 持有的设备引用在设备热移除后仍需完成最后一次 I/O；
-- subscriber callback 中获取的引用可能在设备 remove 后仍被使用。
+- input subsystem device matching (evdev device identity) needs both
+  fields;
+- the `ClassRuntimeMetadata` trait's default implementation returns empty
+  metadata, so other classes work with zero extra code;
+- future classes can carry metadata by overriding `class_metadata()`.
 
-**拒绝的方案**：`ClassDevice` 持有 `Weak<DeviceObject>`。
-该方案允许 `DeviceObject` 在 remove 后立即释放，
-但要求每次 `with()` 调用前都 upgrade weak pointer，
-增加失败路径（设备已释放时返回错误）。
+**Rejected alternative**: adding `physical_location` / `unique_id` to the
+`Device` trait. That would pollute the generic device abstraction with
+input-specific concepts.
 
-## Drop / 资源释放
+### Arc<DeviceObject> prevents use-after-remove
 
-- `ClassDevice` 的 drop 仅减少 `Arc` 引用计数，不触发任何设备操作。
-- 注册表 remove 仅执行 `Vec::swap_remove`，移除 `ClassDevice` 条目。
-- 当最后一个 `ClassDevice` 和 `DeviceObject` 引用都释放后，
-  `DeviceObject` 的 devres（MMIO 映射、IRQ、DMA buffer）按 LIFO 顺序清理。
-- runtime trait object 的 drop 由 `Box<T>` 负责，在 `ClassDeviceInner` drop 时执行。
+**Choice**: `ClassDevice` holds a strong `Arc<DeviceObject>`.
+
+**Trade-off**: clones of a `ClassDevice` held outside the registry still
+reach the trait methods after the device is removed from the registry.
+This is necessary for:
+
+- pollers / async tasks holding a device reference that must finish a last
+  I/O after hot removal;
+- references obtained inside subscriber callbacks that may outlive the
+  removal.
+
+**Rejected alternative**: `ClassDevice` holding `Weak<DeviceObject>`. That
+would free the `DeviceObject` immediately on removal but requires
+upgrading the weak pointer before every `with()` call, adding a failure
+path (device already freed).
+
+## Drop / Resource Release
+
+- Dropping a `ClassDevice` only decrements the `Arc` count; it performs no
+  device operations.
+- Registry removal is a `Vec::swap_remove` of the `ClassDevice` entry.
+- When the last `ClassDevice` and `DeviceObject` references are released,
+  the `DeviceObject` devres (MMIO mappings, IRQs, DMA buffers) is cleaned
+  up in LIFO order.
+- The runtime trait object is dropped by its `Box<T>` when
+  `ClassDeviceInner` drops.

@@ -438,6 +438,13 @@ impl BlockDevice {
     }
 
     /// Returns this device's capacity in bytes.
+    /// Returns the disk size in bytes (`num_blocks * block_size`).
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the block size or capacity were not validated at
+    /// publication time, which [`Gendisk::new`] and [`Self::set_capacity`]
+    /// already enforce.
     pub fn size(&self) -> u64 {
         let block_size = u64::try_from(self.block_size()).expect("validated block size");
         self.num_blocks()

@@ -22,6 +22,7 @@ pub use bus_type::{BusType, BusTypeId, BusTypeObject, PciBusTypeMatcher, Platfor
 pub struct BusId(u64);
 
 impl BusId {
+    /// Wraps a raw numeric bus id.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }

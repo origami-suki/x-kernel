@@ -13,10 +13,12 @@ pub struct BusHandle {
 }
 
 impl BusHandle {
+    /// Wraps a raw [`BusId`] into a handle.
     pub const fn new(id: BusId) -> Self {
         Self { id }
     }
 
+    /// Returns the bus id this handle refers to.
     pub const fn id(self) -> BusId {
         self.id
     }
@@ -29,10 +31,12 @@ pub struct DriverCore {
 }
 
 impl DriverCore {
+    /// Wraps a raw [`DriverId`] into a handle.
     pub const fn new(id: DriverId) -> Self {
         Self { id }
     }
 
+    /// Returns the driver id this handle refers to.
     pub const fn id(self) -> DriverId {
         self.id
     }
@@ -45,10 +49,12 @@ pub struct DeviceCore {
 }
 
 impl DeviceCore {
+    /// Wraps a raw [`DeviceId`] into a handle.
     pub const fn new(id: DeviceId) -> Self {
         Self { id }
     }
 
+    /// Returns the device id this handle refers to.
     pub const fn id(self) -> DeviceId {
         self.id
     }

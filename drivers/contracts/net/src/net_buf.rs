@@ -177,6 +177,12 @@ impl NetBuf {
     }
 
     /// Converts the buffer into a [`NetBufHandle`].
+    ///
+    /// # Panics
+    ///
+    /// Only through the internal `NonNull::new(..).unwrap()` calls if the
+    /// box pointer or the payload pointer were null, which cannot happen
+    /// for a live pooled buffer.
     pub fn into_handle(mut self: Box<Self>) -> NetBufHandle {
         let data_ptr = self.payload_mut().as_mut_ptr();
         let data_len = self.payload_len;

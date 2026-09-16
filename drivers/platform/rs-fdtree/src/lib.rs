@@ -5,7 +5,6 @@
 //! A minimal #![no_std] parser for Linux Flattened Devicetrees.
 
 #![no_std]
-#![allow(rustdoc::bare_urls)]
 
 mod error;
 mod header;
@@ -19,6 +18,8 @@ pub use kernel_nodes::{Chosen, Dice, InterruptController};
 pub use node::{FdtNode, MemoryRegion, NodeProperty, RegIter};
 use parsing::{BigEndianU64, CStr, FdtData};
 
+/// Iterator over the DTB memory-reservation block, yielding each
+/// `(address, size)` pair until the `0, 0` terminator.
 #[derive(Debug, Clone, Copy)]
 pub struct MemReserveIter<'a> {
     stream: FdtData<'a>,
@@ -63,6 +64,24 @@ impl<'a> LinuxFdt<'a> {
         })
     }
 
+    /// Constructs a `LinuxFdt` from a raw pointer to a DTB blob in
+    /// memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FdtError::BadPtr` for a null pointer and
+    /// `FdtError::BadMagic` when the header parses but the magic is
+    /// wrong. `FdtError::BufferTooSmall` is unreachable on this path:
+    /// the slice handed to the validator is exactly the declared total
+    /// size, so a blob shorter than its declaration is the caller's
+    /// safety obligation, not a returned error.
+    ///
+    /// # Panics
+    ///
+    /// Panics via the internal unwrap when the fixed-size header
+    /// (36 bytes) cannot be parsed at all — i.e. the caller-provided
+    /// region is shorter than one header.
+    ///
     /// # Safety
     ///
     /// `ptr` must point to a readable flattened devicetree blob whose header
@@ -140,44 +159,55 @@ impl<'a> LinuxFdt<'a> {
         )
     }
 
+    /// Iterates the memreserve block entries (physical address/size pairs).
     pub fn mem_reservations(&self) -> MemReserveIter<'a> {
         MemReserveIter {
             stream: FdtData::new(self.mem_rsvmap_block()),
         }
     }
 
+    /// Iterates `/memory` node regions as [`MemoryRegion`]s.
     pub fn memory_regions(&self) -> impl Iterator<Item = MemoryRegion> + '_ {
         node::memory_regions(self)
     }
 
+    /// Iterates `/reserved-memory` child regions as [`MemoryRegion`]s.
     pub fn reserved_memory_regions(&self) -> impl Iterator<Item = MemoryRegion> + '_ {
         node::reserved_memory_regions(self)
     }
 
+    /// Iterates `/reserved-memory` child nodes.
     pub fn reserved_memory_nodes(&self) -> impl Iterator<Item = node::FdtNode<'_, 'a>> + '_ {
         node::reserved_memory_nodes(self)
     }
 
+    /// Returns the boot arguments from the `/chosen` node.
     pub fn chosen_bootargs(&self) -> Option<&'a str> {
         self.chosen()?.bootargs()
     }
 
+    /// Returns the console device path from the `/chosen` node.
     pub fn chosen_stdout_path(&self) -> Option<&'a str> {
         self.chosen()?.stdout_path()
     }
 
+    /// Returns the root node's `model` string.
     pub fn root_model(&self) -> Option<&'a str> {
         self.find_node("/")?.property_str("model")
     }
 
+    /// Returns the root node's first `compatible` string.
     pub fn root_compatible(&self) -> Option<&'a str> {
         self.find_node("/")?.compatible()
     }
 
+    /// Finds the first node whose `compatible` list contains the string.
     pub fn find_compatible(&self, compatible: &str) -> Option<node::FdtNode<'_, 'a>> {
         self.all_nodes().find(|node| node.is_compatible(compatible))
     }
 
+    /// Resolves a path or an alias (looked up under `/aliases`) to a node;
+    /// a `:`-suffixed cell suffix is ignored.
     pub fn resolve_node(&self, path_or_alias: &str) -> Option<node::FdtNode<'_, 'a>> {
         let key = path_or_alias.split(':').next()?;
         if key.starts_with('/') {

@@ -1,6 +1,15 @@
-# kclass — 安全与可靠性分析
+# kclass — Security And Reliability
 
-## 信任模型
+## Scope
+
+This analysis covers the entire crate: `src/lib.rs` (macro-generated
+class registries, delegation impls, event bridge, prelude) and
+`src/generic.rs` (`ClassDevice<T>`, `ClassRegistry<T>`). No modules are
+excluded; the crate contains no unsafe code and every registry is
+reachable from the documented publish/query/subscribe API.
+
+
+## Trust Model
 
 ```text
     kdriver (probe success)
@@ -27,141 +36,179 @@
     knet / fs_boot / input subsystem / ...
 ```
 
-- `kclass` 信任 `kdriver` 在调用 `publish_<class>()` 前已完成驱动 probe，
-  `parent` 的 `driver_name()` / `driver_id()` 已设置且驱动匹配已通过 `kdevice` 校验。
-- `kclass` 信任 runtime trait object 实现了 `Send + Sync` 且内部并发安全。
-- `kclass` 信任 `kdevice` 的 `Activated` / `Removed` 事件在正确的时序分发。
-- 上层子系统信任 `kclass` 返回的 `ClassDevice<T>` 在设备 remove 后仍可安全访问（通过 `Arc<DeviceObject>` 持有保证）。
+- `kclass` trusts `kdriver` to have finished the driver probe before
+  calling `publish_<class>()`, with the parent's `driver_name()` /
+  `driver_id()` set and the driver match validated by `kdevice`.
+- `kclass` trusts the runtime trait object to be `Send + Sync` and
+  internally concurrency-safe.
+- `kclass` trusts `kdevice` to dispatch `Activated` / `Removed` events in
+  the correct order.
+- Upper subsystems trust that a `ClassDevice<T>` returned by `kclass`
+  stays safely accessible after device removal (guaranteed by holding
+  `Arc<DeviceObject>`).
 
-## 外部边界 / 攻击面
+## External Boundaries / Attack Surface
 
-`kclass` 是类型化的运行时设备能力注册层，不直接接触硬件或外部输入。
-其攻击面主要来自：
+`kclass` is a typed runtime device-capability registry layer that never
+touches hardware or external input directly. Its attack surface comes
+from:
 
-- **kdriver publish 输入**：驱动传入的 `parent: Arc<DeviceObject>` 和 `runtime: T`。
-  kclass 假设 `parent` 已通过 `kdevice` 的完整 probe 流水线——驱动匹配已校验、
-  `parent.state` 状态转换受 `kdevice` 内部锁保护。
-- **事件桥接**：`kdevice` 分发的 `Activated` / `Removed` 事件到达时序。
-  kclass 信任 kdevice 在状态迁移完成后才分发事件。
-- **ClassDevice trait delegation**：上层子系统通过 `ClassDevice<T>` 调用 trait 方法时，
-  委托到 runtime trait object。kclass 自身不做参数校验——信任各 subsystem 和驱动完成校验。
+- **kdriver publish input**: the driver-supplied
+  `parent: Arc<DeviceObject>` and `runtime: T`. kclass assumes `parent`
+  went through the full `kdevice` probe pipeline — driver matching
+  validated, `parent.state` transitions protected by `kdevice` internal
+  locks.
+- **Event bridge**: the arrival order of `Activated` / `Removed` events
+  dispatched by `kdevice`. kclass trusts kdevice to dispatch only after
+  state transitions complete.
+- **ClassDevice trait delegation**: when upper subsystems call trait
+  methods through `ClassDevice<T>`, calls delegate to the runtime trait
+  object. kclass itself performs no argument validation — it trusts each
+  subsystem and driver to validate.
 
-威胁分析重点应覆盖：
+The threat analysis should focus on:
 
-- 事件桥接的回调是否可能在错误的设备状态下被触发；
-- `ClassDevice` 的 `Arc` 生命周期是否可能在设备 remove 后产生悬垂引用；
-- 重复 publish 是否被拒绝且 class-specific publish 是否正确回滚。
+- whether event-bridge callbacks can fire in the wrong device state;
+- whether the `ClassDevice` `Arc` lifetime can dangle after device
+  removal;
+- whether duplicate publishes are rejected and class-specific publish
+  steps are rolled back correctly.
 
-## unsafe 代码清单
+## Unsafe Code Inventory
 
-kclass 自身不包含任何 `unsafe` 代码块。历史上 `DisplayDevice::fb()` 曾通过
-`display::FrameBuffer::from_raw_parts_mut` 从裸 vaddr 构造 framebuffer 引用，
-该路径已随 framebuffer 直接映射抽象的移除而删除：`/dev/fb0` 现由 `fbdevice` 的
-fbdev emulation（shadow buffer + scanout resource）实现，framebuffer 裸指针构造的
-unsafe 边界随之消失，相关安全责任转移到 `fbdevice`（shadow buffer 由 `GlobalPage`
-RAII 管理，生命周期与内核等长）。
+kclass contains no `unsafe` code blocks. Historically
+`DisplayDevice::fb()` built a framebuffer reference from a raw vaddr via
+`display::FrameBuffer::from_raw_parts_mut`; that path was removed along
+with the directly-mapped framebuffer abstraction. `/dev/fb0` is now
+implemented by `fbdevice`'s fbdev emulation (shadow buffer + scanout
+resource), so the framebuffer raw-pointer unsafe boundary is gone and its
+safety responsibilities moved to `fbdevice` (the shadow buffer is managed
+by a `GlobalPage` RAII allocation that lives for the kernel lifetime).
 
-## 内存安全不变量
+## Memory-Safety Invariants
 
-1. **ClassDevice Arc 生命周期**：`ClassDevice` 持有 `Arc<ClassDeviceInner<T>>`，
-   `ClassDeviceInner` 持有 `Arc<DeviceObject>`。
-   只要外部持有 `ClassDevice` 克隆，`DeviceObject` 就不会被释放，
-   其 devres 资源（MMIO 映射、IRQ、DMA buffer）保持有效。
-2. **ClassDevice 在 remove 后仍可安全使用**：`ClassRegistry::remove` 仅从注册表移除条目；
-   外部已持有的 `ClassDevice` 克隆仍有效，其 `with()` 调用通过 `Arc<DeviceObject>` 访问设备资源。
-   设备状态变为 `Removing`/`Removed` 后 trait 方法可能返回错误，但不会产生 UB。
-3. **注册表锁内操作不回调**：`publish`、`remove` 在 `SpinNoPreempt` 锁内完成，
-   不调用外部 callback。callback 在锁外执行。
-4. **事件分发无重入**：`notify_class_available` 在 callback 调用前已释放注册表锁，
-   callback 中对同一注册表的访问不会死锁。
-5. **publish identity 唯一性**：同一 `DeviceId` 的第二次 publish 返回 `AlreadyExists`；
-   replacement 必须由 `Removed` 后的新 publish 表达。
-6. **device_kind 校验**：`publish_<class>()` 在构造 `ClassDevice` 前校验 runtime 的
-   `device_kind` 与注册表类型匹配，不匹配时返回 `InvalidInput` 而不发布。
+1. **ClassDevice Arc lifetime**: `ClassDevice` holds
+   `Arc<ClassDeviceInner<T>>`, and `ClassDeviceInner` holds
+   `Arc<DeviceObject>`. As long as any `ClassDevice` clone exists, the
+   `DeviceObject` is not freed and its devres resources (MMIO mappings,
+   IRQs, DMA buffers) stay valid.
+2. **ClassDevice remains safe to use after removal**:
+   `ClassRegistry::remove` only drops the registry entry; clones held
+   outside stay valid, and their `with()` calls reach device resources
+   through `Arc<DeviceObject>`. Trait methods may return errors once the
+   device state is `Removing`/`Removed`, but no UB can occur.
+3. **No callbacks under the registry lock**: `publish` and `remove`
+   complete inside the `SpinNoPreempt` lock without calling external
+   callbacks; callbacks run outside the lock.
+4. **No reentrancy in event dispatch**: `notify_class_available` releases
+   the registry lock before invoking callbacks, so a callback touching
+   the same registry cannot deadlock.
+5. **Publish identity uniqueness**: a second publish of the same
+   `DeviceId` returns `AlreadyExists`; replacement must be expressed as a
+   new publish after `Removed`.
+6. **device_kind validation**: `publish_<class>()` verifies the runtime's
+   `device_kind` against the registry type before constructing the
+   `ClassDevice`; a mismatch returns `InvalidInput` without publishing.
 
-## 线程安全
+## Thread Safety
 
-| 类型 | Send 条件 | Sync 条件 |
+| Type | Send condition | Sync condition |
 |------|-----------|-----------|
-| `ClassDevice<T>` | `Arc<ClassDeviceInner<T>>` 满足 Send，要求 `T: Send + Sync` | `Arc` 提供共享访问 |
-| `ClassDeviceInner<T>` | `Arc<DeviceObject>` + `T: Send` + metadata 满足 Send | `Arc<DeviceObject>` + `T: Sync` |
-| `ClassRegistry<T>` | `Vec<ClassDevice<T>>` + `Vec<Callback>` 满足 Send | 通过 `SpinNoPreempt` 提供内部可变性 |
-| `ClassAvailabilityCallback<T>` | `Arc<dyn Fn(...) + Send + Sync>` 满足 Send + Sync | `Arc` 提供共享访问 |
-| `ACTIVATION_BRIDGE` | `LazyInit<()>` 零大小类型 | `LazyInit` 保证初始化线程安全 |
+| `ClassDevice<T>` | `Arc<ClassDeviceInner<T>>` is `Send` when `T: Send + Sync` | `Arc` provides shared access |
+| `ClassDeviceInner<T>` | `Arc<DeviceObject>` + `T: Send` + metadata `Send` | `Arc<DeviceObject>` + `T: Sync` |
+| `ClassRegistry<T>` | `Vec<ClassDevice<T>>` + `Vec<Callback>` are `Send` | interior mutability via `SpinNoPreempt` |
+| `ClassAvailabilityCallback<T>` | `Arc<dyn Fn(...) + Send + Sync>` is `Send + Sync` | `Arc` provides shared access |
+| `ACTIVATION_BRIDGE` | `LazyInit<()>` is a zero-sized type | `LazyInit` makes initialization thread-safe |
 
-## 威胁分析
+## Threat Analysis
 
-| 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
+| ID | Threat | Impact | Trigger | Existing control |
 |------|----------|----------|----------|----------|
-| T-02 | 事件桥接在 `kdevice` 未初始化时被触发 | 高 | `ensure_event_bridge` 在 `kdevice::init_device_registry` 之前调用 | kdriver 调用 `publish_*` 前已执行 `init_device_registry`；`ACTIVATION_BRIDGE` 惰性初始化在首次 publish 时触发 |
-| T-03 | 注册表 publish 竞态导致设备丢失或重复 | 中 | 同一设备并发 publish | `SpinNoPreempt` 串行化，同 ID 的第二次 publish 返回 `AlreadyExists` |
-| T-04 | subscriber callback 中 panic 导致后续 subscriber 未被通知 | 中 | 某个 callback panic，其余 callback 在 `for` 循环中未执行 | callback 在 `catch_unwind` 之外执行；当前无 unwind 保护，依赖 subscriber 实现质量 |
-| T-05 | 设备 remove 后 `ClassDevice` 的 `with()` 访问已释放的 runtime | 中 | runtime trait object 的 `Drop` 在 `ClassDeviceInner` drop 之前执行 | `ClassDeviceInner` 的所有字段（包括 runtime）同时 drop；`Arc` 引用计数保证所有引用释放后才 drop |
-| T-06 | publish 时 `device_kind` 校验被绕过 | 中 | 驱动错误使用错误的 publish 函数（如对 net 设备调用 `publish_block`） | 显式 `device_kind != $kind` 校验，不匹配时返回 `InvalidInput` 且不发布 |
-| T-07 | `find` / `devices` 返回非 `Active` 设备 | 低 | `is_available()` 过滤逻辑被移除或错误实现 | `devices()` 和 `find()` 均通过 `is_available()` 过滤；remove 后设备被 swap_remove |
-| T-08 | subscriber 回调中重入同一注册表导致死锁 | 中 | subscriber 回调中调用 `publish_*` / `subscribe_*` 等注册表操作 | `notify_class_available` 在锁外执行回调，重入不会死锁（但可能产生长调用链） |
+| T-02 | Event bridge fires before `kdevice` is initialized | High | `ensure_event_bridge` called before `kdevice::init_device_registry` | kdriver runs `init_device_registry` before any `publish_*`; the `ACTIVATION_BRIDGE` lazy init fires at first publish |
+| T-03 | Publish race loses or duplicates a device | Medium | Concurrent publish of the same device | `SpinNoPreempt` serializes; a second publish of the same id returns `AlreadyExists` |
+| T-04 | A subscriber callback panics, skipping later subscribers | Medium | One callback panics inside the notification `for` loop | Callbacks run outside `catch_unwind`; currently no unwind protection — subscriber quality is relied upon |
+| T-05 | `with()` on a removed `ClassDevice` reaches freed runtime | Medium | Runtime trait object dropped before `ClassDeviceInner` | All `ClassDeviceInner` fields (including runtime) drop together; `Arc` counting delays drop until all references are gone |
+| T-06 | device_kind validation bypassed at publish | Medium | Driver misuses a publish function (e.g. `publish_block` for a net device) | Explicit `device_kind != $kind` check returns `InvalidInput` without publishing |
+| T-07 | `find`/`devices` return non-`Active` devices | Low | `is_available()` filtering removed or broken | Both paths filter through `is_available()`; removed devices are swap_remove'd |
+| T-08 | Reentrancy into the same registry from a subscriber callback deadlocks | Medium | Callback calls `publish_*` / `subscribe_*` | `notify_class_available` runs callbacks outside the lock, so reentrancy cannot deadlock (but may build long call chains) |
 
-影响等级定义：
+Impact levels:
 
-- 高：导致 UB、内存破坏、权限提升。
-- 中：导致 panic、服务不可用、数据不一致。
-- 低：导致性能退化、日志丢失、功能降级。
+- High: UB, memory corruption, privilege escalation.
+- Medium: panic, service unavailability, inconsistent state.
+- Low: performance degradation, lost logs, degraded functionality.
 
-## 故障模式与影响分析
+## Failure Modes And Effects Analysis
 
-| 编号 | 故障模式 | 故障原因 | 局部影响 | 系统影响 | 严重度 | 应对措施 |
-|------|----------|----------|----------|----------|--------|----------|
-| F-01 | publish 时 parent 无绑定驱动 | `DeviceObject` 在 publish 前未完成 bind 流程 | publish 返回 `BadState` | 该设备无法发布到 class 注册表 | 3 | `try_new_with_class_metadata` 检查 `driver_name()` 和 `driver_id()` |
-| F-02 | publish 时 device_kind 不匹配 | 驱动将 net 设备传入 `publish_block` | publish 返回 `InvalidInput` | 该设备无法发布 | 4 | `kind` 校验在构造 `ClassDevice` 前完成 |
-| F-03 | 事件桥接未注册 | `ensure_event_bridge` 未被调用（无 class feature 启用） | 无 Activated/Removed 事件分发 | 设备状态变更不影响 class 注册表 | 4 | `ensure_event_bridge` 在每个 `*_registry_fn()` 中调用 |
-| F-04 | subscriber 回调 panic | 回调实现有 bug 导致 unwinding | 后续 subscriber 未被通知 | 部分子系统可能未收到设备可用通知 | 3 | 回调按 Vec 顺序调用；当前未使用 `catch_unwind`；依赖 subscriber 质量 |
-| F-06 | 注册表 `devices()` 返回过大的 Vec | 大量设备同时活跃 | 内存分配可能失败 | 调用者收到空 Vec（当前无 OOM 处理） | 4 | `Vec::collect` 可能失败；上层调用者应处理空结果 |
-| F-07 | 重复 publish | 驱动绕过正常 remove/add lifecycle | publish 返回 `AlreadyExists` | 新 runtime 不可见 | 4 | 回滚 class-specific publish，保留原 resident object |
-| F-08 | input metadata 缺失 | 非 input class 未实现 `class_metadata` 覆盖 | `physical_location()` / `unique_id()` 返回空字符串 | input 设备身份信息缺失 | 4 | `ClassRuntimeMetadata` 默认实现返回 `empty()`；input class 显式覆盖 |
+| ID | Failure mode | Cause | Local effect | System effect | Severity | Handling |
+|------|----------|----------|--------|------|----------|----------|
+| F-01 | Publish with an unbound parent | `DeviceObject` did not complete bind before publish | publish returns `BadState` | Device not published | 3 | `try_new_with_class_metadata` checks `driver_name()` and `driver_id()` |
+| F-02 | Publish with a mismatched device_kind | Driver passes a net device to `publish_block` | publish returns `InvalidInput` | Device not published | 4 | Kind check happens before `ClassDevice` construction |
+| F-03 | Event bridge not registered | `ensure_event_bridge` never called (no class feature enabled) | No Activated/Removed dispatch | Device state changes do not reach class registries | 4 | `ensure_event_bridge` is called by every `*_registry_fn()` |
+| F-04 | Subscriber callback panics | Callback bug causes unwinding | Later subscribers not notified | Some subsystems miss availability notices | 3 | Callbacks run in Vec order; no `catch_unwind` today; subscriber quality relied upon |
+| F-06 | `devices()` returns a very large `Vec` | Many devices active at once | Allocation may fail | Caller gets an empty `Vec` (no OOM handling) | 4 | `Vec::collect` may fail; callers should handle empty results |
+| F-07 | Duplicate publish | Driver bypasses the normal remove/add lifecycle | publish returns `AlreadyExists` | New runtime not visible | 4 | Class-specific publish is rolled back; the resident object is kept |
+| F-08 | Missing input metadata | Non-input class does not override `class_metadata` | `physical_location()` / `unique_id()` return empty strings | Input device identity incomplete | 4 | `ClassRuntimeMetadata` default returns `empty()`; the input class overrides explicitly |
 
-严重度定义：
+Severity levels:
 
-- 1：致命，系统崩溃、数据丢失。
-- 2：严重，功能不可用，需重启恢复。
-- 3：一般，功能降级，可自动恢复。
-- 4：轻微，影响有限，用户可容忍。
+- 1: fatal — system crash, data loss.
+- 2: serious — function unavailable until restart.
+- 3: moderate — degraded function, self-recoverable.
+- 4: minor — limited impact, tolerable.
 
-## 故障管理
+## Failure Management
 
-- publish 校验失败使用 `DriverError` 返回（`BadState`、`InvalidInput`、`AlreadyExists`），不 panic。
-- devices、find、subscribe、remove 是 infallible；publish 显式报告重复 identity。
-- subscriber callback 的 panic 当前无 unwind 保护，依赖 subscriber 实现质量。
-- `ClassDevice` 的 `driver_name()` / `driver_id()` 使用 `expect`——前提是 publish 时已校验，
-  如果触发 expect 说明存在 bug（publish 路径未正确校验）。
-- kclass 自身不含 `unsafe` 代码块，因此不会因 class adapter 逻辑产生 UB；
-  历史上的 framebuffer 裸指针路径已迁移到 `fbdevice` 的 fbdev emulation。
+- Publish validation failures return `DriverError` (`BadState`,
+  `InvalidInput`, `AlreadyExists`); nothing panics.
+- devices, find, subscribe, and remove are infallible; publish reports
+  duplicate identity explicitly.
+- A subscriber callback panic currently has no unwind protection;
+  subscriber implementation quality is relied upon.
+- `ClassDevice`'s `driver_name()` / `driver_id()` use `expect` — valid
+  because publish validated them; tripping the `expect` indicates a bug
+  in the publish path.
+- kclass contains no `unsafe` blocks, so class adapter logic cannot cause
+  UB; the historical framebuffer raw-pointer path moved to `fbdevice`'s
+  fbdev emulation.
 
-## 隐私分析
+## Privacy Analysis
 
-`kclass` 不处理用户数据。设备元数据（name、device_kind、driver_name、irq）在日志中以
-debug 级别输出，不包含用户进程数据或设备 payload。
-input class 的 `physical_location` 和 `unique_id` 是设备标识信息，
-不包含用户输入数据。
+`kclass` processes no user data. Device metadata (name, device_kind,
+driver_name, irq) is logged at debug level and contains no user-process
+data or device payloads. The input class's `physical_location` and
+`unique_id` are device identity strings, not user input data.
 
-模块不持久化任何数据；所有状态保持在内存中的 class 注册表和 `ClassDevice` 对象中。
+The module persists nothing; all state lives in the in-memory class
+registries and `ClassDevice` objects.
 
-## 已知限制
+## Known Limitations
 
-- subscriber callback 的 panic 无 `catch_unwind` 保护，可能导致后续 subscriber 未被通知。
-- `devices()` 每次调用都分配新的 `Vec`，高频率轮询场景可能有分配压力。
-- 注册表不支持按条件筛选（如"只列出支持某特性的设备"），调用者需自行过滤。
-- 非 input class 无 `ClassDeviceMetadata` 扩展入口；如需添加 class 特定元数据需修改 trait。
-- `ClassDevice` 不支持降级通知（如设备即将被 remove 的 pre-notification）。
+- Subscriber callback panics have no `catch_unwind` protection and may
+  skip later subscribers.
+- `devices()` allocates a fresh `Vec` per call; high-frequency polling
+  adds allocation pressure.
+- The registry supports no predicate filtering (e.g. "list devices with
+  feature X"); callers filter themselves.
+- Non-input classes have no `ClassDeviceMetadata` extension point; adding
+  class-specific metadata requires a trait change.
+- `ClassDevice` has no pre-removal notification (e.g. "device about to be
+  removed").
 
-## 审计清单
+## Audit Checklist
 
-修改本模块时需验证：
+When modifying this module, verify:
 
-- 每个 `unsafe` 块均有 `SAFETY:` 注释。
-- 新增 class 时在 `class_registries!` 宏调用点添加，而非手写重复逻辑。
-- 新增 class 的 runtime type alias（如 `FooDeviceImpl`）在 lib.rs 中声明。
-- 新增 class 的 trait delegation impl 覆盖所有必要的 trait 方法。
-- 新增 class 在 `prelude` 模块中 re-export。
-- publish 路径对 `parent.driver_name()` / `parent.driver_id()` 的校验保留。
-- 注册表锁内操作不调用外部 callback（避免死锁）。
-- framebuffer 修改遵守 `Arc<DeviceObject>` 生命周期保证。
+- Every `unsafe` block carries a `SAFETY:` comment.
+- A new class is added at the `class_registries!` macro call site, not by
+  hand-copying logic.
+- The new class's runtime type alias (e.g. `FooDeviceImpl`) is declared
+  in lib.rs.
+- The new class's trait delegation impls cover all required trait
+  methods.
+- The new class is re-exported in the `prelude` module.
+- The publish path still validates `parent.driver_name()` /
+  `parent.driver_id()`.
+- Registry-lock critical sections still call no external callbacks (deadlock
+  prevention).
+- Framebuffer changes respect the `Arc<DeviceObject>` lifetime guarantee.

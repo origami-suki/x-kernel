@@ -1,28 +1,57 @@
-# device-res — 设计文档
+# device-res — Design
 
-## 定位
+## Purpose
 
-`device-res` 提供 OS 无关的设备资源描述模型和 provider contract。它是驱动
-子系统表达“驱动需要哪些内核能力”的统一入口，覆盖 MMIO 映射、I/O 端口、
-中断、DMA 缓冲区和单调时钟等能力，并将这些语义与具体内核实现解耦。
+`device-res` provides the OS-neutral device resource description model and
+provider contract. It is the single entry point through which the driver
+subsystem expresses "which kernel capabilities a driver needs", covering
+MMIO mapping, I/O ports, interrupts, DMA buffers, and the monotonic clock,
+and it decouples those semantics from concrete kernel implementations.
 
-依赖本模块的上游子系统包括：
+Upstream subsystems that depend on this module include:
 
-- 各平台驱动（通过 RAII handle 或 `devm_*` 函数获取资源）
-- 内核总线/设备模型（实现 [`DeviceResource`] trait 以支持设备托管资源）
+- platform drivers (acquiring resources via RAII handles or `devm_*`
+  functions);
+- the kernel bus/device model (implementing the [`DeviceResource`] trait to
+  support device-managed resources).
 
-## 背景
+## Non-Responsibilities
 
-不同内核对同一类能力（映射 MMIO、注册中断、分配 DMA、读取单调时间）的操作接口各异。
-驱动代码如果直接调用内核 API，移植时需要逐函数修改。本模块将资源的发现与使用
-分离：驱动只描述"需要什么"，由 host kernel 通过 MMIO / IRQ / DMA provider traits
-提供"怎么给"，从而实现驱动在不同内核间的可移植性。
+- No concrete kernel behavior behind the provider traits: `MmioOp` /
+  `IrqOp` / `DmaOp` / `TimeOp` implementations belong to the host kernel's
+  provider crate (in x-kernel, `device-res-xkernel`, backed by `memspace`,
+  `kirq`, and `kdma`).
+- No global provider state or provider selection: the driver framework
+  (for example `kdriver::resource`) holds the provider instance and passes
+  it explicitly; this crate stores none.
+- No MMIO region overlap detection: rejecting overlapping maps (`Busy`) is
+  owned by the `MmioOp` implementation.
+- No validation of `ResourceDesc` contents: firmware-derived addresses,
+  sizes, and IRQ numbers are trusted to the provider implementations,
+  which must check them at the `map_mmio` / `request_irq` boundary.
+- No interrupt vector, APIC id, or CPU vector allocation: those are
+  internal state of the host IRQ core; this crate only hands out the
+  provider-generated `MsiResource` (see Threat T-09).
+- No DMA cache-coherency protocol of its own: coherency strategy
+  (uncached mappings, fences, cache maintenance) is decided by the
+  `DmaOp` backend.
+- No devres lifecycle engine: cleanup callbacks are registered through
+  the caller's `DeviceResource` implementation, and the device model
+  drives their LIFO execution.
 
-## 范围
+## Background
 
-涉及的源文件：
+Different kernels expose different interfaces for the same class of
+capability: mapping MMIO, registering interrupts, allocating DMA, reading
+monotonic time. Driver code that calls kernel APIs directly must be edited
+function by function when ported. This module separates resource discovery
+from resource use: the driver describes "what it needs", and the host
+kernel supplies "how it is provided" through the MMIO / IRQ / DMA provider
+traits, which is what makes drivers portable across kernels.
 
-```
+## Scope
+
+```text
 drivers/contracts/device-res/
 ├── src/
 │   ├── lib.rs
@@ -37,9 +66,9 @@ drivers/contracts/device-res/
     └── security.md
 ```
 
-## 架构
+## Architecture
 
-```
+```text
                     ┌─────────────────────────────────────────────┐
                     │             Host Kernel                      │
                     │  implements provider traits                  │
@@ -72,58 +101,65 @@ drivers/contracts/device-res/
                └────────────────┘
 ```
 
-### 核心组件
+### Core Components
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |------|------|
-| `ResourceDesc` / `ResourceSet` | 描述单个设备的硬件资源（MMIO、I/O 端口、中断、DMA） |
-| `MmioOp` / `IrqOp` / `DmaOp` / `TimeOp` traits | host kernel 实现的能力后端（map/unmap、request/release IRQ、alloc/free DMA、alloc/free MSI-X、monotonic time） |
-| `ResourceProvider` trait | `MmioOp + IrqOp + DmaOp + TimeOp` 的组合 trait，供驱动框架持有完整资源能力 |
-| `Io` | MMIO 映射的 RAII handle，提供带 acquire/release fence 的寄存器读写方法 |
-| `Irq` | 中断注册的 RAII handle，drop 时自动释放 |
-| `DmaCoherent` | 一致性 DMA 缓冲区的 RAII handle，drop 时自动释放 |
-| `DeviceResource` trait | OS 无关的设备抽象，驱动通过它读取资源和注册清理回调 |
-| `devm_*_with_provider` 函数 | 将资源生命周期绑定到设备，probe 失败或移除时自动清理 |
+| `ResourceDesc` / `ResourceSet` | Describes one device's hardware resources (MMIO, I/O ports, interrupts, DMA) |
+| `MmioOp` / `IrqOp` / `DmaOp` / `TimeOp` traits | The capability backends a host kernel implements (map/unmap, request/release IRQ, alloc/free DMA, alloc/free MSI-X, monotonic time) |
+| `ResourceProvider` trait | Combined `MmioOp + IrqOp + DmaOp + TimeOp` trait the driver framework holds for the full capability set |
+| `Io` | RAII handle over an MMIO mapping, with register read/write methods using acquire/release fences |
+| `Irq` | RAII handle over an interrupt registration, released automatically on drop |
+| `DmaCoherent` | RAII handle over a coherent DMA buffer, freed automatically on drop |
+| `DeviceResource` trait | OS-neutral device abstraction through which drivers read resources and register cleanup callbacks |
+| `devm_*_with_provider` functions | Bind resource lifetime to a device, cleaning up automatically on probe failure or removal |
 
-### Provider 选择
+### Provider Selection
 
-`device-res` 不维护全局 provider 状态。驱动框架持有 host kernel 提供的
-provider 实例，并调用
-`Io::map_with()`、`Irq::request_with()`、`DmaCoherent::alloc_with()` 或
-`devm_*_with_provider()`。RAII handle 保存创建它的 provider，drop 时回到同一个
-provider 执行释放。
+`device-res` keeps no global provider state. The driver framework holds the
+provider instance supplied by the host kernel and calls
+`Io::map_with()`, `Irq::request_with()`, `DmaCoherent::alloc_with()`, or
+`devm_*_with_provider()`. RAII handles remember the provider that created
+them and return to that same provider for release on drop.
 
-## 调用约束 / 执行上下文
+## Calling Constraints / Execution Context
 
-- **可在早期启动阶段调用**：模块不依赖调度器或进程线程上下文，
-  provider 生命周期由调用方保证。
-- **不可在中断上下文中获取或释放资源**：provider trait 方法文档声明运行在
-  正常（非中断）上下文。MMIO 读写方法本身可以在任意上下文调用，
-  但资源获取/释放（`map`、`request`、`alloc` 及对应的 drop）不应
-  在中断上下文中执行。`TimeOp::monotonic_time()` 可用于短轮询和超时检查，
-  provider 实现必须声明自身是否可在 IRQ-like 上下文调用。
-- **不可睡眠或阻塞**：`device-res` 本身不获取全局 provider 锁；provider 方法
-  自身仍必须遵守各 host kernel 的 probe/remove 上下文约束。
-- **不要求当前进程线程**：API 只依赖当前执行路径。
-- **可重入性**：`device-res` 不持全局 provider 锁调用 provider；provider 实现仍应
-  避免在资源释放回调中形成自身的锁递归。
+- **Callable in early boot**: the module depends on neither the scheduler
+  nor a process-thread context; provider lifetime is guaranteed by the
+  caller.
+- **No resource acquisition or release from interrupt context**: the
+  provider trait method docs declare that they run in normal (non-IRQ)
+  context. MMIO register reads/writes themselves may run in any context,
+  but acquisition/release (`map`, `request`, `alloc`, and the
+  corresponding drops) must not run in interrupt context.
+  `TimeOp::monotonic_time()` may be used for short polling and timeout
+  checks; each provider implementation must state whether it is callable
+  from IRQ-like contexts.
+- **No sleeping or blocking**: `device-res` itself takes no global
+  provider lock; provider methods must still respect each host kernel's
+  probe/remove context constraints.
+- **No current process thread required**: the API depends only on the
+  current execution path.
+- **Reentrancy**: `device-res` never calls into a provider while holding a
+  global lock; provider implementations should still avoid their own lock
+  recursion inside resource-release callbacks.
 
-## 算法流程
+## Flows
 
-### 资源获取（以 `Io::map_with` 为例）
+### Resource acquisition (`Io::map_with` as the example)
 
-```
+```text
 Io::map_with(provider, region, name)
   │
   ├─ provider.map_mmio(region, name)?
-  │    └─ host kernel 执行实际映射
+  │    └─ host kernel performs the actual mapping
   │
   └─ Ok(Io { provider, mapping: Some(mapping) })
 ```
 
-### RAII 资源释放（以 `Io::drop` 为例）
+### RAII resource release (`Io::drop` as the example)
 
-```
+```text
 Io::drop()
   │
   ├─ mapping.take()
@@ -133,90 +169,108 @@ Io::drop()
        provider.unmap_mmio(mapping)
 ```
 
-RAII handle 保存创建它的 provider。drop 不重新查询外部状态，因此不会把释放
-请求发送给另一个 provider，也不依赖框架在 cleanup 时重新选择 provider。
+An RAII handle keeps the provider that created it. Drop does not re-query
+external state, so a release request can never be routed to a different
+provider, and cleanup does not depend on the framework re-selecting one.
 
-### 设备托管资源（以 `devm_iomap` 为例）
+### Device-managed resources (`devm_iomap` as the example)
 
-```
+```text
 devm_iomap_with_provider(provider, device, region, name)
   │
   ├─ Io::map_with(provider, region, name)?  → io
   ├─ io.as_ptr()                           → ptr
   ├─ device.register_cleanup(move || drop(io))
-  │    └─ 回调在设备移除时 LIFO 执行
+  │    └─ callback runs LIFO when the device is removed
   │
   └─ Ok(ptr)
 ```
 
-## 并发模型
+## Concurrency Model
 
-- **显式 provider**：驱动框架持有 provider，资源 handle 只保存 `&'static dyn ...`
-  引用，不引入额外共享可变状态。
-- **RAII handle**：`Io`、`Irq`、`DmaCoherent` 均非 `Sync`（内部持有
-  `NonNull`），不可跨线程共享。它们可在线程间移动（`Send`），
-  但同一时刻只有一个线程持有 handle。
-- **MMIO 读写**：`Io` 的 `read*`/`write*` 方法使用 acquire/release
-  fence 保证寄存器访问的有序性。多字节访问有 `debug_assert` 检查对齐。
+- **Explicit provider**: the driver framework holds the provider; resource
+  handles store only `&'static dyn ...` references and add no shared
+  mutable state.
+- **RAII handles**: `Io`, `Irq`, and `DmaCoherent` are not `Sync` (they
+  hold `NonNull` internally) and cannot be shared across threads. They may
+  move between threads (`Send`), but only one thread holds a handle at a
+  time.
+- **MMIO access**: the `read*`/`write*` methods of `Io` use acquire/release
+  fences to order register accesses. Multi-byte accesses carry
+  `debug_assert` alignment checks.
 
-## 设计决策
+## Design Decisions
 
-### 为什么 provider API 用 trait 对象
+### Why the provider API uses trait objects
 
-RAII handle 内部保存 `&'static dyn MmioOp` / `IrqOp` / `DmaOp`，原因：
+RAII handles store `&'static dyn MmioOp` / `IrqOp` / `DmaOp` internally:
 
-- 驱动框架可以持有具体 provider 类型并通过 trait bound 管理能力；
-- handle 需要在 devres cleanup 闭包中保存 provider 引用，trait object 能避免把
-  provider 泛型扩散到普通驱动和 cleanup 容器；
-- provider 选择在框架边界显式完成，驱动代码仍只看到设备资源方法。
+- the driver framework can hold a concrete provider type and manage
+  capabilities through trait bounds;
+- handles must store a provider reference inside devres cleanup closures;
+  trait objects keep provider generics from leaking into ordinary driver
+  code and cleanup containers;
+- provider selection happens explicitly at the framework boundary; driver
+  code still sees only device-resource methods.
 
-### 为什么 `devm_*` 返回裸指针而非 RAII handle
+### Why devm_* returns raw pointers instead of RAII handles
 
-`devm_iomap` 返回 `NonNull<u8>` 而非 `Io`，因为 `Io` 的 drop 行为
-与设备托管清理冲突：如果返回 `Io`，驱动 drop `Io` 时会释放映射，
-同时设备清理回调也会尝试释放同一映射。
+`devm_iomap` returns `NonNull<u8>` rather than an `Io`, because `Io`'s
+drop behavior conflicts with device-managed cleanup: if `Io` were
+returned, the driver dropping the `Io` would release the mapping while the
+device cleanup callback would also try to release the same mapping.
 
-解决方案：`devm_iomap` 在内部创建 `Io`，提取指针，然后通过
-`register_cleanup` 注册 drop 闭包。`Io` 的生命周期由回调管理，
-驱动只持有裸指针。
+Resolution: `devm_iomap` creates the `Io` internally, extracts the
+pointer, then registers the drop closure via `register_cleanup`. The
+`Io`'s lifetime is managed by the callback; the driver keeps only the raw
+pointer.
 
-### 为什么 `Io::read*`/`write*` 使用 fence 而非 `volatile` 的 `Ordering` 参数
+### Why Io::read*/write* use fences instead of volatile Ordering parameters
 
-`core::ptr::read_volatile` / `write_volatile` 保证编译器不会消除或重排
-volatile 访问，但不提供 CPU 侧的内存序保证。额外的 `fence(Acquire)` /
-`fence(Release)` 确保在弱序架构（AArch64）上，寄存器读写不会被 CPU
-重排到 fence 另一侧。在强序架构（x86）上 fence 编译为空操作。
+`core::ptr::read_volatile` / `write_volatile` guarantee the compiler will
+not elide or reorder volatile accesses, but they give no CPU-side memory
+ordering. The extra `fence(Acquire)` / `fence(Release)` ensure that on
+weakly ordered architectures (AArch64) register reads and writes are not
+reordered by the CPU across the fence. On strongly ordered architectures
+(x86) the fences compile to no-ops.
 
-### 为什么 drop 保存创建时的 provider
+### Why drop keeps the creating provider
 
-资源释放必须回到分配该资源的同一个 provider。否则未来出现 per-framework、
-per-bus 或测试 mock provider 时，drop 阶段重新选择 provider 可能释放到错误后端。
-保存创建时 provider 可以把 acquire/release 配对关系编码进 RAII handle。
+Resource release must return to the same provider that allocated the
+resource. Otherwise, once per-framework, per-bus, or test-mock providers
+exist, re-selecting a provider at drop time could release into the wrong
+backend. Keeping the creating provider encodes the acquire/release pairing
+in the RAII handle itself.
 
-## Drop / 资源释放
+## Drop / Resource Release
 
-| 类型 | Drop 行为 |
+| Type | Drop behavior |
 |------|----------|
-| `Io` | 如果 mapping 和 provider 均为 `Some`，调用 `provider.unmap_mmio(mapping)` |
-| `Irq` | 如果 `armed` 且 provider 为 `Some`，调用 `provider.release_irq(resource, token)` |
-| `DmaCoherent` | 如果 allocation 和 provider 均为 `Some`，调用 `provider.free_coherent(allocation)` |
+| `Io` | If both mapping and provider are `Some`, calls `provider.unmap_mmio(mapping)` |
+| `Irq` | If `armed` and provider is `Some`, calls `provider.release_irq(resource, token)` |
+| `DmaCoherent` | If both allocation and provider are `Some`, calls `provider.free_coherent(allocation)` |
 
-`Irq` 使用 `armed` 标志防止 `request_irq` 失败后 drop 时误调用 `release_irq`，
-并保存 provider 返回的 token，使共享 IRQ 释放时只移除当前注册的 handler。
+`Irq` uses an `armed` flag so a failed `request_irq` does not trigger a
+spurious `release_irq` on drop, and it stores the provider-returned token
+so releasing a shared IRQ removes only the handler registered by this
+handle.
 
-### MSI-X 资源
+### MSI-X Resources
 
-`IrqOp::alloc_msix()` 返回 `MsiResource`：
+`IrqOp::alloc_msix()` returns an `MsiResource`:
 
-- `MsiResource::irq` 是 OS-visible IRQ，驱动或上层框架用它注册 handler；
-- `MsiResource::message` 是 device-visible MSI message，PCI/MSI-X 代码用它写设备
-  table 或 MSI register。
+- `MsiResource::irq` is the OS-visible IRQ, used by the driver or upper
+  framework to register the handler;
+- `MsiResource::message` is the device-visible MSI message, used by the
+  PCI/MSI-X code to program the device table or MSI register.
 
-`MsiResource` 是显式所有权资源，不实现 `Copy`。调用方可以在同一所有权链路中移动
-它，并必须在 IRQ handler 注销之后调用 `free_msix()` 释放；不能通过隐式复制制造多个
-同一 MSI allocation 的释放者。
+`MsiResource` is an explicitly owned resource and does not implement
+`Copy`. Callers may move it along one ownership chain and must call
+`free_msix()` to release it after the IRQ handler is unregistered; implicit
+copies cannot create multiple releasers of one MSI allocation.
 
-`device-res` 不暴露 APIC id、CPU vector 或 irqchip-private allocation cookie。
-这些属于 host IRQ core 和具体 backend 的内部状态。x-kernel 中该 provider 由
-`device-res-xkernel` 实现，内部转到 `kirq::alloc_msix()`；`device-res` 本身仍保持
-OS-neutral，不依赖 `kirq`。
+`device-res` exposes no APIC ids, CPU vectors, or irqchip-private
+allocation cookies. Those are internal state of the host IRQ core and its
+backends. In x-kernel this provider is implemented by
+`device-res-xkernel`, which forwards to `kirq::alloc_msix()`; `device-res`
+itself stays OS-neutral and does not depend on `kirq`.
