@@ -13,7 +13,7 @@
 //!   guest's "how many priority bits?" probe reads 0 and hangs;
 //! - enable state (ISENABLER/ICENABLER) is tracked as a bitmap;
 //! - guest-set-pending (ISPENDR) and SGI (SGIR) writes are turned into
-//!   injections via the [`IrqSender`] (the vGIC).
+//!   injections via the [`crate::vdev::IrqSender`] (the vGIC).
 //!
 //! The real host distributor is never touched.
 

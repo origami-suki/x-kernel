@@ -8,7 +8,8 @@
 //! defined in the crate that owns the call contract and provided by exactly one
 //! other crate linked into the final image:
 //!
-//! ```ignore
+//! ```no_run
+//! # fn rust_main(boot_info: usize) -> ! { loop {} }
 //! #[kiface::interface]
 //! pub trait KernelEntry {
 //!     fn primary(boot_info: usize) -> !;
@@ -37,6 +38,14 @@ mod validator;
 /// The input is written as a trait-shaped contract. The macro generates a facade
 /// type with inherent methods. Callers invoke the interface directly through
 /// `InterfaceName::method(...)`.
+///
+/// # Arguments
+///
+/// - `namespace = "name"` (optional): disambiguates the exported symbols so
+///   two interfaces with the same method names can coexist; the provider
+///   must repeat the identical namespace.
+/// - `optional` (reserved): rejected with a compile error; the optional
+///   provider mode is not implemented yet.
 #[proc_macro_attribute]
 pub fn interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as args::InterfaceArgs);
@@ -53,6 +62,14 @@ pub fn interface(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `impl InterfaceName for Provider { ... }`. The macro exports one link
 /// symbol per method and removes the impl from the expanded code, so the
 /// provider may live in a different crate from the interface facade type.
+/// Each method is type-checked against the interface facade at provider
+/// compile time; a missing or mismatched interface is a compile error,
+/// and a missing provider surfaces at final link time.
+///
+/// # Arguments
+///
+/// - `namespace = "name"` (optional): must match the namespace used on
+///   the corresponding `#[kiface::interface]` definition.
 #[proc_macro_attribute]
 pub fn provide(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as args::ProvideArgs);

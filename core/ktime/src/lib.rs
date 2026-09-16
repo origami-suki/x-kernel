@@ -7,8 +7,8 @@
 //! `ktime` is the system timekeeping owner: it derives realtime from the
 //! monotonic hardware clock exposed by [`khal::time`] plus a clock
 //! correlation, and owns initialization, runtime updates, and reads. `khal`
-//! stays a pure hardware time source; [`drivers::rtc`] only provides
-//! persistent-clock samples that boot code passes to
+//! stays a pure hardware time source; the `drivers/platform/rtc` crate only
+//! provides persistent-clock samples that boot code passes to
 //! [`initialize_realtime`].
 //!
 //! Semantics:
@@ -118,9 +118,13 @@ pub struct RealtimeOutOfRange;
 ///   UNIX_EPOCH + monotonic`) cannot be violated by a gap between validation
 ///   and commit.
 ///
-/// Returns [`Err(RealtimeOutOfRange)`] if `sample` would move the wall clock
-/// before `CLOCK_MONOTONIC` or beyond the upper bound. Syscall layers keep only
-/// the privilege check and map this error to `EINVAL`.
+/// Syscall layers keep only the privilege check and map the error to `EINVAL`.
+///
+/// # Errors
+///
+/// Returns [`RealtimeOutOfRange`] when `sample` would move the wall clock
+/// before `CLOCK_MONOTONIC` or beyond [`MAX_SETTABLE_UNIX_SECONDS`]
+/// (Linux `KTIME_SEC_MAX`).
 pub fn set_realtime_checked(sample: SystemTime) -> Result<(), RealtimeOutOfRange> {
     let mut correlation = REALTIME_CORRELATION.write();
     // Sample monotonic under the write lock so validation and the recorded

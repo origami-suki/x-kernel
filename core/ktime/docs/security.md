@@ -3,14 +3,18 @@
 ## 信任模型
 
 `ktime` 信任 `khal` 提供单调、稳定的硬件时钟读数，信任调用者在 syscall 边界
-完成特权与语义校验（settimeofday 的 CLOCK_MONOTONIC 约束由调用者负责）。
-RTC 驱动只提供 sample，不直接修改 timekeeper 状态。
+完成特权校验。`set_realtime_checked` 内置墙钟范围校验（见外部边界），
+syscall 层不再负责 CLOCK_MONOTONIC 约束。RTC 驱动只提供 sample，不直接修改
+timekeeper 状态。
 
 ## 外部边界 / 攻击面
 
 该 crate 不访问用户内存、设备、网络或文件系统。外部输入通过
-`initialize_realtime`/`set_realtime` 传入的 `SystemTime` sample 进入；
-`SystemTime` 构造本身规范化并校验分量范围。
+`initialize_realtime`/`set_realtime_checked` 传入的 `SystemTime` sample 进入；
+`SystemTime` 构造本身规范化并校验分量范围。`set_realtime_checked` 对
+sample 执行内置范围校验：墙钟不得早于 `CLOCK_MONOTONIC` 当前值，也不得
+超过上界 `MAX_SETTABLE_UNIX_SECONDS`（Linux `KTIME_SEC_MAX`）；校验失败
+返回 `RealtimeOutOfRange` 错误，不应用任何部分修改。
 
 ## 内存安全不变量
 
@@ -26,7 +30,7 @@ RTC 驱动只提供 sample，不直接修改 timekeeper 状态。
 
 | 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
 |------|----------|----------|----------|----------|
-| T-01 | 非特权进程修改墙钟 | 高 | 直接调用 `set_realtime` | syscall 层检查 privileged credential，并拒绝把墙钟移到 CLOCK_MONOTONIC 之前 |
+| T-01 | 非特权进程修改墙钟 | 高 | 直接调用 `set_realtime_checked` | syscall 层检查 privileged credential；`set_realtime_checked` 内置范围校验（墙钟不得早于 `CLOCK_MONOTONIC` 或超过 `MAX_SETTABLE_UNIX_SECONDS`），失败返回 `RealtimeOutOfRange`，syscall 层将其映射为 `EINVAL` |
 | T-02 | 初始化输入超范围 | 中 | 越界 SystemTime sample | `SystemTime` 构造规范化分量；读取路径 checked/saturating 兜底 |
 | T-03 | IRQ 上下文死锁 | 高 | 中断读取 realtime 时写者持锁 | 读写均使用 `SpinRwNoIrq`（关中断），写临界区极短 |
 | T-04 | 墙钟回拨导致负 duration | 中 | realtime 被设置到过去 | `duration_since` 返回错误而非下溢，deadline 换算按已过期处理 |

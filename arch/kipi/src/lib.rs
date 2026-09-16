@@ -9,7 +9,7 @@
 //! dispatches generic callbacks from the shared IPI handler, hosts the TLB
 //! shootdown protocol used by page-table updates, and the system-wide CPU
 //! stop protocol used before entering a platform power terminal
-//! ([`stop_other_cpus`]).
+//! (`stop_other_cpus`).
 //!
 //! ## Safety
 //!

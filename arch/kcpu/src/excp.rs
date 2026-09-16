@@ -21,7 +21,7 @@ pub static IRQ: [fn(usize) -> bool];
 /// These fire when the taken IRQ exception is an NMI: either a hardware NMI
 /// (GICv3.3 NMI attribute + FEAT_NMI) or a pseudo‑NMI (IRQ taken while
 /// normal IRQs are masked by PMR).  Handlers must use the lock‑free
-/// [`NMI_TABLE`] dispatch path.
+/// [`NMI`] dispatch path.
 #[def_trap_handler]
 pub static NMI: [fn(usize) -> bool];
 

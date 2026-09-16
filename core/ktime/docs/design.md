@@ -28,7 +28,9 @@ khal -> ktime_types
 
 - `initialize_realtime`：用 persistent-clock sample 建立 realtime 关联，
   幂等，第一个 sample 生效。
-- `set_realtime`：运行时把墙钟重新关联到当前单调时刻（settimeofday 路径）。
+- `set_realtime_checked`：运行时把墙钟重新关联到当前单调时刻
+  （settimeofday 路径）。范围校验失败返回 `RealtimeOutOfRange` 错误
+  （墙钟早于 `CLOCK_MONOTONIC` 或超过上界），由调用方映射为 `EINVAL`。
 - `realtime`：当前墙钟时间；未初始化时回退为 Unix epoch 加单调流逝时间。
 - `realtime_deadline_to_monotonic`：把 realtime 截止时间换算到单调时钟域。
 
@@ -37,8 +39,9 @@ khal -> ktime_types
 - realtime = realtime_base + (monotonic_now - monotonic_base)，速率 1:1。
 - 关联状态由 `SpinRwNoIrq` 保护：读路径（syscall/fs 时间戳）与写路径
   （启动初始化、settimeofday）互斥，且可在 IRQ 上下文安全读取。
-- `set_realtime` 不内置授权检查；调用者（syscall 层）负责 Linux 规则
-  （墙钟不得移到 CLOCK_MONOTONIC 之前）与特权校验。
+- `set_realtime_checked` 不内置授权检查；调用者（syscall 层）负责
+  Linux 特权校验。墙钟相对 `CLOCK_MONOTONIC` 的下界与上界由函数内置
+  的范围校验保证，失败以 `RealtimeOutOfRange` 错误返回。
 - 未初始化时回退 `SystemTime::UNIX_EPOCH + elapsed`，保证早期启动可用。
 
 ## 调用约束 / 执行上下文

@@ -202,7 +202,7 @@ impl<A: VmmArch> VmShared<A> {
 
     /// Ask every vCPU thread to leave its run loop.
     ///
-    /// Sets the stop flag observed at the top of [`vmm_run_vcpu`] and wakes any
+    /// Sets the stop flag observed at the top of [`crate::vcpu::vmm_run_vcpu`] and wakes any
     /// vCPU parked in the WFI path so it re-checks the flag promptly. This only
     /// requests the stop; use [`Vm::stop_and_join`] to also wait for the vCPU
     /// threads to exit.

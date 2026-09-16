@@ -9,6 +9,7 @@
 use define_simple_interfaces::{AdvancedIf, CallerIf, NamespacedIf, SimpleIf};
 use kiface::provide;
 
+/// References every provider symbol so test binaries link them in.
 pub fn force_link() {}
 
 #[provide]
