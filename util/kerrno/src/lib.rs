@@ -2,6 +2,20 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
+//! Kernel error kinds and Linux errno conversion without heap allocation.
+//!
+//! [`KError`] stores positive kernel-kind codes and negative Linux errno codes.
+//! [`KError::code`] is this internal tagged representation, not a syscall return
+//! value: syscall adapters convert through [`LinuxError`] and negate its code.
+//! [`KResult`] is the common result alias; [`k_err!`] and [`k_err_type!`] also
+//! emit warning logs. [`KError::canonicalize`] normalizes mapped Linux errors,
+//! but conversion is lossy where several kernel kinds share one Linux code.
+//!
+//! Use [`KError::try_from_i32`] for untrusted serialized codes. The re-exported
+//! [`LinuxError::new`] is unchecked; passing zero or a negative errno to
+//! `KError::from` can violate the representation expected by formatting and
+//! conversion routines. Neither type performs authorization or user-memory I/O.
+
 // Kernel error types and errno conversions.
 //
 // # Code Similarity Compliance Notice
@@ -210,7 +224,9 @@ impl KErrorKind {
         }
     }
 
-    /// Returns the error code value in `i32`.
+    /// Returns the internal code: positive kernel kind or negative Linux errno.
+    ///
+    /// Convert through `LinuxError` before producing a Linux syscall result.
     pub const fn code(self) -> i32 {
         self as i32
     }
@@ -389,7 +405,19 @@ impl TryFrom<LinuxError> for KErrorKind {
     }
 }
 
-/// The error type used by x-kernel.
+/// A signed carrier distinguishing kernel kinds from Linux errno values.
+///
+/// Positive values represent [`KErrorKind`]; negative values represent Linux
+/// errno. Construct from a kernel kind, a positive Linux errno, or the checked
+/// [`Self::try_from_i32`] decoder. Unknown positive Linux errno values can be
+/// retained by `From<LinuxError>`, even though the checked decoder rejects them.
+///
+/// # Panics
+///
+/// `From<LinuxError>` may overflow when given `i32::MIN` in checked builds.
+/// Zero or negative values created with `LinuxError::new` may create an invalid
+/// carrier; formatting, canonicalization, and conversions can then panic or
+/// reinterpret it as a kernel kind. Use positive errno values at that boundary.
 #[repr(transparent)]
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct KError(i32);
@@ -418,7 +446,9 @@ impl KError {
         }
     }
 
-    /// Returns the error code value in `i32`.
+    /// Returns the internal code: positive kernel kind or negative Linux errno.
+    ///
+    /// Convert through `LinuxError` before producing a Linux syscall result.
     pub const fn code(self) -> i32 {
         self.0
     }
@@ -426,7 +456,14 @@ impl KError {
     /// Returns a canonicalized version of this error.
     ///
     /// This method tries to convert [`LinuxError`] variants into their
-    /// corresponding [`KErrorKind`] variants if possible.
+    /// corresponding [`KErrorKind`] variants if possible. Unmapped Linux errors
+    /// remain unchanged. This does not recover distinctions lost when several
+    /// kernel kinds were converted to the same Linux errno.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an unchecked `LinuxError` conversion created an invalid
+    /// non-negative carrier; see the [`KError`] construction contract.
     ///
     /// # Examples
     ///
@@ -474,6 +511,14 @@ impl TryFrom<KError> for KErrorKind {
 }
 
 impl KError {
+    /// Decodes an internal signed error representation without panicking.
+    ///
+    /// Positive values must identify a `KErrorKind`; negative values must be the
+    /// negation of a named `LinuxError`. Zero is not an error representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original `value` for unknown codes, zero, or `i32::MIN`.
     pub fn try_from_i32(value: i32) -> Result<Self, i32> {
         if KErrorKind::try_from(value).is_ok() {
             return Ok(KError(value));

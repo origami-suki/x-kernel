@@ -2,24 +2,32 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Provide helper functions/trait impls to pack/unpack
-//! [`SyscallArgs`].
-//!
-//! `io:Error` is not implemented for better `no_std` support.
+//! Raw register argument packing for [`SyscallArgs`].
 
-/// The 6 arguments of a syscall, raw untyped version.
+/// Six raw syscall argument registers in ABI order.
+///
+/// Array conversions with fewer than six elements zero the unused registers.
+/// Pointer-like values are not validated or dereferenced; syscall adapters must
+/// interpret each value using the selected syscall's ABI.
 #[derive(PartialEq, Debug, Eq, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SyscallArgs {
+    /// Raw argument register 0; interpretation depends on the syscall.
     pub arg0: usize,
+    /// Raw argument register 1; interpretation depends on the syscall.
     pub arg1: usize,
+    /// Raw argument register 2; interpretation depends on the syscall.
     pub arg2: usize,
+    /// Raw argument register 3; interpretation depends on the syscall.
     pub arg3: usize,
+    /// Raw argument register 4; interpretation depends on the syscall.
     pub arg4: usize,
+    /// Raw argument register 5; interpretation depends on the syscall.
     pub arg5: usize,
 }
 
 impl SyscallArgs {
+    /// Packs `a0` through `a5` in register order without validation.
     pub fn new(a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Self {
         SyscallArgs {
             arg0: a0,
@@ -123,6 +131,20 @@ impl From<&[usize; 0]> for SyscallArgs {
     }
 }
 
+/// Packs zero through six `usize` expressions into [`SyscallArgs`].
+///
+/// Arguments stay in ABI register order and omitted registers are zeroed.
+/// Expressions are evaluated once; this macro does not execute a syscall.
+///
+/// # Examples
+///
+/// ```
+/// use linux_sysno::syscall_args;
+/// let args = syscall_args!(7, 16);
+/// assert_eq!(args.arg0, 7);
+/// assert_eq!(args.arg1, 16);
+/// assert_eq!(args.arg5, 0);
+/// ```
 #[macro_export]
 macro_rules! syscall_args {
     ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr) => {

@@ -31,7 +31,16 @@ macro_rules! syscall_enum {
 
         LAST: $last_syscall:ident;
     ) => {
-        /// Complete list of Linux syscalls.
+        /// Syscall identifiers recorded for this architecture and enabled extensions.
+        ///
+        /// `new` rejects numbers absent from this table; membership does not imply
+        /// kernel implementation. Name parsing is exact and case-sensitive and
+        /// returns `Err(())` for unknown names.
+        ///
+        /// # Panics
+        ///
+        /// `From<i32>` and `From<u32>` panic for numbers not in the table.
+        /// Use `new` when decoding untrusted registers.
         $(#[$outer])*
         #[allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
         #[derive(Eq, PartialEq, Clone, Copy, Hash, Ord, PartialOrd)]
@@ -48,6 +57,7 @@ macro_rules! syscall_enum {
             $($(
                 $(
                     #[$extension]
+                    #[doc = concat!("Kernel extension `", stringify!($extension_syscall), "` with ABI number ", stringify!($extension_num), ". Its argument and status contracts belong to the enabled extension dispatcher.")]
                     $(#[$extension_inner])*
                     $extension_syscall = $extension_num,
                 )*

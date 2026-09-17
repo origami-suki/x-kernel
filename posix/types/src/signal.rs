@@ -17,9 +17,17 @@ use crate::{UserRead, UserWrite};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, UserRead, UserWrite)]
 #[repr(transparent)]
 #[allow(non_camel_case_types)]
-pub struct k_sigset(pub u64);
+pub struct k_sigset(
+    /// Raw signal bits; bit zero represents signal 1.
+    pub u64,
+);
 
-/// Validates that an ABI `sigset_t` size matches the kernel expectation.
+/// Accepts zero or the eight-byte kernel `sigset_t` size.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` for any other size. A zero size is intentionally
+/// accepted here; syscall-specific requirements belong to the adapter.
 pub fn check_sigset_size(size: usize) -> KResult<()> {
     if size != size_of::<k_sigset>() && size != 0 {
         return Err(KError::InvalidInput);
@@ -46,9 +54,13 @@ impl From<kernel_sigset_t> for k_sigset {
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct k_sigaction {
+    /// Raw user signal-handler address or Linux special disposition value.
     pub handler: __kernel_sighandler_t,
+    /// Raw ABI flags, validated by the consuming signal adapter.
     pub flags: c_ulong,
+    /// User-space signal-return trampoline address.
     pub restorer: __sigrestore_t,
+    /// Signals blocked while the handler runs.
     pub mask: k_sigset,
 }
 
@@ -56,7 +68,10 @@ pub struct k_sigaction {
 #[derive(Clone, UserRead, UserWrite)]
 #[repr(transparent)]
 #[allow(non_camel_case_types)]
-pub struct k_siginfo(pub siginfo_t);
+pub struct k_siginfo(
+    /// Raw Linux signal-information record, including its tagged union payload.
+    pub siginfo_t,
+);
 
 /// A raw `sigval_t` carrier used at the syscall boundary.
 #[allow(non_camel_case_types)]
@@ -81,8 +96,12 @@ unsafe impl UserWrite for k_sigevent {}
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct k_sigaltstack {
+    /// User virtual address of the alternate stack base.
     pub sp: usize,
+    /// Raw ABI flags, validated by the consuming signal adapter.
     pub flags: u32,
+    /// Explicit padding; initialize before copying to user space.
     pub abi_pad: u32,
+    /// Alternate stack size in bytes.
     pub size: usize,
 }

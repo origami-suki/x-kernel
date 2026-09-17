@@ -13,6 +13,15 @@ macro_rules! errno_enum {
             )*
         }
     ) => {
+        /// A raw Linux errno carrier with named constants and return-register decoding.
+        ///
+        /// Named constants are positive; [`Self::new`] can also represent arbitrary
+        /// integers. [`Self::name`] distinguishes named codes from unknown values.
+        ///
+        /// # Panics
+        ///
+        /// Formatting `Errno::new(i32::MIN)` with `Display` can overflow in checked
+        /// builds because display negates values accepted by `is_valid`.
         $(#[$meta])*
         #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
         #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]

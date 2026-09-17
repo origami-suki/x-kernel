@@ -18,29 +18,50 @@ pub struct FdSet {
 }
 
 impl FdSet {
+    /// Maximum number of descriptor bits represented by this ABI type.
     pub const FD_SETSIZE: usize = __FD_SETSIZE as usize;
 
+    /// Constructs a set with every descriptor bit cleared.
     pub fn zeroed() -> Self {
         Self {
             fds_bits: [0; Self::FD_SETSIZE / usize::BITS as usize],
         }
     }
 
+    /// Sets the bit for `fd`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `fd >= Self::FD_SETSIZE`.
     pub fn set(&mut self, fd: usize) {
         debug_assert!(fd < Self::FD_SETSIZE);
         self.fds_bits[fd / usize::BITS as usize] |= 1 << (fd % usize::BITS as usize);
     }
 
+    /// Tests the bit for `fd`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `fd >= Self::FD_SETSIZE`.
     pub fn is_set(&self, fd: usize) -> bool {
         debug_assert!(fd < Self::FD_SETSIZE);
         (self.fds_bits[fd / usize::BITS as usize] & (1 << (fd % usize::BITS as usize))) != 0
     }
 
+    /// Clears every descriptor bit.
     pub fn clear(&mut self) {
         self.fds_bits.fill(0);
     }
 
-    /// Reads an [`FdSet`] from user space and masks bits above `nfds`.
+    /// Reads an [`FdSet`] and clears descriptor bits at or above `nfds`.
+    ///
+    /// A null pointer returns `Ok(None)`. The whole fixed-size carrier is copied;
+    /// `nfds >= FD_SETSIZE` leaves it unchanged rather than rejecting the count.
+    /// Requires the current user address-space copy service.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` read error for inaccessible non-null user memory.
     pub fn read_from_user(ptr: UserPtr<Self>, nfds: usize) -> osvm::MemResult<Option<Self>> {
         if ptr.is_null() {
             return Ok(None);
@@ -63,7 +84,13 @@ impl FdSet {
         Ok(Some(fdset))
     }
 
-    /// Writes this [`FdSet`] back to user space unless `ptr` is null.
+    /// Writes the full carrier through the current user address-space copy service.
+    ///
+    /// A null pointer is a successful no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` write error; a failed copy need not be atomic.
     pub fn write_to_user(&self, ptr: UserPtr<Self>) -> osvm::MemResult {
         if ptr.is_null() {
             return Ok(());
@@ -90,10 +117,12 @@ pub struct SignalSetWithSize {
 }
 
 impl SignalSetWithSize {
+    /// Returns the raw signal-mask pointer without dereferencing it.
     pub fn set(self) -> UserConstPtr<k_sigset> {
         self.set
     }
 
+    /// Returns the user-supplied signal-mask size in bytes without validation.
     pub fn sigsetsize(self) -> usize {
         self.sigsetsize
     }

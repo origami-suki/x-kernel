@@ -10,9 +10,13 @@ use crate::ptr::UserWrite;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputId {
+    /// Linux input bus type identifier.
     pub bus_type: u16,
+    /// Vendor identifier reported by the input device.
     pub vendor: u16,
+    /// Product identifier reported by the input device.
     pub product: u16,
+    /// Device version identifier.
     pub version: u16,
 }
 

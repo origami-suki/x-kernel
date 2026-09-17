@@ -2,29 +2,21 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-/// Performs a syscall and returns a `Result<usize, Errno>`.
+/// Legacy result-returning syscall invocation macro retained from the upstream API.
 ///
-/// Accepts a syscall number and a variable number of arguments (0 to 6).
+/// Accepts a number and zero through six arguments, casting arguments to `usize`.
+/// **Unavailable in this kernel fork:** expansion refers to `syscall0` through
+/// `syscall6`, which this crate does not provide. Importing the macro is possible,
+/// but invoking it fails to compile. This crate supplies number tables and ABI
+/// helpers; it does not provide a userspace trap-instruction backend.
 ///
-/// # Returns
-///  - `Ok` on success, or
-///  - `Err(errno)` if the syscall failed.
+/// # Examples
 ///
-/// # Example
-/// ```
-/// use syscalls::{Sysno, syscall};
+/// The missing backend is an explicit compatibility limitation:
 ///
-/// match unsafe { syscall!(Sysno::clone) } {
-///     Ok(0) => {
-///         // Child process
-///     }
-///     Ok(pid) => {
-///         // Parent process
-///     }
-///     Err(err) => {
-///         eprintln!("clone() failed: {}", err);
-///     }
-/// }
+/// ```compile_fail,E0425
+/// use linux_sysno::{syscall, Sysno};
+/// let _ = unsafe { syscall!(Sysno::getpid) };
 /// ```
 #[macro_export]
 macro_rules! syscall {
@@ -72,19 +64,18 @@ macro_rules! syscall {
     };
 }
 
-/// Performs a raw syscall and returns a `usize`. Use [`syscall`] if you wish to
-/// get a `Result` as a return value.
+/// Legacy raw-register syscall invocation macro retained from the upstream API.
 ///
-/// Accepts a syscall number and a variable number of arguments (0 to 6).
+/// Accepts a number and zero through six arguments and casts them to `usize`.
+/// **Unavailable in this kernel fork:** expansion requires the absent `raw`
+/// module's `syscall0` through `syscall6` functions. See [`syscall!`] for the
+/// compatibility boundary; neither macro is a kernel dispatch interface.
 ///
-/// # Example
-/// ```
-/// use syscalls::{Sysno, raw_syscall};
+/// # Examples
 ///
-/// // gettid is guaranteed to never fail, so we don't need a `Result` return
-/// // value.
-/// let tid = unsafe { raw_syscall!(Sysno::gettid) };
-/// println!("My thread ID is {}", tid);
+/// ```compile_fail,E0433
+/// use linux_sysno::{raw_syscall, Sysno};
+/// let _ = unsafe { raw_syscall!(Sysno::getpid) };
 /// ```
 #[macro_export]
 macro_rules! raw_syscall {

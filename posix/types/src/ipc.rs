@@ -45,14 +45,23 @@ pub struct IpcPerm {
 #[repr(C)]
 #[derive(Clone, Copy, UserWrite, UserRead)]
 pub struct msqid_ds {
+    /// Queue ownership and access-mode carrier.
     pub msg_perm: IpcPerm,
+    /// Last successful send time in Unix seconds.
     pub msg_stime: __kernel_time_t,
+    /// Last successful receive time in Unix seconds.
     pub msg_rtime: __kernel_time_t,
+    /// Last metadata change time in Unix seconds.
     pub msg_ctime: __kernel_time_t,
+    /// Current queued payload bytes.
     pub msg_cbytes: __kernel_size_t,
+    /// Number of queued messages.
     pub msg_qnum: __kernel_size_t,
+    /// Maximum permitted queued payload bytes.
     pub msg_qbytes: __kernel_size_t,
+    /// PID of the last sender.
     pub msg_lspid: __kernel_pid_t,
+    /// PID of the last receiver.
     pub msg_lrpid: __kernel_pid_t,
 }
 
@@ -61,14 +70,23 @@ pub struct msqid_ds {
 #[repr(C)]
 #[derive(Clone, Copy, UserWrite, UserRead)]
 pub struct shmid_ds {
+    /// Shared-memory ownership and access-mode carrier.
     pub shm_perm: IpcPerm,
+    /// Segment size in bytes.
     pub shm_segsz: __kernel_size_t,
+    /// Last attach time in Unix seconds.
     pub shm_atime: __kernel_time_t,
+    /// Last detach time in Unix seconds.
     pub shm_dtime: __kernel_time_t,
+    /// Last metadata change time in Unix seconds.
     pub shm_ctime: __kernel_time_t,
+    /// PID of the segment creator.
     pub shm_cpid: __kernel_pid_t,
+    /// PID of the last attach/detach operation.
     pub shm_lpid: __kernel_pid_t,
+    /// Attachment count in this ABI carrier.
     pub shm_nattch: c_ushort,
+    /// Explicit trailing padding; initialize before copying to user space.
     pub abi_pad: [u8; 6],
 }
 
@@ -77,7 +95,9 @@ pub struct shmid_ds {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct msgbuf {
+    /// Positive message type supplied before the payload.
     pub mtype: i64,
+    /// Zero-length marker for the variable-length payload following the header.
     pub mtext: [u8; 0],
 }
 
@@ -86,14 +106,23 @@ pub struct msgbuf {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct msginfo {
+    /// Legacy message-pool size field, in KiB.
     pub msgpool: i32,
+    /// Legacy maximum message-map entries field.
     pub msgmap: i32,
+    /// Maximum size of one message payload in bytes.
     pub msgmax: i32,
+    /// Default maximum queued payload bytes per queue.
     pub msgmnb: i32,
+    /// Maximum queue identifiers.
     pub msgmni: i32,
+    /// Legacy message-segment size in bytes.
     pub msgssz: i32,
+    /// Legacy maximum message headers field.
     pub msgtql: i32,
+    /// Legacy maximum message segments field.
     pub msgseg: u16,
+    /// Explicit ABI padding; initialize before copying to user space.
     pub pad: u16,
 }
 

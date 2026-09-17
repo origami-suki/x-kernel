@@ -25,7 +25,15 @@ pub struct IoVectorBuf {
 }
 
 impl IoVectorBuf {
-    /// Creates an I/O vector buffer from kernel-owned iovec descriptors.
+    /// Takes ownership of copied descriptors and checks their aggregate length.
+    ///
+    /// Segment addresses remain unvalidated until user-memory I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for more than 1024 descriptors, a negative segment
+    /// length, or overflow of the total byte count. The moved vector is dropped
+    /// on failure.
     pub fn from_iovecs(iovs: Vec<IoVec>) -> KResult<Self> {
         if iovs.len() > 1024 {
             return Err(KError::InvalidInput);
@@ -48,6 +56,14 @@ impl IoVectorBuf {
     ///
     /// The pointers passed to `read_fn` point into user memory.
     /// The closure must use `read_vm_mem` or equivalent to access them safely.
+    /// It must return at most the supplied segment length. A positive short
+    /// result advances to the next segment, not the remainder of this segment;
+    /// zero stops iteration. The sum is returned on success.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first callback error even if previous segments transferred
+    /// data; previous side effects are not rolled back.
     pub fn read_with(
         self,
         mut read_fn: impl FnMut(*const u8, usize) -> KResult<usize>,
@@ -70,6 +86,14 @@ impl IoVectorBuf {
     ///
     /// The pointers passed to `write_fn` point into user memory.
     /// The closure must use `write_vm_mem` or equivalent to access them safely.
+    /// It must return at most the supplied segment length. A positive short
+    /// result advances to the next segment, not the remainder of this segment;
+    /// zero stops iteration. The sum is returned on success.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first callback error even if previous segments transferred
+    /// data; previous side effects are not rolled back.
     pub fn fill_with(
         self,
         mut write_fn: impl FnMut(*mut u8, usize) -> KResult<usize>,
@@ -118,7 +142,13 @@ impl IoVectorBufIo {
         Ok(())
     }
 
-    /// Moves the current I/O position backward by `count` bytes.
+    /// Moves the cursor backward by `count` bytes, making those bytes available again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if rewinding crosses the start or overflows the
+    /// remaining byte count. Restores all cursor fields on error; it does not
+    /// undo bytes already written to user memory.
     pub fn rewind_bytes(&mut self, mut count: usize) -> KResult<()> {
         let rewind = count;
         let original_start = self.start;

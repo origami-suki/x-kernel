@@ -30,14 +30,14 @@ const fn words<T>(bits: usize) -> usize {
 /// # Examples
 ///
 /// ```
-/// # use syscalls::{Sysno, SysnoSet};
+/// # use linux_sysno::{Sysno, SysnoSet};
 /// let syscalls = SysnoSet::new(&[Sysno::read, Sysno::write, Sysno::openat, Sysno::close]);
 /// assert!(syscalls.contains(Sysno::read));
 /// assert!(syscalls.contains(Sysno::close));
 /// ```
 /// Most operations can be done at compile-time as well.
 /// ```
-/// # use syscalls::{Sysno, SysnoSet};
+/// # use linux_sysno::{Sysno, SysnoSet};
 /// const SYSCALLS: SysnoSet = SysnoSet::new(&[Sysno::read, Sysno::write, Sysno::close])
 ///     .union(&SysnoSet::new(&[Sysno::openat]));
 /// const _: () = assert!(SYSCALLS.contains(Sysno::read));

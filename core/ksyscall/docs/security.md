@@ -1,18 +1,17 @@
-# ksyscall - 安全与可靠性分析
+# ksyscall security and reliability
 
-## 概述
+## Overview
 
-`ksyscall` 是用户态 syscall ABI 进入内核资源 owner 的第一层适配边界。
-主要风险来自：
+`ksyscall` is the first adaptation boundary between the user-space syscall
+ABI and kernel resource owners. The main risk sources are:
 
-- 用户提供的 syscall number、标志位、fd、PID 和标量参数；
-- 用户指针 `copyin/copyout`；
-- 错误的 owner 路由导致权限或语义检查落错位置；
-- 在 adapter 层误持有资源状态，造成边界混乱。
+- user-provided syscall numbers, flags, fds, PIDs, and scalar arguments;
+- user-pointer `copyin`/`copyout`;
+- wrong owner routing that moves permission or semantic checks to the wrong
+  place;
+- adapters accidentally holding resource state, blurring the boundary.
 
-本 crate 当前不包含手写 `unsafe` 代码。
-
-## 信任模型
+## Trust model
 
 ```text
 userspace syscall arguments
@@ -29,54 +28,82 @@ resource owners
    └─ other subsystem owners
 ```
 
-- 用户态 syscall 参数不可信。
-- `ksyscall` 信任各 owner crate 在进入其边界后维护真实资源语义。
-- `ksyscall` 必须在 syscall 边界完成 ABI 级别的基础校验，
-  但不应重复 owner 内部不变量检查。
+- User-space syscall arguments are untrusted.
+- `ksyscall` trusts each owner crate to maintain real resource semantics
+  once the call crosses its boundary.
+- `ksyscall` must complete ABI-level baseline validation at the syscall
+  boundary without duplicating owner-internal invariant checks.
 
-## 核心不变量
+## Unsafe inventory
 
-1. `ksyscall` 不保存资源的长期状态。
-2. 用户指针只通过现有安全封装类型访问。
-3. syscall adapter 负责 ABI 级错误码分支，不越权实现 owner 逻辑。
-4. adapter 目录结构应反映 owner 归属，而不是历史 API 分类。
-5. 涉及 current process/thread 的 helper 只能在明确上下文下调用。
-6. syscall 解码只能读取该 ABI 定义的参数；不能信任旧 ABI 未使用寄存器中的残留值。
+The crate contains three audited unsafe sites; all carry inline `SAFETY:`
+notes. There are no hand-written unsafe traits, FFI, or inline assembly.
 
-## 主要风险
+| Site | Operation | Invariant |
+|---|---|---|
+| `sys.rs` (`sethostname`) | stack `[u8; N]` reborrowed as `MaybeUninit<u8>` for copy-from-user | the array is live with trivially initializable bytes; only `buf[..len]` is read after the copy (same pattern as `devfs/nodes/loop.rs`) |
+| `task/clone3.rs` | fully initialized `#[repr(C)]` integer struct viewed as `MaybeUninit<u8>` for a versioned in-place user copy | `kargs` is zero-initialized first, so bytes beyond the caller's struct version stay zero; the reinterpretation is size-preserving |
+| `time/posix_timer.rs` | read of `sigevent._sigev_un._tid` | guarded by `sigev_notify == SIGEV_THREAD_ID`, the ABI-defined selector for that union arm; the tid is validated positive and owned by the process before use |
 
-| 编号 | 风险 | 影响 | 缓解 |
-|------|------|------|------|
-| T-01 | 用户坏指针导致 copyin/copyout 失败 | 中 | 统一通过 `UserPtr`/`UserConstPtr`/现有封装访问并传播 `KResult` |
-| T-02 | adapter 在错误 owner 下落地，导致边界职责重新混乱 | 中 | 目录和文档按 owner 语义组织；review 时检查路由归属 |
-| T-03 | adapter 重复实现 owner 状态机，造成双重语义源 | 高 | 文档明确 `ksyscall` 不拥有长期状态；仅做 ABI 适配 |
-| T-04 | current-thread/process helper 在错误上下文调用 | 中 | 复用 `kprocess` 现有约束，并在 syscall 入口保持 task-context 假设 |
-| T-05 | 不同 syscall 被历史目录误导，后续继续堆入错误模块 | 中 | crate-local design 文档固定 `vfs/ipc/time/task` 的 adapter 语义 |
-| T-06 | `setpriority` 通过进程代表线程漏检目标身份 | 高 | per-thread credential 下仍按 process representative 授权 | `PRIO_*` 选择和扫描均落到具体 task，逐 task 比较 caller euid 与 target real/effective UID，并单独检查提高优先级权限 |
-| T-06a | 非特权进程改写任意任务 affinity | 高 | `sched_setaffinity` 对非 current 直接 `set_cpumask` | 解析目标后按 `check_same_owner` 语义比较 caller euid 与 target ruid/euid；root（近似 `CAP_SYS_NICE`）可绕过，否则 `EPERM` |
-| T-07 | 非特权进程修改主机名 | 高 | `sethostname` 直接写 UTS namespace | syscall 边界检查 privileged credential，并限制 nodename 长度与用户缓冲区访问 |
-| T-08 | 非特权进程改变电源状态 | 高 | `reboot` 直接进入平台 power 接口 | 检查 privileged credential、Linux magic 和受支持命令集合 |
-| T-09 | 非特权进程修改墙钟 | 高 | wall-clock setter 直接更新 realtime 时钟关联 | `settimeofday` 与 `clock_settime` 在共享 setter 中检查 privileged credential，并拒绝把墙钟移到 CLOCK_MONOTONIC 之前 |
-| T-10 | `PR_SET_KEEPCAPS` 传入非法值或绕过锁定位 | 中 | `ctl.rs` 拒绝大于 1 的设置值，`kcred::Cred::keep_caps_enable()` / `keep_caps_disable()` 校验锁定位并通过 prepared credential 一次提交 |
-| T-11 | `riscv_hwprobe` 使用未校验用户 cpuset/pairs | 中 | 坏指针、超大 mask/pair_count 触发巨量内核分配（DoS）或破坏 ABI 结果 | 逐条 stream pairs（`read_vm`/`write_vm`，不做 bulk `Vec` 分配，超大 `pair_count` 只会走入未映射页返回 `EFAULT`）；`cpusetsize` 在 load 与 write 两端均封顶到 `cpumask_size()`；`flags` 非 `0`/`WHICH_CPUS` 返回 `EINVAL`，value 模式下用户 cpuset 与 online 求交后为空返回 `EINVAL`，`cpus == NULL && cpusetsize != 0` 返回 `EFAULT`；WHICH_CPUS 模式空 cpuset 视作全部 online，未知 key 写回 `key=-1,value=0` 并清空输出 cpuset；key 取值、聚合与匹配由 `kcpu` hwprobe helper 提供 |
-| T-12 | syscall 热路径临时读取不可靠 RISC-V 硬件状态 | 中 | S-mode 读取 M-mode CSR fault 或跨 CPU 能力不一致 | RISC-V 能力事实来源保存在 `kcpu` 的 FDT 初始化 snapshot；`ksyscall` 只按 selected CPU mask 聚合 |
-| T-13 | `get_robust_list` 跨进程泄露目标线程用户地址 | 高 | 解析目标线程后调用 `kprocess::ptrace::check_read_real_creds_access()`；统一策略执行同线程组豁免、caller real UID/GID 对 target real/effective/saved IDs 的非对称匹配，以及当前以 euid 0 近似的 `CAP_SYS_PTRACE` 绕过，否则返回 `EPERM` |
+All other user-memory access goes through the `posix-types`/`osvm` checked
+copy wrappers.
 
-## 已知限制
+## Core invariants
 
-- `ioctl` 先按精确命令询问 `posix-net::handle_net_ioctl`，未命中再走文件 `ioctl`。socket 文件 vtable 尚未实现 `ioctl`，因此 SIOC* 仍挂在 syscall adapter，而不是 Linux `sock_ioctl` 形态。
+1. `ksyscall` keeps no long-term resource state.
+2. User pointers are accessed only through the existing safe wrapper types.
+3. Syscall adapters own ABI-level error-code branches and do not implement
+   owner logic beyond their mandate.
+4. Adapter directory structure reflects owner boundaries, not historical
+   API categories.
+5. Helpers involving the current process/thread are called only in
+   contexts that guarantee them.
+6. Syscall decoding reads only the registers its ABI defines; stale values
+   in registers unused by an older ABI must not be trusted as extension
+   flags.
 
-## 审计清单
+## Threat analysis
 
-- cgroup/namespace flags 必须完整实现后才可从 `ENOSYS` 列表移除；adapter 不创建第二份
-  membership 或 namespace view state。
-- capability、seccomp 和 `no_new_privileges` 等安全 ABI 不允许返回与实际 enforcement
-  不一致的成功结果。
+| ID | Threat | Severity | Trigger | Response |
+|---|---|---|---|---|
+| T-01 | Bad user pointer fails copyin/copyout | Medium | any wrapped access | All access goes through `UserPtr`/`UserConstPtr` and existing wrappers, propagating `KResult` |
+| T-02 | Adapter lands under the wrong owner, blurring boundary responsibilities again | Medium | new syscalls placed by habit | Directories and docs are organized by owner semantics; reviews check routing |
+| T-03 | Adapter duplicates an owner state machine, creating a second source of semantics | High | convenience copying | Docs state that `ksyscall` owns no long-term state; ABI adaptation only |
+| T-04 | Current-thread/process helpers called in the wrong context | Medium | helper misuse | Reuse `kprocess` constraints; syscall entry maintains the task-context assumption |
+| T-05 | Historically misleading directories keep collecting syscalls of the wrong owner | Medium | new additions | This crate-local design doc fixes the `vfs`/`ipc`/`time`/`task` adapter semantics |
+| T-06 | `setpriority` authorizes only a process representative and misses target identity | High | per-thread credentials | `PRIO_*` selection and scanning both resolve to concrete tasks; per task, caller euid is compared with target real/effective UID, and priority-raising permission is checked separately |
+| T-06a | Unprivileged process rewrites arbitrary task affinity | High | `sched_setaffinity` calling `set_cpumask` on non-current targets | After target resolution, caller euid is compared with target ruid/euid under `check_same_owner` semantics; root (approximating `CAP_SYS_NICE`) may bypass, otherwise `EPERM` |
+| T-07 | Unprivileged process renames the host | High | `sethostname` writing the UTS namespace directly | The syscall boundary checks a privileged credential and bounds nodename length and the user buffer access |
+| T-08 | Unprivileged process changes power state | High | `reboot` reaching platform power interfaces directly | Privileged credential, Linux magic, and the supported command set are checked |
+| T-09 | Unprivileged process shifts the wall clock | High | wall-clock setters updating the realtime association directly | `settimeofday` and `clock_settime` check a privileged credential in the shared setter and reject moving the wall clock before `CLOCK_MONOTONIC` |
+| T-10 | `PR_SET_KEEPCAPS` receives an invalid value or bypasses the lock bit | Medium | `ctl.rs` | Values greater than 1 are rejected; `kcred::Cred::keep_caps_enable()` / `keep_caps_disable()` validate the lock bit and commit once through a prepared credential |
+| T-11 | `riscv_hwprobe` consumes unvalidated user cpusets/pairs | Medium | bad pointers, oversized masks or pair counts causing huge kernel allocations (DoS) or corrupt ABI results | Pairs stream one by one (`read_vm`/`write_vm`, no bulk `Vec` allocation; an oversized `pair_count` only walks into unmapped pages and returns `EFAULT`); `cpusetsize` is clamped to `cpumask_size()` on both load and write; non-`0`/`WHICH_CPUS` `flags` return `EINVAL`; in value mode an empty intersection of the user cpuset with online CPUs returns `EINVAL`; `cpus == NULL && cpusetsize != 0` returns `EFAULT`; in WHICH_CPUS mode an empty cpuset means all online CPUs, unknown keys write `key=-1,value=0` and clear the output cpuset; key semantics live in the `kcpu` hwprobe helper |
+| T-12 | Syscall hot path reads unreliable RISC-V hardware state | Medium | S-mode reads of M-mode CSRs faulting, or capability divergence across CPUs | The source of truth is the FDT-initialized snapshot in `kcpu`; `ksyscall` only aggregates over the selected CPU mask |
+| T-13 | `get_robust_list` leaks another process's user addresses | High | target resolution | After resolving the target thread, `kprocess::ptrace::check_read_real_creds_access()` applies the uniform policy: same-thread-group exemption, asymmetric matching of caller real UID/GID against target real/effective/saved IDs, and the euid-0 approximation of `CAP_SYS_PTRACE`; otherwise `EPERM` |
 
-- [ ] 新增 syscall 实现是否只做 ABI 适配，而不是复制 owner 状态机？
-- [ ] 新增 adapter 是否放在贴近 owner 的目录，而不是历史 API 杂项目录？
-- [ ] 用户指针访问是否都通过现有封装类型？
-- [ ] 合并相近 syscall 路径时，是否分别遵守各自的参数个数和 flags ABI？
-- [ ] current process/thread helper 的调用上下文是否明确？
-- [ ] 架构专属 syscall 是否把硬件事实来源留在架构 owner，而不是在 adapter 中临时探测？
-- [ ] 如果修改了 owner 路由关系，是否同步更新本 crate 和 owner crate 文档？
+## Known limitations
+
+- `ioctl` first asks `posix-net::handle_net_ioctl` for exact commands, then
+  falls back to file `ioctl`. Socket file vtables do not yet implement
+  `ioctl`, so SIOC* still hangs on the syscall adapter instead of the Linux
+  `sock_ioctl` shape.
+- Capability, seccomp, and `no_new_privileges` security ABIs must not
+  return success inconsistent with actual enforcement (currently `ENOSYS`).
+
+## Audit checklist
+
+- cgroup/namespace flags may leave the `ENOSYS` list only when fully
+  implemented; adapters do not create a second membership or namespace-view
+  state.
+- Does a new syscall implementation only adapt the ABI instead of copying
+  an owner state machine?
+- Is a new adapter placed near its owner rather than in a historical
+  catch-all directory?
+- Do all user-pointer accesses go through the existing wrapper types?
+- When merging similar syscall paths, are the per-ABI argument counts and
+  flags respected separately?
+- Is the calling context of current process/thread helpers explicit?
+- Do architecture-specific syscalls keep hardware sources of truth in the
+  architecture owner instead of ad-hoc probing in the adapter?
+- When owner routing changes, are this crate's and the owner's documents
+  updated together?

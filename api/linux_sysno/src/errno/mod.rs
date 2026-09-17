@@ -17,7 +17,10 @@ impl Errno {
     /// Operation would block. This is the same as [`Errno::EAGAIN`].
     pub const EWOULDBLOCK: Self = Self::EAGAIN;
 
-    /// Creates a new `Errno`.
+    /// Wraps `num` without validation, conventionally a positive Linux errno.
+    ///
+    /// Zero, negative values, and unknown codes are representable. Validate
+    /// externally supplied values before converting them to kernel errors.
     pub fn new(num: i32) -> Self {
         Self(num)
     }
@@ -27,12 +30,20 @@ impl Errno {
         self.0
     }
 
-    /// Returns true if the error code is valid (i.e., less than 4096).
+    /// Tests only whether the stored value is less than 4096.
+    ///
+    /// This also accepts zero and negative values; it does not establish a
+    /// positive Linux errno or membership in the named errno table.
     pub fn is_valid(&self) -> bool {
         self.0 < 4096
     }
 
-    /// Converts a raw syscall return value to a result.
+    /// Decodes a raw return register, preserving successful values unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Register encodings of signed values from -4095 through -1 yield the
+    /// corresponding positive errno. The encoding of -4096 is treated as success.
     #[inline(always)]
     pub fn from_ret(value: usize) -> Result<usize, Errno> {
         if value > -4096isize as usize {
@@ -84,7 +95,11 @@ impl fmt::Debug for Errno {
     }
 }
 
+/// Supplies the all-ones failure sentinel used by libc-style return types.
+///
+/// This does not store an errno or decode a raw Linux return register.
 pub trait ErrnoSentinel: Sized {
+    /// Returns -1 for signed integers, `usize::MAX`, or the all-ones pointer.
     fn sentinel() -> Self;
 }
 

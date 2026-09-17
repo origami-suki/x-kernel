@@ -88,7 +88,12 @@ unsafe impl<T> UserWrite for *const T {}
 // SAFETY: raw pointers are copied by value without dereferencing.
 unsafe impl<T> UserWrite for *mut T {}
 
-/// A mutable pointer to user-space memory.
+/// A mutable user virtual address, copied by value without validating its target.
+///
+/// Copy helpers require the `osvm` current-address-space provider. They may
+/// fault or block; use them in initialized thread context, not early boot or a
+/// hardware IRQ. `cast`, `is_null`, and `check_non_null` perform no memory access.
+/// Non-null does not imply mapped, writable, aligned, or exclusively owned.
 ///
 /// Provides copy-to-user helpers for syscall ABI values.
 #[repr(transparent)]
@@ -147,12 +152,26 @@ impl<T> UserPtr<T> {
         UserConstPtr(self.0.cast_const())
     }
 
-    /// Read into an uninitialized buffer with copy-from-user semantics.
+    /// Copies `size_of::<T>()` bytes into uninitialized kernel storage.
+    ///
+    /// The returned `MaybeUninit<T>` is not proof that those bytes form a valid
+    /// `T`; use `read_vm` when the `UserRead` representation contract applies.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` memory-access error for the user source range.
     pub fn read_uninit(self) -> osvm::MemResult<MaybeUninit<T>> {
         self.as_const().read_uninit()
     }
 
-    /// Read a by-value syscall ABI object from user memory.
+    /// Copies one ABI value; `T: UserRead` makes every copied bit pattern valid.
+    ///
+    /// This establishes representation validity, not permission or ABI field
+    /// semantics, and does not provide an atomic snapshot of shared user memory.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` memory-access error for the user source range.
     pub fn read_vm(self) -> osvm::MemResult<T>
     where
         T: UserRead,
@@ -160,7 +179,18 @@ impl<T> UserPtr<T> {
         self.as_const().read_vm()
     }
 
-    /// Load a vector of values from user memory.
+    /// Allocates and copies `len` values from the current user address space.
+    ///
+    /// `len` is an element count. Callers must enforce a resource limit before
+    /// allocation; this helper imposes no syscall-specific maximum.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` copy error and drops the temporary allocation.
+    ///
+    /// # Panics
+    ///
+    /// Capacity overflow can panic; allocation failure follows allocator policy.
     pub fn load_vm_vec(self, len: usize) -> osvm::MemResult<Vec<T>>
     where
         T: UserRead,
@@ -168,7 +198,11 @@ impl<T> UserPtr<T> {
         self.as_const().load_vm_vec(len)
     }
 
-    /// Write a value to user memory with copy-to-user semantics.
+    /// Copies a value's initialized representation to the current user address space.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` write error; failed writes may have partial effects.
     pub fn write_vm(self, value: T) -> osvm::MemResult
     where
         T: UserWrite,
@@ -176,7 +210,14 @@ impl<T> UserPtr<T> {
         self.write_vm_slice(slice::from_ref(&value))
     }
 
-    /// Write a slice of values to user memory.
+    /// Copies all bytes of `data` into consecutive user memory.
+    ///
+    /// `T: UserWrite` guarantees initialized output bytes, including explicit
+    /// padding. This does not validate the semantic values in those bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` write error; the copy is not transactional.
     pub fn write_vm_slice(self, data: &[T]) -> osvm::MemResult
     where
         T: UserWrite,
@@ -218,7 +259,12 @@ unsafe impl<T> UserRead for UserPtr<T> {}
 // without dereferencing it. Any bit pattern is valid for a pointer wrapper.
 unsafe impl<T> UserWrite for UserPtr<T> {}
 
-/// A read-only pointer to user-space memory.
+/// A read-only user virtual address, copied by value without validating its target.
+///
+/// Copy helpers require initialized `osvm` current-address-space services and
+/// may fault or block. Other threads can modify user memory during or after a
+/// copy, so copied fields still require semantic validation. Pure pointer
+/// operations need no process context.
 ///
 /// Provides copy-from-user helpers for syscall ABI values.
 #[repr(transparent)]
@@ -278,14 +324,28 @@ impl<T> UserConstPtr<T> {
         UserConstPtr(self.0 as *const U)
     }
 
-    /// Read into an uninitialized buffer with copy-from-user semantics.
+    /// Copies `size_of::<T>()` bytes into uninitialized kernel storage.
+    ///
+    /// The returned `MaybeUninit<T>` is not proof that those bytes form a valid
+    /// `T`; use `read_vm` when the `UserRead` representation contract applies.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` memory-access error for the user source range.
     pub fn read_uninit(self) -> osvm::MemResult<MaybeUninit<T>> {
         let mut value = MaybeUninit::<T>::uninit();
         read_vm_bytes(self.0.cast::<u8>(), as_uninit_bytes(&mut value))?;
         Ok(value)
     }
 
-    /// Read a by-value syscall ABI object from user memory.
+    /// Copies one ABI value; `T: UserRead` makes every copied bit pattern valid.
+    ///
+    /// This establishes representation validity, not permission or ABI field
+    /// semantics, and does not provide an atomic snapshot of shared user memory.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` memory-access error for the user source range.
     pub fn read_vm(self) -> osvm::MemResult<T>
     where
         T: UserRead,
@@ -295,7 +355,18 @@ impl<T> UserConstPtr<T> {
         Ok(unsafe { value.assume_init() })
     }
 
-    /// Load a vector of values from user memory.
+    /// Allocates and copies `len` values from the current user address space.
+    ///
+    /// `len` is an element count. Callers must enforce a resource limit before
+    /// allocation; this helper imposes no syscall-specific maximum.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` copy error and drops the temporary allocation.
+    ///
+    /// # Panics
+    ///
+    /// Capacity overflow can panic; allocation failure follows allocator policy.
     pub fn load_vm_vec(self, len: usize) -> osvm::MemResult<Vec<T>>
     where
         T: UserRead,
@@ -320,7 +391,15 @@ impl<T> VirtPtr for UserConstPtr<T> {
 }
 
 impl UserConstPtr<c_char> {
-    /// Load a null-terminated string from user memory.
+    /// Loads a NUL-terminated UTF-8 string from the current user address space.
+    ///
+    /// No caller-selected bound is enforced here; prefer the bounded helper for
+    /// hostile strings. The terminator is not included in the returned string.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `osvm` string-copy error or returns `IllegalBytes` for
+    /// invalid UTF-8. Allocation failure follows allocator policy.
     pub fn load_string(self) -> KResult<String> {
         #[allow(clippy::unnecessary_cast)]
         let bytes = load_vec_until_null(self.0 as *const u8)?;
@@ -329,6 +408,12 @@ impl UserConstPtr<c_char> {
 
     /// Load a null-terminated string whose byte length must not exceed
     /// `max_len`, excluding the terminator.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if no NUL occurs within the bound, `IllegalBytes`
+    /// for invalid UTF-8, or the user-memory copy error. Requires initialized
+    /// current-address-space and allocation services.
     pub fn load_string_with_max_len(self, max_len: usize) -> KResult<String> {
         let bytes = self.load_bytes_with_max_len(max_len).map_err(|err| {
             if err.canonicalize() == KError::OutOfRange {
@@ -344,6 +429,14 @@ impl UserConstPtr<c_char> {
     ///
     /// Unlike [`Self::load_string_with_max_len`], this preserves non-UTF-8
     /// bytes for Linux ABI names whose value is an opaque byte sequence.
+    /// At most `max_len + 1` bytes are probed, with the last reserved for NUL;
+    /// the result excludes the terminator. The caller must bound allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OutOfRange` when a non-NUL byte is found at the payload limit,
+    /// or propagates the user-memory copy error. Earlier reads are not a stable
+    /// snapshot of concurrently writable user memory.
     pub fn load_bytes_with_max_len(self, max_len: usize) -> KResult<Vec<u8>> {
         let mut bytes = Vec::new();
 

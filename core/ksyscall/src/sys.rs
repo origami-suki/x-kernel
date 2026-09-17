@@ -252,6 +252,28 @@ const GETRANDOM_CHUNK: usize = 64 * 1024;
 ///   the same ChaCha20 pool as the default path.
 /// - Request length is clamped to the Linux single-call limits (`512` with
 ///   `GRND_RANDOM`, otherwise `32 MiB - 1`) and copied in chunks.
+///
+/// # Arguments
+///
+/// `buf` is a user virtual address in the current address space; `len` is its
+/// requested capacity in bytes. `flags` contains Linux `GRND_*` bits. Requires
+/// initialized entropy, allocator and user-memory services, and a sleepable
+/// thread context for the blocking path.
+///
+/// # Returns
+///
+/// Returns the clamped byte count, or zero for a zero-length request after flag
+/// validation. `GRND_INSECURE` permits output before quality seeding.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` for invalid flags, `WouldBlock` when nonblocking secure
+/// output is not ready, or the user-memory copy error. If a later chunk faults,
+/// earlier chunks remain written but the call returns the error, not a short count.
+///
+/// # Panics
+///
+/// Scratch-buffer allocation failure follows kernel allocator policy.
 pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> KResult<isize> {
     // Reject unknown bits and the nonsensical INSECURE|RANDOM combination
     // (Linux getrandom(2) → EINVAL).

@@ -17,11 +17,20 @@ const fn uninit_data_array<T>() -> DataArray<T> {
 /// A map of syscalls to a type `T`.
 ///
 /// This provides constant-time lookup of syscalls within a static array.
+/// Storage grows with the target table's numeric span and `size_of::<T>()`,
+/// including gaps. Iteration visits occupied keys in numeric order.
+///
+/// # Panics
+///
+/// Indexing with an absent key panics; use [`Self::get`] for optional lookup.
+/// Clearing or dropping the map runs each occupied value's destructor. Values
+/// used here must not panic in `Drop`: `clear` clears membership only after all
+/// destructors return, so unwinding does not leave a reusable map.
 ///
 /// # Examples
 ///
 /// ```
-/// # use syscalls::{Sysno, SysnoMap};
+/// # use linux_sysno::{Sysno, SysnoMap};
 /// struct Point {
 ///     x: i32,
 ///     y: i32,
@@ -34,7 +43,7 @@ const fn uninit_data_array<T>() -> DataArray<T> {
 ///
 /// Use function callbacks:
 /// ```
-/// # use syscalls::{Sysno, SysnoMap};
+/// # use linux_sysno::{Sysno, SysnoMap};
 /// let mut map = SysnoMap::<fn() -> i32>::new();
 /// map.insert(Sysno::openat, || 1);
 /// map.insert(Sysno::close, || -1);
@@ -43,7 +52,7 @@ const fn uninit_data_array<T>() -> DataArray<T> {
 /// ```
 ///
 /// ```
-/// # use syscalls::{Sysno, SysnoMap};
+/// # use linux_sysno::{Sysno, SysnoMap};
 /// let mut syscalls = SysnoMap::from_iter([(Sysno::openat, 0), (Sysno::close, 42)]);
 ///
 /// assert!(!syscalls.is_empty());
@@ -113,8 +122,10 @@ impl<T> SysnoMap<T> {
         self.is_set.count()
     }
 
-    /// Inserts the given syscall into the map. Returns true if the syscall was
-    /// not already in the map.
+    /// Inserts a value, returning the previous value if the key was present.
+    ///
+    /// Returns `None` for a newly occupied slot; a replaced value is transferred
+    /// to the caller rather than dropped by the map.
     pub fn insert(&mut self, sysno: Sysno, value: T) -> Option<T> {
         let uninit = &mut self.data[get_idx(sysno)];
         if self.is_set.insert(sysno) {
@@ -186,12 +197,13 @@ impl<T: Copy> SysnoMap<T> {
     /// Initialize a syscall map from the given slice. Note that `T` must be
     /// `Copy` due to `const fn` limitations.
     ///
-    /// This is useful for constructing a static callback table.
+    /// This is useful for constructing a static callback table. For duplicate
+    /// keys, the last entry wins.
     ///
     /// # Example
     ///
     /// ```
-    /// use syscalls::{Sysno, SysnoMap};
+    /// use linux_sysno::{Sysno, SysnoMap};
     ///
     /// static CALLBACKS: SysnoMap<fn() -> i32> =
     ///     SysnoMap::from_slice(&[(Sysno::openat, || 42), (Sysno::close, || 43)]);

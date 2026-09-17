@@ -17,10 +17,19 @@ use crate::ptr::{UserRead, UserWrite};
 
 /// Converts between kernel [`TimeSpan`] values and Linux duration structures.
 pub trait TimeSpanLike {
-    /// Converts from a kernel time span.
+    /// Converts from a kernel time span using the destination ABI field widths.
+    ///
+    /// Microsecond carriers truncate sub-microsecond precision; narrowing casts
+    /// do not report overflow. Callers must enforce the destination range.
     fn from_time_span(span: TimeSpan) -> Self;
 
-    /// Tries to convert into a non-negative kernel time span.
+    /// Converts into a non-negative kernel time span.
+    ///
+    /// # Errors
+    ///
+    /// Linux carriers return `InvalidInput` for negative seconds or a fractional
+    /// field outside `[0, 1_000_000_000)` nanoseconds / `[0, 1_000_000)`
+    /// microseconds. The `TimeSpan` implementation always succeeds.
     fn try_into_time_span(self) -> KResult<TimeSpan>;
 }
 
@@ -141,10 +150,16 @@ impl TimeSpanLike for __kernel_sock_timeval {
 
 /// Converts between kernel [`SystemTime`] values and Linux timestamp structures.
 pub trait SystemTimeLike {
-    /// Converts from a kernel system timestamp.
+    /// Converts using the destination field widths, truncating sub-microsecond
+    /// precision for timeval carriers. Callers must prevent narrowing overflow.
     fn from_system_time(time: SystemTime) -> Self;
 
-    /// Tries to convert into a kernel system timestamp.
+    /// Converts into a kernel system timestamp, allowing pre-epoch seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if the fractional field is negative or reaches one
+    /// second, or `SystemTime::from_unix_parts` rejects the representation.
     fn try_into_system_time(self) -> KResult<SystemTime>;
 }
 
@@ -157,6 +172,11 @@ pub trait SystemTimeLike {
 /// intentionally *not* rejected by [`SystemTimeLike::try_into_system_time`],
 /// because pre-epoch timestamps are valid for file `atime`/`mtime`; this
 /// helper applies the stricter syscall-boundary rule to deadline parsing only.
+///
+/// # Errors
+///
+/// Propagates the input conversion error or returns `InvalidInput` for a
+/// timestamp with negative Unix seconds.
 pub fn try_into_realtime_deadline<T: SystemTimeLike>(ts: T) -> KResult<SystemTime> {
     let deadline = ts.try_into_system_time()?;
     if deadline.unix_seconds() < 0 {

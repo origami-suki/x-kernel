@@ -55,7 +55,29 @@ fn sys_riscv_flush_icache(flags: usize) -> KResult<isize> {
     Ok(0)
 }
 
-/// Dispatches a syscall from the given user context.
+/// Dispatches the syscall number and raw arguments in `uctx` for the current thread.
+///
+/// # Arguments
+///
+/// `uctx` must be the current user thread's exclusively borrowed trap context.
+/// The runtime must have established current process/thread state, address-space
+/// access, scheduler, allocator, and subsystem initialization. Despite the name,
+/// this is a syscall thread path: handlers can block, allocate, replace the user
+/// context on exec, or terminate the thread. Do not invoke from a hardware IRQ,
+/// early boot, or while holding locks that prohibit sleeping.
+///
+/// # Returns
+///
+/// Writes the result register, encoding ordinary failures as negative Linux
+/// errno (including `ENOSYS` for unknown/unsupported calls). Enabled TEE/TIPC
+/// extensions retain their own status conventions. Returns `Continue`, or
+/// `SkipSignalCheckOnce` after successful `rt_sigreturn`. The caller performs
+/// the runtime action; dispatch itself does not enter user mode.
+///
+/// # Panics
+///
+/// Handler access to missing current process/thread state or uninitialized
+/// providers can panic. Allocation failure follows kernel allocator policy.
 pub fn dispatch_irq_syscall(uctx: &mut UserContext) -> UserThreadRuntimeAction {
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());

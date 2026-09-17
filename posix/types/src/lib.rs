@@ -2,7 +2,30 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! POSIX/Linux ABI types.
+//! POSIX/Linux ABI carriers, checked user-memory copying, and time conversions.
+//!
+//! [`UserPtr`] and [`UserConstPtr`] copy values through `osvm`; constructing a
+//! wrapper does not validate an address. [`UserRead`] and [`UserWrite`] describe
+//! representation safety, not permissions or semantic validity. Syscall adapters
+//! must validate flags, lengths, identities, and reserved fields after copying.
+//!
+//! [`IoVec`] and [`IoVectorBuf`] support scatter-gather marshalling;
+//! [`TimeSpanLike`], [`SystemTimeLike`] and [`PosixClockTicks`] translate ABI time.
+//! Public domain modules also attach copy traits to `linux_raw_sys` structures.
+//! This crate owns temporary buffers and carriers, not processes or file objects.
+//!
+//! # Examples
+//!
+//! Pure carrier operations do not access user memory:
+//!
+//! ```
+//! use posix_types::{FdSet, UserPtr, check_sigset_size};
+//! let mut set = FdSet::zeroed();
+//! set.set(3);
+//! assert!(set.is_set(3));
+//! assert!(UserPtr::<u32>::default().is_null());
+//! assert!(check_sigset_size(8).is_ok());
+//! ```
 
 #![no_std]
 
