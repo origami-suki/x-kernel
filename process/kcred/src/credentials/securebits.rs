@@ -14,9 +14,9 @@ bitflags::bitflags! {
     /// Process secure-bits stored on [`super::Cred`].
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct SecureBits: u32 {
-        /// Retain capabilities across a uid-0 → non-root transition.
+        /// Keep-capabilities request flag; capability-set effects are not implemented.
         const KEEP_CAPS = 1 << 4;
-        /// Make [`Self::KEEP_CAPS`] immutable from userspace.
+        /// Reject keep-capabilities setters; exec still clears [`Self::KEEP_CAPS`].
         const KEEP_CAPS_LOCKED = 1 << 5;
     }
 }

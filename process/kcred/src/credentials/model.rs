@@ -10,7 +10,7 @@ use kerrno::{KError, KResult};
 
 use super::{Gid, Uid, securebits::SecureBits};
 
-/// A Linux task security context.
+/// User/group identity and keep-capabilities state for a task credential.
 ///
 /// A committed credential is held through [`Arc<Cred>`] and treated as
 /// immutable. Credential transitions operate on an uncommitted clone returned
@@ -36,7 +36,12 @@ impl Cred {
         Self::new(0, 0)
     }
 
-    /// Creates credentials with all user and group IDs initialized alike.
+    /// Creates credentials with all user IDs set to `uid` and all group IDs to `gid`.
+    ///
+    /// Supplementary groups are empty and securebits are clear. This trusted
+    /// constructor performs no authorization or namespace mapping; the caller
+    /// must authorize these IDs before publishing the credential. Allocation
+    /// of the shared group storage follows the allocator's failure policy.
     pub fn new(uid: Uid, gid: Gid) -> Self {
         Self {
             ruid: uid,
@@ -53,11 +58,20 @@ impl Cred {
     }
 
     /// Prepares an uncommitted copy for a credential transition.
+    ///
+    /// Scalar fields are copied and the immutable group array is shared through
+    /// `Arc`. Mutating the returned value does not alter this credential.
+    /// This method neither authorizes nor publishes a replacement; see the
+    /// crate-level example for the prepare/transition sequence.
     pub fn prepare(&self) -> Self {
         self.clone()
     }
 
     /// Prepares credentials for an `access(2)` check using real IDs.
+    ///
+    /// Only the returned copy's filesystem IDs change to its real IDs. Effective,
+    /// saved and real IDs, supplementary groups and securebits are preserved.
+    /// This prepares identity data and does not itself perform a file access check.
     pub fn for_access(&self) -> Self {
         let mut cred = self.prepare();
         cred.fsuid = cred.ruid;
@@ -129,8 +143,8 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when the keep-capabilities flag is
-    /// locked. The credential is unchanged on failure.
+    /// Returns [`KError::OperationNotPermitted`] if `KEEP_CAPS_LOCKED` is set,
+    /// even if the requested flag value is already present. The credential is unchanged.
     pub fn keep_caps_enable(&mut self) -> KResult<()> {
         if self.keep_caps_locked() {
             return Err(KError::OperationNotPermitted);
@@ -143,8 +157,8 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when the keep-capabilities flag is
-    /// locked. The credential is unchanged on failure.
+    /// Returns [`KError::OperationNotPermitted`] if `KEEP_CAPS_LOCKED` is set,
+    /// even if the requested flag value is already present. The credential is unchanged.
     pub fn keep_caps_disable(&mut self) -> KResult<()> {
         if self.keep_caps_locked() {
             return Err(KError::OperationNotPermitted);
@@ -198,8 +212,9 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when the caller is unprivileged and `uid` matches neither real nor saved UID.
-    /// All checks precede mutation; failure leaves the credential unchanged.
+    /// Returns [`KError::OperationNotPermitted`] if the credential is not privileged
+    /// and the requested UID matches neither the real nor saved set-user ID.
+    /// No fields change on rejection.
     pub fn set_uid(&mut self, uid: Uid) -> KResult<()> {
         if self.is_privileged() {
             self.set_resuid_unchecked(Some(uid), Some(uid), Some(uid));
@@ -223,8 +238,9 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when the caller is unprivileged and `gid` matches neither real nor saved GID.
-    /// All checks precede mutation; failure leaves the credential unchanged.
+    /// Returns [`KError::OperationNotPermitted`] if the credential is not privileged
+    /// and the requested GID matches neither the real nor saved set-group ID.
+    /// No fields change on rejection.
     pub fn set_gid(&mut self, gid: Gid) -> KResult<()> {
         if self.is_privileged() {
             self.set_resgid_unchecked(Some(gid), Some(gid), Some(gid));
@@ -243,12 +259,17 @@ impl Cred {
     /// Implements Linux `setreuid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    /// The saved user ID becomes the final effective ID if a real-ID argument is
+    /// provided, or if the effective-ID argument differs from the old real ID.
+    /// On every successful call the filesystem ID becomes the effective ID,
+    /// even when both arguments are `None`.
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when an unprivileged real-UID request matches neither old real nor effective UID,
-    /// or its effective-UID request matches none of old real/effective/saved UIDs.
-    /// All checks precede mutation; failure leaves the credential unchanged.
+    /// Returns [`KError::OperationNotPermitted`] for an unprivileged credential
+    /// if the requested real ID matches neither the old real nor effective ID,
+    /// or the requested effective ID matches none of the old real, effective,
+    /// and saved IDs. All checks precede mutation; rejection leaves fields unchanged.
     pub fn set_reuid(&mut self, ruid: Option<Uid>, euid: Option<Uid>) -> KResult<()> {
         let old_ruid = self.ruid;
         let old_euid = self.euid;
@@ -286,12 +307,17 @@ impl Cred {
     /// Implements Linux `setregid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    /// The saved group ID becomes the final effective ID if a real-ID argument is
+    /// provided, or if the effective-ID argument differs from the old real ID.
+    /// On every successful call the filesystem ID becomes the effective ID,
+    /// even when both arguments are `None`.
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when an unprivileged real-GID request matches neither old real nor effective GID,
-    /// or its effective-GID request matches none of old real/effective/saved GIDs.
-    /// All checks precede mutation; failure leaves the credential unchanged.
+    /// Returns [`KError::OperationNotPermitted`] for an unprivileged credential
+    /// if the requested real ID matches neither the old real nor effective ID,
+    /// or the requested effective ID matches none of the old real, effective,
+    /// and saved IDs. All checks precede mutation; rejection leaves fields unchanged.
     pub fn set_regid(&mut self, rgid: Option<Gid>, egid: Option<Gid>) -> KResult<()> {
         let old_rgid = self.rgid;
         let old_egid = self.egid;
@@ -329,12 +355,16 @@ impl Cred {
     /// Implements Linux `setresuid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    /// Each supplied value replaces the corresponding user ID. Filesystem ID
+    /// synchronization occurs when a supplied real/saved ID changes, or when an
+    /// explicit effective ID differs from either the old effective or filesystem ID.
+    /// Otherwise the call is a no-op, preserving any distinct filesystem ID.
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when any requested UID for an unprivileged credential matches none of its
-    /// real/effective/saved UIDs.
-    /// All checks precede mutation; failure leaves the credential unchanged.
+    /// Returns [`KError::OperationNotPermitted`] if an unprivileged credential
+    /// requests any ID outside its current real/effective/saved set. `None` is
+    /// always permitted. All checks precede mutation; rejection leaves fields unchanged.
     pub fn set_resuid(
         &mut self,
         ruid: Option<Uid>,
@@ -358,12 +388,16 @@ impl Cred {
     /// Implements Linux `setresgid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    /// Each supplied value replaces the corresponding group ID. Filesystem ID
+    /// synchronization occurs when a supplied real/saved ID changes, or when an
+    /// explicit effective ID differs from either the old effective or filesystem ID.
+    /// Otherwise the call is a no-op, preserving any distinct filesystem ID.
     ///
     /// # Errors
     ///
-    /// Returns `KError::OperationNotPermitted` when any requested GID for an unprivileged credential matches none of its
-    /// real/effective/saved GIDs.
-    /// All checks precede mutation; failure leaves the credential unchanged.
+    /// Returns [`KError::OperationNotPermitted`] if an unprivileged credential
+    /// requests any ID outside its current real/effective/saved set. `None` is
+    /// always permitted. All checks precede mutation; rejection leaves fields unchanged.
     pub fn set_resgid(
         &mut self,
         rgid: Option<Gid>,
@@ -388,6 +422,10 @@ impl Cred {
     ///
     /// The old filesystem UID is always returned. If the requested UID is not
     /// permitted, the credential state is left unchanged.
+    ///
+    /// A privileged credential accepts any target; otherwise the target must
+    /// match its real, effective, saved or current filesystem user ID.
+    /// The returned old value does not indicate whether the change succeeded.
     pub fn set_fsuid(&mut self, fsuid: Uid) -> Uid {
         let old_fsuid = self.fsuid;
         if self.is_privileged()
@@ -405,6 +443,10 @@ impl Cred {
     ///
     /// The old filesystem GID is always returned. If the requested GID is not
     /// permitted, the credential state is left unchanged.
+    ///
+    /// A privileged credential accepts any target; otherwise the target must
+    /// match its real, effective, saved or current filesystem group ID.
+    /// The returned old value does not indicate whether the change succeeded.
     pub fn set_fsgid(&mut self, fsgid: Gid) -> Gid {
         let old_fsgid = self.fsgid;
         if self.is_privileged()
@@ -422,6 +464,11 @@ impl Cred {
     ///
     /// Linux sorts supplementary groups for membership checks and preserves
     /// duplicate entries for syscall-visible output.
+    ///
+    /// This trusted setter does not check privilege or enforce a group-count limit.
+    /// The caller must perform both checks before publishing a user-requested change.
+    /// It consumes `groups`, preserves duplicates, and allocates shared array storage;
+    /// allocation failure follows the allocator policy rather than returning `KError`.
     pub fn set_supplementary_groups(&mut self, mut groups: Vec<Gid>) {
         groups.sort_unstable();
         self.supplementary_groups = Arc::from(groups);
@@ -467,7 +514,12 @@ impl Cred {
         self.fsgid = self.egid;
     }
 
-    /// Applies credential transitions after a successful execve.
+    /// Resets saved/filesystem IDs and clears keep-capabilities after successful exec.
+    ///
+    /// Saved and filesystem IDs become the effective IDs; real IDs and
+    /// supplementary groups remain unchanged. `KEEP_CAPS_LOCKED` remains set if it was set, while
+    /// `KEEP_CAPS` is cleared regardless of that lock. This method does not
+    /// inspect an executable, apply setuid/setgid file bits, or publish credentials.
     pub fn apply_exec(&mut self) {
         // Future setuid/setgid executable support must update euid/egid before this reset.
         self.suid = self.euid;

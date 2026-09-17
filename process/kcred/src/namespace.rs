@@ -11,7 +11,7 @@ use klazy::Once;
 
 static INIT_USER_NS: Once<Arc<UserNamespace>> = Once::new();
 
-/// Kernel namespace identifier allocated from a global counter.
+/// Namespace identifier allocated from a kernel-wide atomic counter.
 ///
 /// This is used for namespace identities that are externally rendered as
 /// `/proc/[pid]/ns/*` inode-style identifiers.
@@ -25,10 +25,12 @@ impl Default for NamespaceId {
 }
 
 impl NamespaceId {
-    /// Allocates the next namespace ID.
+    /// Allocates the next namespace ID without allocating memory.
     ///
-    /// The relaxed `u64` counter has no wrap check; uniqueness is limited
-    /// to allocations before counter exhaustion. This is not an authorization token.
+    /// The counter starts at one and uses relaxed atomic increment. IDs are
+    /// distinct until the `u64` counter wraps; exhaustion is not checked and
+    /// allocation does not synchronize unrelated namespace state.
+    /// An ID is not an authorization token.
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
@@ -46,10 +48,10 @@ impl core::fmt::Display for NamespaceId {
     }
 }
 
-/// User namespace.
+/// User-namespace identity and parentage, without ID mapping or privilege policy.
 ///
-/// This is the owner namespace for credentials and namespace-scoped privilege
-/// checks. The current implementation models identity and parentage only.
+/// The current public API exposes only the initial namespace. `Cred` does not
+/// store a user namespace, and credential privilege checks do not consult this type.
 #[derive(Debug)]
 pub struct UserNamespace {
     id: NamespaceId,
@@ -75,7 +77,16 @@ impl UserNamespace {
     }
 }
 
-/// Returns the global initial user namespace.
+/// Returns a shared reference to the lazily allocated initial user namespace.
+///
+/// Its parent is `None`; repeated calls clone the same `Arc`. Initialization
+/// requires an allocator, may spin on a concurrent initializer, and must not
+/// be re-entered. No child-namespace constructor or ID mapping is provided.
+///
+/// # Panics
+///
+/// Panics if an earlier initialization unwound and poisoned the internal
+/// [`klazy::Once`]. Allocation failure follows the allocator's failure policy.
 pub fn initial_user_namespace() -> Arc<UserNamespace> {
     Arc::clone(INIT_USER_NS.call_once(|| Arc::new(UserNamespace::new_root())))
 }
