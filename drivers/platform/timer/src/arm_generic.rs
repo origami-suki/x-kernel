@@ -99,6 +99,8 @@ pub struct TimerConfig {
 }
 
 impl TimerConfig {
+    /// Builds the platform-static timer descriptor for one non-zero IRQ
+    /// line.
     pub const fn platform_static(irq: usize) -> Self {
         Self {
             irq,
@@ -153,6 +155,15 @@ impl khal::time::ClockEventIf {
     }
 }
 
+/// Initializes the ARM generic timer from a platform-provided
+/// configuration: validates the IRQ and frequency, records the counter
+/// epoch (physical mode starts at 0; virtual mode snapshots the current
+/// count), and installs the count-to-nanoseconds ratio.
+///
+/// # Panics
+///
+/// Panics for a zero IRQ, a zero frequency, or a frequency that does
+/// not fit in `u32` — all platform configuration errors.
 pub fn init(config: TimerConfig) {
     assert!(config.irq != 0, "ARM generic timer IRQ must be non-zero");
     TIMER_IRQ.store(config.irq, Ordering::Relaxed);
@@ -182,6 +193,8 @@ pub fn init(config: TimerConfig) {
     NANOS_TO_CNTPCT_RATIO.call_once(|| ratio.inverse());
 }
 
+/// Enables the timer interrupt and arms the per-CPU countdown on the
+/// current CPU.
 pub fn init_percpu() {
     #[cfg(feature = "arm-timer-resume-fixup")]
     // SAFETY: this initializes only the current CPU's percpu logical-tick slot
@@ -267,6 +280,8 @@ fn handle_idle_return(previous_ticks: u64) -> bool {
 }
 
 #[cfg(feature = "arm-timer-resume-fixup")]
+/// Re-applies the per-CPU timer programming after an IPI-driven CPU
+/// hotplug/cresume fixup (feature `arm-timer-resume-fixup`).
 pub fn handle_ipi_fixup() {
     let cpu_id = khal::percpu::this_cpu_id();
     let bit = 1usize << cpu_id.as_usize();
@@ -380,6 +395,8 @@ fn write_physical_timer_tval(value: u64) {
     CNTP_TVAL_EL0.set(value);
 }
 
+/// Discovers the ARM generic timer from the device tree (the `timer`
+/// node's frequency and interrupt); returns `None` when absent.
 pub fn config_from_device_tree() -> Option<TimerConfig> {
     let timer_mode = TimerMode::from_kconfig();
     let node = of::find_compatible("arm,armv8-timer")

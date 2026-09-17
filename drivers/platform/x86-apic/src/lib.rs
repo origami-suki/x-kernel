@@ -2,6 +2,35 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
+//! x86 APIC integration: Local APIC bring-up, IPIs, IO-APIC routing, and
+//! the MSI-X vector backend for `kirq`.
+//!
+//! Start from `init_primary` (boot CPU, once during platform
+//! bring-up) and `init_secondary` (each application CPU); after that,
+//! `send_ipi_self` / `send_ipi_raw` / `send_ipi_all_but_self`,
+//! `configure_irq`, `set_irq_enabled`, and `end_of_interrupt` drive
+//! the hardware.
+//! A production call site is `platforms/kplat-x86_64/src/init.rs`.
+//!
+//! # Example
+//!
+//! Kernel code only (x86_64 target; runs after the platform maps the
+//! IO-APIC), so the example is `ignore`.
+//!
+//! ```ignore
+//! use drivers::platform::x86_apic;
+//!
+//! // 1. Boot CPU bring-up: LAPIC vectors + IO-APIC mapping.
+//! x86_apic::init_primary(io_apic_paddr);
+//! x86_apic::init_secondary(); // on each AP
+//!
+//! // 2. Route and enable a legacy line, then acknowledge it.
+//! x86_apic::configure_irq(4, x86_apic::IoApicTriggerMode::Edge,
+//!                         x86_apic::IoApicPolarity::High);
+//! x86_apic::set_irq_enabled(4, true);
+//! // ... interrupt arrives on this CPU ...
+//! x86_apic::end_of_interrupt();
+//! ```
 #![no_std]
 #![cfg(target_arch = "x86_64")]
 
@@ -159,6 +188,12 @@ fn apic_id_for_affinity(affinity: kirq::IrqAffinity) -> Option<u8> {
     }
 }
 
+/// Masks or unmasks one IO-APIC input line.
+///
+/// Interrupts numbered at or above [`MSIX_VECTOR_BASE`] are MSI-X vectors,
+/// not IO-APIC lines, and are ignored here; the vector must land in the
+/// IO-APIC range below the local APIC timer vector and within the
+/// controller's table, otherwise the call is a no-op.
 pub fn set_irq_enabled(irq: usize, enabled: bool) {
     if irq >= MSIX_VECTOR_BASE as usize {
         return;
@@ -181,6 +216,7 @@ pub fn set_irq_enabled(irq: usize, enabled: bool) {
     }
 }
 
+/// Programs the trigger mode and polarity of one IO-APIC input line.
 pub fn configure_irq(irq: usize, trigger: IoApicTriggerMode, polarity: IoApicPolarity) {
     if irq >= MSIX_VECTOR_BASE as usize {
         return;
@@ -211,6 +247,8 @@ pub fn configure_irq(irq: usize, trigger: IoApicTriggerMode, polarity: IoApicPol
     }
 }
 
+/// Returns the programmed trigger mode of one IO-APIC input line, or
+/// `None` when the line is out of the controller's table range.
 pub fn irq_trigger_mode(irq: usize) -> Option<IoApicTriggerMode> {
     if irq >= MSIX_VECTOR_BASE as usize {
         return None;
@@ -236,6 +274,12 @@ pub fn irq_trigger_mode(irq: usize) -> Option<IoApicTriggerMode> {
     }
 }
 
+/// Runs `f` with exclusive access to the current CPU's Local APIC.
+///
+/// # Panics
+///
+/// Panics if the current CPU has not installed its Local APIC handle
+/// (i.e. `init_primary`/`init_secondary` has not run on this CPU).
 pub fn with_local_apic<R>(f: impl FnOnce(&mut LocalApic) -> R) -> R {
     let _irq_guard = IrqSave::new();
     let lapic = local_apic_ptr();
@@ -251,6 +295,7 @@ pub fn with_local_apic<R>(f: impl FnOnce(&mut LocalApic) -> R) -> R {
     unsafe { f(&mut *lapic) }
 }
 
+/// Signals end-of-interrupt on the current CPU's Local APIC.
 pub fn end_of_interrupt() {
     with_local_apic(|lapic| {
         // SAFETY: the current CPU's LAPIC handle is initialized before IRQ
@@ -259,6 +304,9 @@ pub fn end_of_interrupt() {
     });
 }
 
+/// Converts an 8-bit APIC id into the destination-id encoding used by
+/// this platform: x2APIC uses the value directly, xAPIC shifts it into
+/// the destination field of the redirect/IPI formats.
 pub fn raw_apic_id(id_u8: u8) -> u32 {
     if IS_X2APIC.load(Ordering::Relaxed) {
         id_u8 as u32
@@ -274,6 +322,15 @@ fn cpu_has_x2apic() -> bool {
     }
 }
 
+/// Brings up the boot CPU's Local APIC and the IO-APIC.
+///
+/// Masks the legacy PIC, selects x2APIC or xAPIC from CPUID, programs the
+/// timer/error/spurious vectors, maps the xAPIC MMIO page when needed,
+/// and maps and initializes the IO-APIC at `io_apic_paddr`.
+///
+/// # Panics
+///
+/// Panics if the xAPIC MMIO mapping fails.
 pub fn init_primary(io_apic_paddr: PhysAddr) {
     info!("Initialize Local APIC...");
     // SAFETY: these are the legacy PIC data ports; masking them here is part of
@@ -344,6 +401,8 @@ pub fn init_primary(io_apic_paddr: PhysAddr) {
     IO_APIC.init_once(SpinNoIrq::new(io_apic));
 }
 
+/// Brings up the Local APIC on an application CPU (spurious/error/timer
+/// vectors only; the IO-APIC is owned by the boot CPU).
 pub fn init_secondary() {
     let mut lapic = build_local_apic();
     // SAFETY: secondary CPUs build their own LAPIC handle from the APIC mode
@@ -353,6 +412,7 @@ pub fn init_secondary() {
     install_local_apic(lapic);
 }
 
+/// Sends an IPI to the current CPU with the given interrupt id.
 pub fn send_ipi_self(interrupt_id: usize) {
     with_local_apic(|lapic| {
         // SAFETY: the current CPU's LAPIC handle is initialized before self-IPIs
@@ -362,6 +422,7 @@ pub fn send_ipi_self(interrupt_id: usize) {
     });
 }
 
+/// Sends an IPI to the CPU identified by `target_raw_apic_id`.
 pub fn send_ipi_raw(interrupt_id: usize, target_raw_apic_id: RawCpuId) {
     let apic_id = raw_apic_id(target_raw_apic_id.as_usize() as u8);
     with_local_apic(|lapic| {
@@ -372,6 +433,7 @@ pub fn send_ipi_raw(interrupt_id: usize, target_raw_apic_id: RawCpuId) {
     });
 }
 
+/// Broadcasts an IPI to every other CPU.
 pub fn send_ipi_all_but_self(interrupt_id: usize) {
     use x2apic::lapic::IpiAllShorthand;
     with_local_apic(|lapic| {

@@ -59,6 +59,8 @@ pub struct TimerConfig {
 }
 
 impl TimerConfig {
+    /// Builds the platform-static timer descriptor for one IRQ line and
+    /// a known counter frequency.
     pub const fn platform_static(irq: usize, frequency: Frequency) -> Self {
         Self {
             irq,
@@ -68,6 +70,12 @@ impl TimerConfig {
     }
 }
 
+/// Initializes the SBI timer backend: validates the IRQ and frequency
+/// and installs the count-to-nanoseconds conversion.
+///
+/// # Panics
+///
+/// Panics for a zero IRQ or a zero frequency.
 pub fn init(config: TimerConfig) {
     assert!(config.irq != 0, "RISC-V SBI timer IRQ must be non-zero");
     assert!(
@@ -82,6 +90,8 @@ pub fn init(config: TimerConfig) {
     );
 }
 
+/// Enables supervisor timer interrupts on the current hart; event
+/// delivery goes through the SBI `set_timer` call on each re-arm.
 pub fn init_percpu() {
     sbi_rt::set_timer(0);
 }

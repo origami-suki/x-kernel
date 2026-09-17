@@ -4,6 +4,31 @@
 
 //! Persistent real-time clock discovery and sampling.
 
+//! Persistent-clock (RTC) sampling for x-kernel platforms.
+//!
+//! Typed configurations select a backend (PL031, Goldfish, x86 CMOS,
+//! LS7A) and a transport (device tree, MMIO-mapped, platform static);
+//! [`read`] returns a validated [`SystemTime`] sample or `None`. See
+//! `docs/design.md` for the discovery and mapping flow.
+//!
+//! # Example
+//!
+//! Kernel code only (platform init context; `memspace` must be
+//! available), so the example is `ignore`. A production call site is
+//! `platforms/kplat-aarch64/src/init.rs`.
+//!
+//! ```ignore
+//! use rtc_driver::{read_from_device_tree, read, RtcConfig};
+//!
+//! // Device-tree discovered RTC (PL031 / Goldfish backends).
+//! let sample = read_from_device_tree();
+//!
+//! // Statically mapped RTC (e.g. the LoongArch LS7A aperture):
+//! let config = RtcConfig::mmio_mapped(
+//!     RtcKind::Ls7a, vaddr, RtcSource::PlatformStatic,
+//! );
+//! let sample = read(config); // Some(SystemTime) or None
+//! ```
 #![no_std]
 #![warn(missing_docs)]
 

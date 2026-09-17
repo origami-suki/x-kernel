@@ -1,6 +1,12 @@
 # RTC Driver - Security And Reliability
 
-## Trust Model
+## Scope
+
+This analysis covers the entire crate: `src/lib.rs` (typed configs,
+device-tree discovery, mapping, dispatch, timestamp validation) plus
+the backend modules `src/pl031.rs`, `src/goldfish.rs`, `src/cmos.rs`,
+and `src/ls7a.rs`. No modules are excluded; backend register access is
+audited as part of the boundary descriptions below.
 
 Device-tree descriptions, MMIO register contents, and platform RTC values are
 external inputs. Platform initialization chooses which discovered or static

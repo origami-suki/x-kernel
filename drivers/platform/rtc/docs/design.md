@@ -10,6 +10,15 @@ Platform initialization passes an accepted sample to `ktime`, which owns
 the relationship between realtime and the monotonic clock. The driver remains
 independent of timer queues and system timekeeping policy.
 
+## Non-Responsibilities
+
+- No wall-clock ownership: sampled values are handed to `ktime`, which
+  owns realtime correlation; the driver never mutates system time.
+- No timer or scheduling policy: the driver is a one-shot sampler, not
+  a clock-event source.
+- No device-tree parsing: discovery consumes `of` accessors.
+- No NVMEM/RTC alarm support: only time sampling is implemented.
+
 ## Components
 
 - `src/lib.rs` defines typed RTC configurations, device-tree discovery,
