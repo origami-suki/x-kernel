@@ -65,6 +65,8 @@ pub fn flush_icache_range(start: VirtAddr, size: usize) {
             asm!("ic ivau, {0:x}", in(reg) va);
         }
     }
+    // Completing IC IVAU requires a DSB covering both reads and writes;
+    // a store-only DSB ISHST cannot provide this completion guarantee.
     aarch64_cpu::asm::barrier::dsb(aarch64_cpu::asm::barrier::ISH);
     aarch64_cpu::asm::barrier::isb(aarch64_cpu::asm::barrier::SY);
 

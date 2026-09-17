@@ -5,6 +5,7 @@
 //! AArch64 low-level architecture operations.
 
 mod asid;
+mod barrier;
 mod cache;
 mod cpu;
 mod fp;
@@ -18,6 +19,7 @@ mod trap;
 pub use asid::{
     USER_ASID_BITS, encode_user_page_table_root, user_asid_from_ttbr, user_page_table_root_paddr,
 };
+pub use barrier::dsb_ishst;
 pub use cache::{
     clean_dcache_line_to_poc, clean_dcache_range_to_poc, dma_read_barrier, flush_icache_all,
     flush_icache_all_local, flush_icache_range, flush_icache_remote,

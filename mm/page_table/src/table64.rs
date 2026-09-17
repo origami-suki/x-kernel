@@ -95,6 +95,9 @@ const fn p1_idx(vaddr: usize) -> usize {
 ///
 /// `PageTable64` owns the root page table frame and all recursively allocated
 /// sub-table frames. On [`Drop`], the entire frame tree is deallocated.
+/// Callers must stop hardware use of the page table before dropping it.
+/// AArch64 user tables with a registered ASID provider invalidate that ASID's
+/// translations, including intermediate walk-cache entries, before freeing frames.
 ///
 /// This type provides read-only operations (query). For mutable operations
 /// (map, unmap, remap, protect), obtain a [`PageTableMut`] via [`modify`].
@@ -167,11 +170,15 @@ impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTable64<M, PT
 
     /// Registers a dynamic ASID provider for AArch64 user-page-table TLB invalidation.
     ///
+    /// The provider is consulted when flushing page-table changes and when
+    /// dropping the user page table, before any owned table frames are freed.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that:
     ///
-    /// - `ctx` remains valid for the full lifetime of this page table;
+    /// - `ctx` remains valid for the full lifetime of this page table, including
+    ///   its destructor;
     /// - `get_asid(ctx)` performs only read-only access to that live context;
     /// - the provider returns the ASID currently paired with this page table's
     ///   user address-space root.
@@ -335,6 +342,18 @@ impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTable64<M, PT
 
 impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> Drop for PageTable64<M, PTE, H> {
     fn drop(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        if !self.is_kernel
+            && let Some(provider) = self.user_asid_provider
+        {
+            // SAFETY: The provider contract keeps its context alive through
+            // page-table destruction and permits this read-only ASID fetch.
+            let asid = unsafe { (provider.get_asid)(provider.ctx) };
+            // Leaf invalidations cannot retire cached intermediate table
+            // descriptors before their physical frames are reused.
+            karch::dsb_ishst();
+            M::flush_tlb_process_asid(None, asid);
+        }
         let root = self.table_of(self.root_paddr);
         #[allow(unused_variables)]
         for (i, entry) in root.iter().enumerate() {
@@ -1276,6 +1295,182 @@ mod tests {
         assert_eq!(ctx.flush_calls.load(Ordering::Relaxed), 1);
         for (cpu, observed_bit) in ctx.observed_mask_bits.iter().enumerate() {
             assert_eq!(observed_bit.load(Ordering::Relaxed), expected_targets[cpu]);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    mod aarch64_drop {
+        use core::{
+            ptr::NonNull,
+            sync::atomic::{AtomicU16, AtomicUsize, Ordering},
+        };
+
+        use super::{
+            PageSize, PageTable64, PagingFlags, PagingHandler, PagingMetaData, PhysAddr, TestEntry,
+            TestHandler, TestMeta, VirtAddr, def_test, paddr, vaddr,
+        };
+
+        // Only the serial tests below use these probes. The scoped guard resets
+        // them on entry and exit; sibling tests use different metadata/handlers.
+        // Relaxed accesses record same-thread call order, not CPU synchronization.
+        static ASID_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+        static LAST_ASID: AtomicU16 = AtomicU16::new(0);
+        static OTHER_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+        static FREED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+        static FREED_WITHOUT_ASID_FLUSH: AtomicUsize = AtomicUsize::new(0);
+
+        struct ProbeGuard;
+
+        impl ProbeGuard {
+            fn new() -> Self {
+                Self::reset();
+                Self
+            }
+
+            fn reset() {
+                ASID_FLUSHES.store(0, Ordering::Relaxed);
+                LAST_ASID.store(0, Ordering::Relaxed);
+                OTHER_FLUSHES.store(0, Ordering::Relaxed);
+                FREED_FRAMES.store(0, Ordering::Relaxed);
+                FREED_WITHOUT_ASID_FLUSH.store(0, Ordering::Relaxed);
+            }
+        }
+
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                Self::reset();
+            }
+        }
+
+        struct DropMeta;
+
+        impl PagingMetaData for DropMeta {
+            type VirtAddr = VirtAddr;
+
+            const LEVELS: usize = TestMeta::LEVELS;
+            const PA_MAX_BITS: usize = TestMeta::PA_MAX_BITS;
+            const VA_MAX_BITS: usize = TestMeta::VA_MAX_BITS;
+
+            fn vaddr_is_valid(addr: usize) -> bool {
+                TestMeta::vaddr_is_valid(addr)
+            }
+
+            fn paddr_is_valid(addr: usize) -> bool {
+                TestMeta::paddr_is_valid(addr)
+            }
+
+            fn flush_tlb(_vaddr: Option<VirtAddr>) {
+                OTHER_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn flush_tlb_process_asid(vaddr: Option<VirtAddr>, asid: u16) {
+                if vaddr.is_none() {
+                    LAST_ASID.store(asid, Ordering::Relaxed);
+                    ASID_FLUSHES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    OTHER_FLUSHES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        struct DropHandler;
+
+        impl PagingHandler for DropHandler {
+            fn alloc_frame() -> Option<PhysAddr> {
+                TestHandler::alloc_frame()
+            }
+
+            fn dealloc_frame(paddr: PhysAddr) {
+                if ASID_FLUSHES.load(Ordering::Relaxed) == 0 {
+                    FREED_WITHOUT_ASID_FLUSH.fetch_add(1, Ordering::Relaxed);
+                }
+                FREED_FRAMES.fetch_add(1, Ordering::Relaxed);
+                TestHandler::dealloc_frame(paddr);
+            }
+
+            fn p2v(paddr: PhysAddr) -> VirtAddr {
+                TestHandler::p2v(paddr)
+            }
+        }
+
+        type DropPageTable = PageTable64<DropMeta, TestEntry, DropHandler>;
+
+        /// Reads the ASID associated with a test-owned, inactive page table.
+        ///
+        /// # Safety
+        ///
+        /// `ctx` must point to an `AtomicU16` that remains live until the page
+        /// table, including its destructor, has finished using this callback.
+        unsafe fn current_asid(ctx: NonNull<()>) -> u16 {
+            // SAFETY: Each test keeps the stack-owned ASID alive until after
+            // dropping its page table. This callback only reads that atomic.
+            unsafe { ctx.cast::<AtomicU16>().as_ref() }.load(Ordering::Relaxed)
+        }
+
+        fn map_test_page(table: &mut DropPageTable) {
+            table
+                .modify()
+                .map(
+                    vaddr(0x4000),
+                    paddr(0x20_0000),
+                    PageSize::Size4K,
+                    PagingFlags::READ,
+                )
+                .expect("map test page");
+            // Mapping finalization is complete. Observe only table destruction,
+            // which must invalidate the ASID even with no pending leaf flushes.
+            ProbeGuard::reset();
+        }
+
+        #[def_test(serial)]
+        fn user_drop_invalidates_latest_asid_before_freeing_frames() {
+            let _probe = ProbeGuard::new();
+            let asid = AtomicU16::new(7);
+            let mut table = DropPageTable::try_new().expect("user page table");
+            // SAFETY: `asid` outlives `table`, the callback only reads it, and
+            // this test table is never installed as a hardware translation root.
+            unsafe { table.set_user_asid_provider(NonNull::from(&asid).cast(), current_asid) };
+            map_test_page(&mut table);
+            asid.store(0x1234, Ordering::Relaxed);
+
+            drop(table);
+
+            assert_eq!(ASID_FLUSHES.load(Ordering::Relaxed), 1);
+            assert_eq!(LAST_ASID.load(Ordering::Relaxed), 0x1234);
+            assert_eq!(OTHER_FLUSHES.load(Ordering::Relaxed), 0);
+            assert_eq!(FREED_WITHOUT_ASID_FLUSH.load(Ordering::Relaxed), 0);
+            assert_eq!(FREED_FRAMES.load(Ordering::Relaxed), DropMeta::LEVELS);
+        }
+
+        #[def_test(serial)]
+        fn user_drop_without_provider_skips_asid_flush() {
+            let _probe = ProbeGuard::new();
+            let mut table = DropPageTable::try_new().expect("user page table");
+            map_test_page(&mut table);
+
+            drop(table);
+
+            assert_eq!(ASID_FLUSHES.load(Ordering::Relaxed), 0);
+            assert_eq!(OTHER_FLUSHES.load(Ordering::Relaxed), 0);
+            assert_eq!(FREED_FRAMES.load(Ordering::Relaxed), DropMeta::LEVELS);
+        }
+
+        #[def_test(serial)]
+        fn kernel_drop_skips_user_asid_flush() {
+            let _probe = ProbeGuard::new();
+            let asid = AtomicU16::new(0x5678);
+            let mut table = DropPageTable::try_new_kernel().expect("kernel page table");
+            // SAFETY: The context stays live until after `table` is dropped and
+            // the callback is read-only. The table is never activated. Installing
+            // a provider here exercises the kernel-table exclusion in Drop.
+            unsafe { table.set_user_asid_provider(NonNull::from(&asid).cast(), current_asid) };
+            map_test_page(&mut table);
+
+            drop(table);
+
+            assert_eq!(ASID_FLUSHES.load(Ordering::Relaxed), 0);
+            assert_eq!(OTHER_FLUSHES.load(Ordering::Relaxed), 0);
+            assert_eq!(FREED_FRAMES.load(Ordering::Relaxed), DropMeta::LEVELS);
         }
     }
 }

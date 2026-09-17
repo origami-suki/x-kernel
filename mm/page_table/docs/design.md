@@ -1,26 +1,28 @@
-# page_table — 设计文档
+# page_table — Design
 
-## 定位
+## Purpose
 
-本模块提供 x-kernel 统一的多架构页表实现。它定义了与架构无关的页表操作
-trait（`PageTableEntry`、`PagingMetaData`、`PagingHandler`），并实现了
-通用的 64 位多级页表 `PageTable64`，支持 x86_64、AArch64、RISC-V、
-LoongArch64 四种架构。本模块被 `mm/memspace`、`process/kexec` 等子系统
-使用，是内核虚拟内存管理的基础。
+This module provides a unified page table implementation for x-kernel across
+multiple architectures. It defines architecture-independent page table traits
+(`PageTableEntry`, `PagingMetaData`, and `PagingHandler`) and implements the
+generic 64-bit multi-level page table `PageTable64` for x86_64, AArch64, RISC-V,
+and LoongArch64. Subsystems such as `mm/memspace` and `process/kexec` use this
+module as the foundation for virtual memory management.
 
-## 背景
+## Background
 
-x-kernel 需要在多种 CPU 架构上管理虚拟地址空间，但各架构的页表项格式、
-层级数量、TLB 刷新机制差异很大。如果每个架构独立实现页表操作，会导致
-大量重复逻辑（映射/解映射/区域操作/TLB 刷新），且难以保证一致性。
-因此需要一套通用框架，将架构差异封装在 PTE 和 Metadata trait 中，
-使核心映射逻辑只写一次。
+x-kernel manages virtual address spaces on CPU architectures with different
+PTE formats, numbers of page table levels, and TLB invalidation mechanisms.
+Independent implementations would duplicate mapping, unmapping, region
+operations, and TLB management, making consistent behavior difficult to maintain.
+The common framework encapsulates these differences in PTE and metadata traits
+so that the core mapping logic is implemented once.
 
-## 范围
+## Scope
 
-涉及的源文件：
+Source files:
 
-```
+```text
 page_table/
 ├── src/
 │   ├── lib.rs
@@ -36,187 +38,232 @@ page_table/
 └── Cargo.toml
 ```
 
-## 架构
+## Boundaries and Delegated Responsibilities
 
-```
+`page_table` owns page table frames, PTE traversal and mutation, conditional
+replacement, and the ordering of TLB finalization relative to frame release.
+The following responsibilities belong to other layers:
+
+| Responsibility outside this crate | Owner or interface |
+|----------------------------------|--------------------|
+| Physical frame allocation policy, allocator initialization, and physical-to-virtual mapping setup | `PagingHandler` supplies allocation, release, and address translation. The kernel adapter is [`khal::paging::PagingHandlerImpl`](../../../arch/khal/src/paging.rs), backed by `kalloc` and `khal::mem` / `kaddr_layout`. This crate requests table frames but does not implement an allocator or establish the direct map. |
+| TLB instructions, remote notification delivery, and IPI acknowledgements | `PagingMetaData` supplies architecture-specific invalidation. The architecture implementations delegate instructions to `karch`; software shootdowns use `TlbFlushIf`, implemented in [`kipi::tlb`](../../../arch/kipi/src/tlb.rs). AArch64 uses hardware Inner Shareable broadcast. This crate chooses when and what to invalidate, not how to deliver IPIs. |
+| VMA policy, page faults, COW resource preparation, and ownership of mapped data pages | [`memspace`](../../memspace/src/aspace.rs) and its backends own these decisions. `replace_if_same()` only commits a PTE change; callers release or abort the corresponding data-page resources. Dropping a page table releases its table frames, not the data pages named by leaf PTEs. |
+| ASID assignment, CPU residency, and stopping hardware use before destruction | The address-space owner supplies the ASID or CPU-mask provider and keeps its context alive. On AArch64, [`memspace::aarch64_asid`](../../memspace/src/aarch64_asid.rs) connects the provider to address-space state. This crate neither allocates ASIDs nor schedules CPUs away from an address space. |
+| Synchronizing callers and managing borrowed subtree lifetimes | Callers serialize mutations and ensure that a source used by `copy_from()` outlives its borrowers. This crate has no internal address-space lock or reference count for borrowed table frames. |
+
+## Architecture
+
+```text
                     ┌─────────────────────────────────┐
-                    │        调用者                     │
-                    │  (memspace, kexec, ...)          │
-                    └───────────┬─────────────────────┘
-                                │
-                    safe API: map / unmap / query / protect
-                                │
-                    ┌───────────v─────────────────────┐
-                    │       PageTable64<M, PTE, H>     │
-                    │       PageTableMut<M, PTE, H>    │
-                    │                                  │
-                    │  ┌─ walk_page_table! ─────────┐  │
-                    │  │  3/4 级遍历 + huge page     │  │
-                    │  └────────────────────────────┘  │
-                    │                                  │
-                    │  ┌─ TLB 刷新延迟批处理 ────────┐  │
-                    │  │  ToFlush / finish()          │  │
-                    │  └────────────────────────────┘  │
-                    └───┬──────────┬───────────────────┘
-                        │          │
-            ┌───────────v──┐   ┌──v──────────────┐
-            │  PTE (trait)  │   │  M: PagingMetaData │
-            │  + arch impl  │   │  + H: PagingHandler│
-            └───────────────┘   └──────────────────┘
-               x86_64              flush_tlb()
-               aarch64             alloc/dealloc_frame()
-               riscv               p2v()
-               loongarch64
+                    │ Callers (memspace, kexec, ...)  │
+                    └───────────────┬─────────────────┘
+                                    │
+                  safe API: map / unmap / query / protect
+                                    │
+                    ┌───────────────v─────────────────┐
+                    │ PageTable64<M, PTE, H>          │
+                    │ PageTableMut<M, PTE, H>         │
+                    │                                 │
+                    │ ┌─ walk_page_table! ──────────┐ │
+                    │ │ 3/4 levels and huge pages   │ │
+                    │ └─────────────────────────────┘ │
+                    │                                 │
+                    │ ┌─ Deferred TLB flushes ──────┐ │
+                    │ │ ToFlush / finish()          │ │
+                    │ └─────────────────────────────┘ │
+                    └───┬───────────────────┬─────────┘
+                        │                   │
+              ┌─────────v───────┐  ┌────────v────────────┐
+              │ PTE (trait)     │  │ M: PagingMetaData   │
+              │ + arch impl     │  │ H: PagingHandler    │
+              └─────────────────┘  └─────────────────────┘
+                 x86_64               flush_tlb()
+                 aarch64              alloc/dealloc_frame()
+                 riscv                p2v()
+                 loongarch64
 ```
 
-| 组件 | 职责 |
-|------|------|
-| `defs.rs` | 定义核心 trait 和类型：`PagingFlags`、`PageTableEntry`、`PagingMetaData`、`PagingHandler`、`PageSize`、`PtError`、`PteSnapshot`、`PteReplaceError`、`TlbFlushReceipt` |
-| `table64.rs` | 通用 64 位多级页表实现：`PageTable64`（只读查询）+ `PageTableMut`（可变操作、条件替换 + TLB 批处理） |
-| `macros.rs` | `walk_page_table!` / `walk_page_table_create!` 遍历宏，`impl_pte_debug!` / `impl_pte_common_ops!` PTE 辅助宏 |
-| `arch/x86_64.rs` | x86_64 PTE（4 级，SEV C-bit 加密），`X64PagingMetaData` |
-| `arch/aarch64.rs` | AArch64 PTE（4 级，Arm64Attr 属性），`A64PagingMetaData` |
-| `arch/riscv.rs` | RISC-V PTE（Sv39 3 级 / Sv48 4 级），`Sv39MetaData` / `Sv48MetaData` |
-| `arch/loongarch64.rs` | LoongArch64 PTE（4 级，LaFlags 属性），`LA64MetaData` |
+| Component | Responsibility |
+|-----------|----------------|
+| `defs.rs` | Core traits and types: `PagingFlags`, `PageTableEntry`, `PagingMetaData`, `PagingHandler`, `PageSize`, `PtError`, `PteSnapshot`, `PteReplaceError`, and `TlbFlushReceipt`. |
+| `table64.rs` | Generic 64-bit multi-level page tables: `PageTable64` for read-only queries and `PageTableMut` for mutations, conditional replacement, and batched TLB invalidation. |
+| `macros.rs` | Traversal macros `walk_page_table!` / `walk_page_table_create!` and PTE helpers `impl_pte_debug!` / `impl_pte_common_ops!`. |
+| `arch/x86_64.rs` | x86_64 PTEs with four levels and SEV C-bit encryption; `X64PagingMetaData`. |
+| `arch/aarch64.rs` | AArch64 PTEs with four levels and `Arm64Attr` attributes; `A64PagingMetaData`. |
+| `arch/riscv.rs` | RISC-V PTEs for three-level Sv39 and four-level Sv48; `Sv39MetaData` / `Sv48MetaData`. |
+| `arch/loongarch64.rs` | LoongArch64 PTEs with four levels and `LaFlags` attributes; `LA64MetaData`. |
 
-## 状态机
+## State Machines
 
-### PageTableMut TLB 刷新状态
+### PageTableMut TLB Flush State
 
+```text
+  None ──flush(vaddr)──> Addresses ──flush(beyond threshold)──> Full
+    │                       │                                  │
+    │                       └────finish()──> None <──finish()───┘
+    └────────────────────────────finish()──> None
 ```
-  None ──flush(vaddr)──> Addresses ──flush(超过阈值)──> Full
-    │                        │                            │
-    │                        └────finish()──> None <──────┘
-    └────────────────────finish()──> None
-```
 
-| 从 | 到 | 触发条件 |
-|----|----|----------|
-| `None` | `Addresses` | 首次调用 `flush(vaddr)` |
-| `Addresses` | `Addresses` | 追加地址，未超 `FLUSH_THRESHOLD`(16) |
-| `Addresses` | `Full` | 追加地址超过阈值 |
-| `Addresses` | `None` | `finish()` 或 `Drop` |
-| `Full` | `None` | `finish()` 或 `Drop` |
+| From | To | Trigger |
+|------|----|---------|
+| `None` | `Addresses` | First call to `flush(vaddr)`. |
+| `Addresses` | `Addresses` | Another address is recorded within `FLUSH_THRESHOLD` (16). |
+| `Addresses` | `Full` | Another address would exceed the threshold. |
+| `Addresses` | `None` | `finish()` or `Drop`. |
+| `Full` | `None` | `finish()` or `Drop`. |
 
-### PTE 生命周期
+### PTE Lifecycle
 
-```
+```text
   EMPTY ──new_page()/new_table()──> PRESENT ──clear()──> EMPTY
                                       │
                               set_paddr()/set_flags()
                                       │
                                       v
-                                   PRESENT (更新)
+                                 PRESENT (updated)
 ```
 
-## 算法流程
+## Algorithms
 
-### 页表遍历（walk_page_table!）
+### Page Table Traversal (`walk_page_table!`)
 
-以 4 级页表为例：
+For a four-level page table:
 
-1. 从 `root_paddr` 获取 P4 表
-2. 用 `p4_idx(vaddr)` 索引 P4 表，获取 P4E
-3. 若 P4E 指向下一级，获取 P3 表；否则返回 `NotMapped`
-4. 检查 P3E 是否为 huge page（1G），若是则直接返回
-5. 用 `p3_idx(vaddr)` 索引 P3 表，获取 P3E → P2 表
-6. 检查 P2E 是否为 huge page（2M），若是则直接返回
-7. 用 `p2_idx(vaddr)` 索引 P2 表，获取 P2E → P1 表
-8. 用 `p1_idx(vaddr)` 索引 P1 表，返回 P1E（4K 页）
+1. Obtain the P4 table from `root_paddr`.
+2. Index P4 with `p4_idx(vaddr)` to obtain P4E.
+3. Follow P4E to P3, or return `NotMapped` if no next-level table exists.
+4. Index P3 with `p3_idx(vaddr)` and return P3E if it maps a 1 GiB huge page.
+5. Otherwise, follow P3E to P2.
+6. Index P2 with `p2_idx(vaddr)` and return P2E if it maps a 2 MiB huge page.
+7. Otherwise, follow P2E to P1.
+8. Index P1 with `p1_idx(vaddr)` and return P1E for a 4 KiB page.
 
-3 级页表（Sv39）跳过 P4 层，直接从 P3 开始。
+Three-level page tables (Sv39) skip P4 and start at P3.
 
-### 映射创建（walk_page_table_create!）
+### Mapping Creation (`walk_page_table_create!`)
 
-1. 遍历各级页表，若中间表项为空则调用 `alloc_table()` 分配新页表帧
-2. 到达目标层级后返回可变 PTE 引用
-3. 调用者写入 PTE 内容
+1. Walk the page table levels. If an intermediate entry is unused, call
+   `alloc_table()` to allocate a new page table frame.
+2. Return a mutable PTE reference at the requested level.
+3. The caller writes the PTE contents.
 
-### 区域映射（map_region）
+### Region Mapping (`map_region`)
 
-1. 校验 vaddr 和 size 按 4K 对齐
-2. 循环中优先尝试大页（1G → 2M → 4K），条件：地址对齐 + 物理地址对齐 + 剩余大小足够
-3. 逐页调用 `map()`，推进 vaddr 和剩余大小
-4. 任一页映射失败则整体失败
+1. Check that `vaddr` and `size` are aligned to 4 KiB.
+2. When huge pages are allowed, prefer the largest usable page size
+   (1 GiB, then 2 MiB, then 4 KiB). Both virtual and physical addresses must
+   satisfy its alignment, and the remaining region must be large enough.
+3. Call `map()` for each page, advancing the virtual address and reducing the
+   remaining size.
+4. Return an error if any mapping fails. Earlier mappings are not rolled back.
 
-### TLB 刷新批处理
+### Batched TLB Invalidation
 
-1. `PageTableMut` 内部维护 `ToFlush` 枚举
-2. 每次 `map/unmap/remap/protect/replace_if_same` 成功修改 PTE 后调用 `flush(vaddr)` 记录待刷新地址
-3. 地址数 ≤ 16 时逐个刷新；超过阈值则标记为 `Full`
-4. `finish()` 时批量执行：`Addresses` 逐个刷新，`Full` 刷新整个 TLB，并返回 `TlbFlushReceipt`
-5. `Drop` 自动调用 `finish()`，确保不会遗漏刷新
+1. `PageTableMut` maintains a `ToFlush` value.
+2. Each successful PTE change made by
+   `map/unmap/remap/protect/replace_if_same` records its address with `flush(vaddr)`.
+3. Up to 16 addresses are retained for individual invalidation.
+   Exceeding this threshold changes the state to `Full`.
+4. `finish()` invalidates each recorded address for `Addresses`, or performs
+   a full invalidation for the target scope for `Full`, then returns a
+   `TlbFlushReceipt`.
+5. `Drop` calls `finish()` automatically to finalize pending invalidations.
 
-`TlbFlushReceipt` 是页表修改后的显式排序边界。它不暴露架构细节，只表示调用点已经完成一次
-flush finalization。上层若要释放刚从 PTE 中移除的物理帧或对象页，必须把释放动作放在
-`finish()` 之后；仅依赖 `PageTableMut::drop` 虽然能避免遗漏 flush，但不能在代码上表达
-“释放发生在 flush 之后”的资源生命周期约束。
+`TlbFlushReceipt` marks an explicit ordering boundary after page table changes.
+It hides architecture-specific details and indicates that flush finalization
+has completed at that call site.
+Before releasing a physical frame or object-owned page removed from a PTE,
+higher layers must call `finish()` and perform the release afterward.
+Relying only on `PageTableMut::drop` prevents forgotten flushes but does not
+express the required release-after-flush ordering in the resource lifecycle.
 
-### PTE snapshot 与条件替换
+### PTE Snapshots and Conditional Replacement
 
-`PageTable64::query_entry(vaddr)` 返回 `PteSnapshot`，表示一次页表遍历观察到的
-present leaf PTE。它包含：
+`PageTable64::query_entry(vaddr)` returns a `PteSnapshot` describing the present
+leaf PTE observed by one page table walk. It contains:
 
-- leaf PTE 的基础物理地址；
-- 解码后的 `PagingFlags`；
-- leaf 页大小；
-- 仅由 `page_table` 内部解释的 raw PTE bits，用于条件替换比较。
+- The base physical address of the leaf PTE.
+- Decoded `PagingFlags`.
+- The leaf page size.
+- Raw PTE bits, interpreted only within `page_table` for conditional comparison.
 
-`PageTableMut::replace_if_same(vaddr, expected, paddr, flags)` 是 COW 等事务型路径的
-提交原语：
+`PageTableMut::replace_if_same(vaddr, expected, paddr, flags)` is the commit
+primitive for transactional paths such as COW:
 
-1. 上层先用 `query_entry()` 观察当前 PTE；
-2. 上层在页表外准备替换资源，例如 COW 新页；
-3. 提交时调用 `replace_if_same()`；
-4. 如果当前 leaf PTE 与 `expected` 完全一致，则替换物理页和权限并记录 TLB flush；
-5. 如果当前 PTE 已变化或不再 present，返回 `PteReplaceError::Changed`，不覆盖当前映射；
-6. 地址非法、物理地址非法或页表遍历异常返回 `PteReplaceError::PageTable`。
+1. The caller observes the current PTE with `query_entry()`.
+2. The caller prepares replacement resources, such as a new COW page, outside
+   the page table mutation.
+3. The caller invokes `replace_if_same()` to commit.
+4. If the current leaf PTE exactly matches `expected`, the operation replaces
+   the physical page and permissions and records a TLB invalidation.
+5. If the PTE has changed or is no longer present, it returns
+   `PteReplaceError::Changed` without overwriting the current mapping.
+6. Invalid virtual or physical addresses and other page table walk errors
+   return `PteReplaceError::PageTable`.
 
-这个接口只表达页表层的 compare/replace 语义，不决定 COW、匿名页或文件页的资源释放策略。
-调用者负责在 `Changed` 时丢弃已准备但未提交的资源，并根据 fault 语义选择 retry。
+This interface defines only the page table compare-and-replace contract.
+It does not choose resource release policies for COW, anonymous pages, or file
+pages. On `Changed`, the caller must discard prepared but uncommitted resources
+and decide whether to retry according to the fault semantics.
 
-## 并发模型
+## Concurrency Model
 
-- **`PageTable64` 本身不是 `Sync`**：内部无锁，多线程同时修改同一页表需要外部同步。
-- **`PageTableMut` 借用 `&mut PageTable64`**：Rust 借用规则保证同一时刻只有一个可变引用，天然互斥。
-- **SMP TLB 刷新**：`feature = "smp"` 时，`flush_tlb_all_cpus()` 通过 `TlbFlushIf` 接口
-  （`kiface` 实现）向远端 CPU 发送 IPI shootdown。AArch64 使用硬件
-  Inner Shareable TLBI 指令，无需软件 IPI。
-- **`PagingMetaData` 约束 `Send + Sync`**：确保元数据可跨线程访问。
-- **`PageTableEntry` 约束 `Send + Sync`**：PTE 可安全在线程间传递。
+- **`PageTable64` has no internal lock**: callers must externally synchronize
+  mutations to a shared page table. Its `Send` and `Sync` auto-traits depend on
+  its type parameters; they do not provide locking for page table updates.
+- **`PageTableMut` borrows `&mut PageTable64`**: Rust borrowing rules require
+  exclusive mutable access through that page table object.
+- **SMP TLB invalidation**: with `feature = "smp"`, `flush_tlb_all_cpus()` uses
+  the `TlbFlushIf` interface, implemented through `kiface`, to send shootdown
+  IPIs to remote CPUs. AArch64 uses hardware Inner Shareable TLBI instructions
+  without software IPIs.
+- **`PagingMetaData` requires `Send + Sync`** so metadata can cross thread
+  boundaries.
+- **`PageTableEntry` requires `Send + Sync`** so PTE values can cross thread
+  boundaries.
 
-## 设计决策
+## Design Decisions
 
-### 为什么用 trait 参数化而非泛型常量
+### Trait Parameters Instead of Const Generics
 
-`PageTable64<M, PTE, H>` 通过三个 trait 参数将架构差异、帧分配、TLB 刷新
-全部外提：
-- `M: PagingMetaData` — 页表级数、地址位宽、TLB 刷新
-- `PTE: PageTableEntry` — 页表项编解码
-- `H: PagingHandler` — 帧分配和物理地址转换
+`PageTable64<M, PTE, H>` delegates architecture details, frame allocation, and
+TLB invalidation through three trait parameters:
 
-这避免了在核心逻辑中使用 `cfg(target_arch)` 分支，使映射算法只写一次。
+- `M: PagingMetaData`: page table levels, address widths, and TLB invalidation.
+- `PTE: PageTableEntry`: PTE encoding and decoding.
+- `H: PagingHandler`: frame allocation and physical address translation.
 
-### 为什么 PageTableMut 采用延迟 TLB 刷新
+This keeps architecture-specific PTE formats out of the shared mapping
+algorithm and allows that algorithm to be implemented once.
 
-每次 map/unmap 立即刷新 TLB 在批量操作时开销巨大（尤其 SMP shootdown）。
-`PageTableMut` 将刷新请求暂存，在 `finish()` 或 `Drop` 时统一处理：
-- 少量地址：逐个刷新，精确高效
-- 大量地址：全量刷新，避免逐个开销
-- 阈值 16：经验值，平衡精确性和开销
+### Deferred TLB Invalidation in PageTableMut
 
-对释放旧物理页的路径，调用者应显式调用 `finish()` 并在得到 `TlbFlushReceipt` 后释放资源。
-`Drop` 仍保留为兜底机制，防止普通映射修改遗漏 TLB flush。
+Flushing after every map or unmap is expensive during batch operations,
+particularly when SMP shootdowns are needed.
+`PageTableMut` records invalidation requests and handles them in `finish()`
+or `Drop`:
 
-### 为什么提供 replace_if_same 而不是复用 remap
+- Small batches invalidate addresses individually.
+- Large batches use a full invalidation to avoid repeated per-address overhead.
+- The threshold of 16 balances targeted invalidation against batching overhead.
 
-`remap()` 是无条件覆盖：只要地址当前 present，就替换物理地址和权限。COW 写故障不能使用
-这种语义，因为 fault 线程在复制页面期间，其他路径可能已经修改同一 PTE。无条件覆盖会丢失
-并发更新，甚至把已解决的 fault 回退到旧状态。
+Paths that release old physical pages should explicitly call `finish()` and
+release resources after receiving `TlbFlushReceipt`.
+`Drop` remains a fallback for mapping changes that omit explicit finalization.
 
-`replace_if_same()` 将“观察 PTE”和“提交替换”绑定成显式 compare/replace contract：
-页表层只判断 PTE 是否仍等于 snapshot；内存对象层负责 prepare/commit/abort 资源。典型
-COW 提交流程可以写成：
+### Conditional Replacement Instead of Reusing remap
+
+`remap()` overwrites a present entry's physical address and permissions
+unconditionally. A COW write fault needs a conditional commit because another
+path may change the PTE while the fault handler copies the page.
+An unconditional overwrite could lose an intervening update or revert an
+already resolved fault to an older state.
+
+`replace_if_same()` connects PTE observation and replacement through an explicit
+compare-and-replace contract. The page table layer checks whether the PTE still
+matches the snapshot; the memory object layer owns resource preparation,
+commit, and abort. A typical COW commit sequence is:
 
 ```text
 query_entry()
@@ -227,38 +274,55 @@ query_entry()
        PageTable(error) => abort and propagate error
 ```
 
-### 为什么用宏实现页表遍历
+### Macros for Page Table Traversal
 
-`walk_page_table!` 和 `walk_page_table_create!` 需要同时支持不可变引用
-（`query`）和可变引用（`map/unmap`），且 3/4 级页表结构不同。
-用宏可以在编译期生成对应代码，避免运行时分支，同时复用遍历逻辑。
-Rust 泛型无法方便地表达"对 `&T` 和 `&mut T` 使用不同调用方式"的需求。
+`walk_page_table!` and `walk_page_table_create!` support both immutable access
+for queries and mutable access for mapping and unmapping, as well as three-
+and four-level layouts.
+Macros generate the appropriate access pattern at compile time and share the
+traversal logic. Rust generics do not conveniently express different call
+patterns for `&T` and `&mut T` in this implementation.
 
-### 为什么 TlbFlushIf 用 kiface 而非直接依赖
+### TlbFlushIf Through kiface
 
-`page_table` 被内存管理子系统依赖，而 IPI 子系统又依赖内存管理。
-直接依赖会形成循环。`kiface` 在链接时绑定 exactly-one 实现，
-编译期只依赖接口定义，打破循环依赖。
+The memory management subsystem depends on `page_table`, while the IPI
+subsystem depends on memory management. A direct dependency on the IPI
+subsystem would create a cycle.
+`kiface` binds exactly one implementation at link time while requiring only the
+interface definition at compile time, breaking that cycle.
 
-### 为什么 x86_64 PTE 使用 EncodedPtePhys 封装
+### EncodedPtePhys for x86_64 PTEs
 
-AMD SEV 需要在 PTE 物理地址中嵌入 C-bit（加密位），其位置由
-`kbuild_config::SEV_CBIT_POS` 决定。`EncodedPtePhys` 封装了 C-bit 的
-设置和清除逻辑，使 `PageTableEntry` 实现不需要直接处理 SEV 细节。
+AMD SEV requires an encryption C-bit in the physical address encoded in a PTE.
+Its position is selected by `kbuild_config::SEV_CBIT_POS`.
+`EncodedPtePhys` encapsulates setting and clearing that bit, keeping SEV details
+out of the `PageTableEntry` implementation.
 
-### 为什么 RISC-V 支持 Sv39 和 Sv48 两种模式
+### Both Sv39 and Sv48 for RISC-V
 
-Sv39（3 级，39 位虚拟地址）是 RISC-V 规范的必选模式，Sv48（4 级，48 位）
-是可选扩展。两种模式共享 `Rv64PageEntry`，仅 `PagingMetaData` 的级数和
-地址位宽不同。通过 `Sv39MetaData` / `Sv48MetaData` 类型参数区分，
-`PageTable64` 的通用遍历逻辑自动适配。
+Sv39 uses three page table levels and 39-bit virtual addresses; Sv48 uses four
+levels and 48-bit virtual addresses.
+Both modes share `Rv64PageEntry` and differ in the level count and address
+widths supplied by `PagingMetaData`.
+The `Sv39MetaData` / `Sv48MetaData` type parameters let the generic `PageTable64`
+traversal adapt to either layout.
 
-## Drop / 资源释放
+## Drop and Resource Release
 
-- **`PageTable64::drop`**：递归释放所有已分配的页表帧。
-  - `feature = "copy-from"` 时，跳过 `borrowed_entries` 标记的借入条目，
-    避免释放从源页表共享的子树。
-  - 释放顺序：先递归释放子表，再释放当前层帧。
-- **`PageTableMut::finish`**：刷新待处理 TLB 并返回 `TlbFlushReceipt`，供上层作为
-  flush-before-free 的显式排序点。
-- **`PageTableMut::drop`**：自动调用 `finish()` 刷新 TLB，作为遗漏显式 finalization 的兜底。
+- **`PageTable64::drop`** recursively frees owned page table frames.
+  - The caller must first stop hardware use of the page table.
+  - For an AArch64 user page table with a registered ASID provider, destruction
+    reads the associated ASID before freeing the first table frame, executes
+    `karch::dsb_ishst()`, and synchronously completes invalidation of the entire ASID,
+    including non-leaf translation caches. Per-VA leaf invalidation cannot
+    replace this reclamation boundary.
+  - The provider context must remain alive until page table destruction
+    completes. `MmSpace` declares `pgtbl` before `user_asid_context` to preserve
+    this lifetime through field destruction order.
+  - With `feature = "copy-from"`, entries marked in `borrowed_entries` are
+    skipped so that subtrees shared from the source page table are not freed.
+  - Child tables are freed recursively before their parent table frame.
+- **`PageTableMut::finish`** finalizes pending TLB invalidations and returns a
+  `TlbFlushReceipt`, providing an explicit flush-before-free ordering point.
+- **`PageTableMut::drop`** calls `finish()` automatically as a fallback when
+  explicit finalization is omitted.

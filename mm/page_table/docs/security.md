@@ -1,170 +1,315 @@
-# page_table — 安全与可靠性分析
+# page_table — Security and Reliability Analysis
 
-## 信任模型
+## Trust Model
 
-```
-调用者（memspace, kexec, ...）
+```text
+Callers (memspace, kexec, ...)
    │
    │ safe API: PageTable64::query/query_entry/modify,
    │           PageTableMut::map/unmap/remap/protect/replace_if_same/finish
    │
    v
-┌──────────────────────────────────────────────────┐
-│  page_table                                      │
-│                                                  │
-│  ┌── unsafe 边界 ──────────────────────────────┐ │
-│  │ table64.rs: alloc_table() — write_bytes     │ │
-│  │ table64.rs: table_of() — from_raw_parts     │ │
-│  │ table64.rs: table_of_mut() — from_raw_parts │ │
-│  └─────────────────────────────────────────────┘ │
-│                                                  │
-│  ┌── 间接 unsafe（通过 PagingHandler）─────────┐ │
-│  │ H::alloc_frame() / H::dealloc_frame()       │ │
-│  │ H::p2v() — 物理地址到虚拟地址转换            │ │
-│  └─────────────────────────────────────────────┘ │
-│                                                  │
-│  ┌── 间接 unsafe（通过 PagingMetaData）────────┐ │
-│  │ M::flush_tlb() — TLB 刷新                   │ │
-│  │ M::vaddr_is_valid() — 地址验证               │ │
-│  │ M::paddr_is_valid() — 地址验证               │ │
-│  └─────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ page_table                                               │
+│                                                          │
+│ ┌── Unsafe boundary ───────────────────────────────────┐ │
+│ │ table64.rs: alloc_table() — write_bytes              │ │
+│ │ table64.rs: table_of() — from_raw_parts              │ │
+│ │ table64.rs: table_of_mut() — from_raw_parts_mut      │ │
+│ └──────────────────────────────────────────────────────┘ │
+│                                                          │
+│ ┌── Indirect safety obligations: PagingHandler ────────┐ │
+│ │ H::alloc_frame() / H::dealloc_frame()                │ │
+│ │ H::p2v() — physical-to-virtual address translation   │ │
+│ └──────────────────────────────────────────────────────┘ │
+│                                                          │
+│ ┌── Indirect safety obligations: PagingMetaData ───────┐ │
+│ │ M::flush_tlb() — TLB invalidation                    │ │
+│ │ M::vaddr_is_valid() — virtual address validation     │ │
+│ │ M::paddr_is_valid() — physical address validation    │ │
+│ └──────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
 ```
 
-- **safe API 调用者**：信任模块正确维护 PTE 不变量和 TLB 一致性。
-- **PagingHandler 实现者**：需保证 `p2v()` 返回有效虚拟地址、`alloc_frame()` 返回对齐的物理帧。
-- **PagingMetaData 实现者**：需保证 `flush_tlb()` 真正刷新 TLB，`vaddr_is_valid()` / `paddr_is_valid()` 正确反映硬件地址约束。
+- **Safe API callers** trust the module to maintain PTE invariants and TLB
+  consistency.
+- **PagingHandler implementors** must ensure that `p2v()` returns a valid
+  virtual address and `alloc_frame()` returns an aligned physical frame.
+- **PagingMetaData implementors** must ensure that `flush_tlb()` invalidates
+  the required translations and that `vaddr_is_valid()` / `paddr_is_valid()`
+  reflect hardware address constraints.
 
-## unsafe 代码清单
+## Unsafe Code Inventory
 
-### 1. `alloc_table()`（`table64.rs`）
+### 1. `alloc_table()` (`table64.rs`)
 
 ```rust
 unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE_4K) };
 ```
 
-**不变量**：`ptr` 指向 `H::alloc_frame()` 返回的物理帧经 `H::p2v()` 转换后的虚拟地址，该帧已分配且对齐到 4K，长度为 `PAGE_SIZE_4K`。
+**Invariant**: `ptr` is the virtual address obtained by applying `H::p2v()` to
+the physical frame returned by `H::alloc_frame()`. The frame is allocated,
+aligned to 4 KiB, and `PAGE_SIZE_4K` bytes long.
 
-**为何安全**：`H::alloc_frame()` 保证返回有效的物理帧，`H::p2v()` 保证转换后的虚拟地址可写且唯一映射到该物理帧。
+**Safety argument**: `H::alloc_frame()` must return a valid, exclusively
+allocated physical frame. `H::p2v()` must provide a writable virtual mapping
+that uniquely corresponds to that frame.
 
-**调用者**：`PageTable64::try_new()`、`PageTableMut::next_table_mut_or_create()` — 均在帧分配成功后调用。
+**Callers**: `PageTable64::try_new()` and
+`PageTableMut::next_table_mut_or_create()` request a new table. The unsafe
+write occurs only after frame allocation succeeds.
 
-### 2. `table_of()`（`table64.rs`）
+### 2. `table_of()` (`table64.rs`)
 
 ```rust
 unsafe { core::slice::from_raw_parts(ptr, ENTRY_COUNT) }
 ```
 
-**不变量**：`paddr` 指向一个有效的 4K 对齐页表帧，`H::p2v(paddr)` 返回的虚拟地址映射该帧，帧内容为 `ENTRY_COUNT` 个 `PTE`。
+**Invariant**: `paddr` identifies a valid page table frame aligned to 4 KiB,
+`H::p2v(paddr)` maps that frame, and its contents are `ENTRY_COUNT` valid PTEs.
 
-**为何安全**：页表帧由 `alloc_table()` 分配并清零，大小恰好为 `ENTRY_COUNT * size_of::<PTE>()` = 512 × 8 = 4096 字节。PTE 类型均满足 `Copy`，无 drop 副作用。
+**Safety argument**: `alloc_table()` allocates and zeroes the frame. For the
+supported PTE types, its size is exactly `ENTRY_COUNT * size_of::<PTE>()`,
+or 512 × 8 = 4096 bytes. The PTE types implement `Copy` and have no destructor
+side effects. The frame must remain live throughout every access to the slice.
 
-**调用者**：`walk_page_table!` 宏（ref 模式）、`dealloc_tree()`、`next_table()` — 均在确认 PTE present 后调用。
+**Callers**: `walk_page_table!` in `ref` mode, `dealloc_tree()`, and `next_table()`.
+Root access relies on ownership of the allocated root frame. Descending into a
+subtable relies on the intermediate entry identifying a live table frame;
+`next_table()` rejects a zero physical address and huge-page entries.
 
-### 3. `table_of_mut()`（`table64.rs`）
+### 3. `table_of_mut()` (`table64.rs`)
 
 ```rust
 unsafe { core::slice::from_raw_parts_mut(ptr, ENTRY_COUNT) }
 ```
 
-**不变量**：同 `table_of()`，但要求调用者拥有对页表帧的独占写权限（通过 `&mut self` 借用链保证）。
+**Invariant**: The requirements for `table_of()` also apply, and the caller
+must have exclusive write access to the page table frame.
 
-**为何安全**：`PageTableMut` 持有 `&mut PageTable64`，Rust 借用规则保证无其他引用。物理帧布局同 `table_of()`。
+**Safety argument**: `PageTableMut` holds `&mut PageTable64`, providing exclusive
+access through that page table object. The frame layout is the same as for
+`table_of()`. Callers must also prevent conflicting accesses through any
+borrowed subtrees shared by `copy_from()`.
 
-**调用者**：`walk_page_table!` 宏（mut 模式）、`walk_page_table_create!` 宏、`next_table_mut_or_create()`、`copy_from()` — 均通过 `&mut self` 调用。
+**Callers**: `walk_page_table!` in `mut` mode, `walk_page_table_create!`,
+`next_table_mut_or_create()`, and `copy_from()`, all through mutable access.
 
-## 内存安全不变量
+### 4. AArch64 User Page Table Destruction (`table64.rs`)
 
-1. **PTE 物理地址有效性**：所有 present 的 PTE 中存储的物理地址必须指向已分配的帧，且该帧未被其他所有者释放。
-2. **页表帧生命周期**：`PageTable64` 拥有 `root_paddr` 及其递归分配的所有子表帧。`Drop` 时递归释放，不遗漏不重复。
-3. **TLB 一致性**：修改 PTE 后必须刷新 TLB，否则 CPU 可能使用过期的映射。`PageTableMut::finish()` 和 `Drop` 保证刷新。
-4. **p2v 单射性**：`H::p2v()` 必须是物理地址到虚拟地址的单射映射，否则 `table_of` / `table_of_mut` 创建的引用可能别名。
-5. **帧分配对齐**：`H::alloc_frame()` 必须返回 4K 对齐的物理地址，否则 PTE 编码和页表帧布局不正确。
-6. **地址有效性**：`map`/`remap` 的物理地址必须在 `PA_MAX_ADDR` 范围内，虚拟地址必须满足架构的规范地址形式。`query`/`protect`/`unmap` 的虚拟地址同理。违反此约束返回 `PtError::InvalidAddress`。
-7. **条件替换不覆盖变化状态**：`replace_if_same()` 只有在当前 leaf PTE 与 `PteSnapshot` 完全一致时才允许替换。若 PTE 已改变或不再 present，必须返回 `PteReplaceError::Changed`，不得覆盖当前映射。
-8. **snapshot raw bits 封装**：`PteSnapshot` 的 raw PTE bits 只能由 `page_table` 内部用于比较。外部调用者只能依赖物理地址、权限和页大小，不能解释架构 PTE 编码。
-9. **flush-before-free 显式边界**：释放从 PTE 中移除的物理页前，调用者必须显式调用 `PageTableMut::finish()`。`Drop` 是兜底刷新机制，不应用作释放旧页的隐式排序证明。
+`Drop` reads the current ASID through the registered provider, executes
+`dsb ishst` through the safe `karch::dsb_ishst()` primitive, and synchronously
+invalidates translations with
+`PagingMetaData::flush_tlb_process_asid(None, asid)` before returning table
+frames to the allocator.
 
-## 线程安全
+**Invariant**: The provider context remains valid throughout destruction and
+the callback performs read-only access. The caller has already stopped hardware
+use of the page table being destroyed. The barrier orders earlier PTE stores,
+and invalidating the entire ASID covers non-leaf translation caches.
+`MmSpace` declares `pgtbl` before `user_asid_context`, so field destruction drops
+the page table first and preserves the callback context until it is no longer
+needed.
 
-| 类型 | `Send` 条件 | `Sync` 条件 |
-|------|-------------|-------------|
-| `PageTable64<M, PTE, H>` | 当 `M, PTE, H: Send` 时自动 `Send` | 非 `Sync`（内部无锁，`root_paddr` 可变） |
-| `PageTableMut<M, PTE, H>` | 当 `PageTable64` 为 `Send` 时 `Send` | 非 `Sync`（持有 `&mut`） |
-| `PagingFlags` | 自动 `Send`（`Copy`） | 自动 `Sync`（`Copy`） |
-| `PageSize` | 自动 `Send`（`Copy`） | 自动 `Sync`（`Copy`） |
-| `PtError` | 自动 `Send`（`Copy`） | 自动 `Sync`（`Copy`） |
-| `X64PageEntry` 等 PTE | 自动 `Send`（`Copy` + `Send` 约束） | 自动 `Sync`（`Copy` + `Sync` 约束） |
+## Memory Safety Invariants
 
-## 威胁分析
+1. **Valid PTE physical addresses**: physical addresses in present PTEs must
+   identify valid backing frames that have not been released by another owner.
+2. **Page table frame lifetime**: `PageTable64` owns `root_paddr` and all subtable
+   frames it allocates recursively. The caller must stop hardware use before
+   `Drop`. An AArch64 user table with a registered ASID provider synchronously
+   invalidates that ASID's leaf and non-leaf translation caches before freeing
+   its first table frame, then releases frames recursively. The provider context
+   must outlive the entire destruction sequence.
+3. **TLB consistency**: PTE changes require TLB invalidation to prevent CPUs from
+   using stale mappings. `PageTableMut::finish()` and `Drop` finalize pending
+   invalidations.
+4. **Injective p2v mapping**: `H::p2v()` must map distinct physical addresses to
+   distinct virtual addresses; otherwise references created by `table_of` /
+   `table_of_mut` may alias.
+5. **Frame alignment**: `H::alloc_frame()` must return physical addresses aligned
+   to 4 KiB so that PTE encoding and page table frame layout remain valid.
+6. **Address validity**: physical addresses passed to `map`/`remap` must be within
+   `PA_MAX_ADDR`, and virtual addresses must have the architecture's canonical
+   form. The same virtual address requirement applies to `query`/`protect`/`unmap`.
+   Violations return `PtError::InvalidAddress`.
+7. **Conditional replacement preserves intervening changes**: `replace_if_same()`
+   may replace a present leaf PTE only when it exactly matches `PteSnapshot`.
+   If the PTE has changed or is no longer present, the operation must return
+   `PteReplaceError::Changed` without overwriting the current mapping.
+8. **Encapsulated snapshot bits**: only `page_table` interprets the raw PTE bits
+   in `PteSnapshot` for comparison. External callers depend on the physical
+   address, permissions, and page size, not architecture-specific PTE encoding.
+9. **Explicit flush-before-free boundary**: before releasing a physical page
+   removed from a PTE, callers must explicitly call `PageTableMut::finish()`.
+   `Drop` is a fallback and must not serve as an implicit proof that old pages
+   are released after invalidation.
+10. **Non-leaf translation caches**: per-VA leaf invalidation alone does not
+    retire cached table-walk descriptors before table frames are reused.
+    AArch64 user page table destruction with a registered ASID provider uses
+    `dsb ishst` and invalidation of the entire ASID to establish this reclamation
+    boundary. The caller must still stop hardware use of the address space.
 
-| 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
-|------|----------|----------|----------|----------|
-| T-01 | `PagingHandler::p2v()` 返回错误虚拟地址，导致 `table_of` 读写非法内存 | 高 | `p2v()` 实现有 bug 或物理地址未映射 | `PagingHandler` 实现者必须保证 `p2v()` 的正确性；内核启动阶段验证直接映射 |
-| T-02 | `PagingHandler::alloc_frame()` 返回已使用的帧，导致页表帧别名 | 高 | 帧分配器 bug（双重分配） | 帧分配器需保证唯一性；`alloc_table()` 清零帧内容可部分检测（若原帧非零） |
-| T-03 | 修改 PTE 后未刷新 TLB，CPU 使用过期映射 | 高 | 绕过 `PageTableMut` 直接修改内存 | 所有修改通过 `PageTableMut` 进行，`Drop` 自动刷新；禁止直接操作 PTE 内存 |
-| T-04 | `PageTable64` 在多线程间共享且无外部同步，导致数据竞争 | 高 | `PageTable64` 非 `Sync`，但通过 `unsafe` 强制共享 | 类型系统阻止 `&PageTable64` 跨线程；调用者需使用 `Mutex` 等外部同步 |
-| T-05 | `copy_from` 后源页表被 drop，目标页表中的借入条目指向已释放帧 | 高 | `feature = "copy-from"` 时源页表先于目标页表 drop | `borrowed_entries` bitmap 标记借入条目，`Drop` 时跳过释放；调用者必须保证源页表生命周期覆盖目标 |
-| T-06 | `map_region` 部分映射失败，已映射的页面未回滚 | 中 | `map_region` 中间某页返回 `AlreadyMapped` 或 `NoMemory` | 调用者需自行处理部分映射状态；建议先 `unmap_region` 再 `map_region` |
-| T-07 | SEV C-bit 位置配置错误，导致加密内存明文访问 | 高 | `kbuild_config::SEV_CBIT_POS` 与实际硬件不一致 | C-bit 位置由构建配置决定，需与硬件匹配；`EncodedPtePhys` 封装了所有 C-bit 操作 |
-| T-08 | 无效虚拟地址传入 map/query 等操作，导致越权映射或非法内存访问 | 高 | 调用者传入非规范形式地址或超出地址空间范围的地址 | `map`/`remap`/`query`/`protect`/`unmap` 入口处检查 `vaddr_is_valid()` 和 `paddr_is_valid()`，违反则返回 `InvalidAddress` |
-| T-09 | COW 提交期间 PTE 被其他路径修改后仍被覆盖 | 高 | fault 路径复制页面后使用无条件 `remap()` 提交 | 使用 `query_entry()` + `replace_if_same()`；Changed 时不写 PTE，由调用者 abort prepared page 并 retry |
-| T-10 | PTE 已清除但旧物理页在 TLB flush 前被释放并复用 | 高 | unmap/COW replace 后立即释放对象页，依赖 `PageTableMut::drop` 稍后刷新 | 释放前显式调用 `PageTableMut::finish()`，以 `TlbFlushReceipt` 作为资源释放排序边界 |
+## Thread Safety
 
-## 故障模式与影响分析（FMEA）
+| Type | `Send` condition | `Sync` condition |
+|------|------------------|------------------|
+| `PageTable64<M, PTE, H>` | Automatically `Send` when `M, PTE, H: Send`. | Automatically `Sync` when `M, PTE, H: Sync`; there is no internal lock. |
+| `PageTableMut<M, PTE, H>` | Requires `PageTable64: Send` and `M::VirtAddr: Send`. | Requires `PageTable64: Sync` and `M::VirtAddr: Sync`; mutation still requires exclusive access. |
+| `PagingFlags` | Automatically `Send` for its scalar representation. | Automatically `Sync` for its scalar representation. |
+| `PageSize` | Automatically `Send` for its fieldless enum representation. | Automatically `Sync` for its fieldless enum representation. |
+| `PtError` | Automatically `Send` for its fieldless enum representation. | Automatically `Sync` for its fieldless enum representation. |
+| PTE types such as `X64PageEntry` | Required by the `PageTableEntry: Send` bound. | Required by the `PageTableEntry: Sync` bound. |
 
-| 编号 | 故障模式 | 故障原因 | 局部影响 | 系统影响 | 严重度 | 应对措施 |
-|------|----------|----------|----------|----------|--------|----------|
-| F-01 | `alloc_table()` 帧分配失败 | 物理内存耗尽 | 无法创建新页表或映射 | 新进程/地址空间创建失败 | 2 | 返回 `PtError::NoMemory`，调用者可回收内存后重试 |
-| F-02 | `unmap` 对未映射地址调用 | 调用者逻辑错误 | 返回 `NotMapped` | 无影响 | 4 | 返回错误码，调用者应检查 |
-| F-03 | `map` 对已映射地址调用 | 调用者重复映射 | 返回 `AlreadyMapped` | 无影响 | 4 | 返回错误码，防止静默覆盖 |
-| F-04 | `dealloc_tree` 递归深度过大 | 页表层级深且条目多 | 栈溢出 | 系统崩溃 | 1 | 4 级页表最大递归深度为 4，每级 512 条目，实际递归深度可控 |
-| F-05 | TLB shootdown IPI 丢失 | SMP 模式下远端 CPU 未响应 | 远端 CPU 使用过期映射 | 内存一致性违反 | 1 | IPI 机制需保证可靠投递；AArch64 使用硬件 TLBI 无此问题 |
-| F-06 | `protect_region` 跳过未映射页 | 区域中部分页未映射 | 权限修改不完整 | 安全策略未完全生效 | 2 | 未映射页静默跳过（按 4K 推进），调用者应确保区域完整映射 |
-| F-07 | `remap` 修改正在使用的页表项 | 并发访问同一地址空间 | TLB 不一致 | 数据损坏 | 1 | 调用者需通过外部同步保证独占访问 |
-| F-08 | 无效地址传入 map/query | 调用者未校验地址范围 | 返回 `InvalidAddress` | 操作被拒绝 | 4 | 入口处检查 `vaddr_is_valid`/`paddr_is_valid`，返回错误码 |
-| F-09 | `unmap` 对非 present 条目调用 `clear()` | 逻辑错误：先 clear 再检查 present | 非法修改 PTE 保留位，破坏架构特定状态 | 硬件行为未定义 | 2 | 修复为先检查 `is_present()` 再 `clear()`；非 present 条目直接返回 `NotMapped` |
-| F-10 | `map_region` 中途 panic | `phys_getter` 闭包 panic | 部分映射已生效，TLB 未刷新 | TLB 不一致 | 2 | `PageTableMut::Drop` 保证刷新已记录的地址；调用者应确保 `phys_getter` 不 panic |
-| F-11 | 中断上下文中调用 map/unmap | 调用者在中断处理程序中操作页表 | 可能死锁（若持锁）或 TLB 刷新不完整 | 系统挂起 | 1 | 调用者需确保不在中断上下文中使用 `PageTableMut`；文档标注调用约束 |
-| F-12 | `replace_if_same` 返回 Changed 后调用者泄漏已准备页面 | 调用者未执行 abort/cleanup | 单页或对象引用泄漏 | 长期内存泄漏 | 2 | `page_table` 只保证不覆盖当前 PTE；COW/anon/file 对象层必须在 Changed 分支释放 prepared resource |
-| F-13 | 调用者忽略显式 flush finalization 并提前释放 unmapped frame | 资源释放顺序错误 | stale TLB 可能继续访问已复用 frame | 隔离破坏或数据损坏 | 1 | 释放路径必须在 `finish()` 返回后执行；审计所有 `dealloc_frame` 与 object-page release 调用点 |
+These auto-traits do not serialize page table mutations or accesses through
+shared physical subtrees. Callers must provide the necessary synchronization.
 
-## 故障管理
+## Threat Analysis
 
-- **错误码**：`PtError` 枚举覆盖 6 种故障场景（`NoMemory`、`NotAligned`、`NotMapped`、`AlreadyMapped`、`MappedToHugePage`、`InvalidAddress`），`feature = "kerrno"` 时可转换为 `KError`。条件替换额外使用 `PteReplaceError` 区分页表错误和 PTE 已变化的 retry-class 状态。
-- **TLB finalization**：`PageTableMut::finish()` 返回 `TlbFlushReceipt`，表示调用点已经完成一次 flush boundary。它不是错误码，也不承诺具体架构 flush 方式。
-- **Panic 策略**：本模块无 panic 路径。`walk_page_table!` 中的 `unreachable!` 仅在 `LEVELS` 不为 3 或 4 时触发，而所有架构实现均满足此约束。
-- **故障恢复**：所有错误通过 `PtResult` 返回，调用者可决定重试或降级。
+Status describes the controls present in this revision:
 
-## 隐私分析
+- **Mitigated**: this crate implements the stated control for callers that obey
+  its API and provider contracts.
+- **Partial**: this crate implements a control, but the named caller obligation
+  remains outside its enforcement.
+- **Delegated**: the named external component owns the control; this crate
+  cannot independently establish the required invariant.
+- **Accepted limitation**: the current API deliberately leaves the stated
+  behavior to its caller. This does not mean the resulting misuse is safe.
 
-本模块不直接处理用户数据，但管理虚拟地址映射，直接影响用户进程的内存隔离。
-需确保：
-- 不同地址空间的页表相互独立
-- 用户态页表不包含内核映射（或通过 KPTI 隔离）
-- SEV C-bit 正确设置，防止加密内存泄露
-- 无效地址无法通过 map 建立越权映射
+| ID | Threat | Impact | Trigger | Mitigation and verification | Status |
+|----|--------|--------|---------|-----------------------------|--------|
+| T-01 | `PagingHandler::p2v()` returns an incorrect virtual address, causing invalid memory access through table slices. | High | A faulty conversion or a missing direct-map mapping. | [`PagingHandlerImpl::p2v`](../../../arch/khal/src/paging.rs) delegates through `khal::mem::p2v` to [`kaddr_layout::p2v`](../../kaddr_layout/src/lib.rs), which uses checked addition of `PAGE_OFFSET`; `v2p` rejects addresses outside the linear-map and kernel-image windows. The provider verification conditions below check the remaining mapping obligation. No page-table-local check proves that the returned virtual page is mapped. | Delegated to `khal`, `kaddr_layout`, and the direct-map owner. |
+| T-02 | `PagingHandler::alloc_frame()` returns a live frame again, causing page table frames to alias. | High | Duplicate allocation by the frame allocator. | [`PagingHandlerImpl::alloc_frame`](../../../arch/khal/src/paging.rs) asserts `is_page_allocator_ready()` and calls `alloc_pages(1, PAGE_SIZE_4K, UsageKind::PageTable)`. [`GlobalAllocator::alloc_pages`](../../kalloc/src/lib.rs) protects PCP access with `IrqSave` and global allocation with `palloc.lock()`. Verify live-frame uniqueness and alignment as specified below. `alloc_table()` zeroes frames but does not detect duplicates. | Delegated to `kalloc` / `alloc-engine`; uniqueness is not rechecked here. |
+| T-03 | A PTE changes without TLB invalidation, leaving stale mappings in use. | High | Direct memory writes bypass `PageTableMut`. | `map`, `unmap`, `remap`, `protect`, and `replace_if_same` record invalidations; `PageTableMut::drop` calls `finish()`. `finish_reports_explicit_flush_boundary` checks pending-state finalization. Direct PTE memory writes remain outside this API contract. | Mitigated for the listed mutation APIs. |
+| T-04 | Unsynchronized mutations or aliases of a shared page table cause a data race. | High | Callers bypass exclusive access or mutate shared physical subtrees without coordination. | `PageTable64::modify(&mut self)` requires exclusive Rust access to one table object. The caller must also lock accesses through distinct objects sharing `copy_from()` subtrees; the borrow checker cannot detect those physical aliases. | Partial; shared-subtree synchronization belongs to callers. |
+| T-05 | Dropping a `copy_from` source leaves borrowed entries pointing to freed frames. | High | The source is dropped before its destination. | `copy_from()` marks `borrowed_entries`, and `PageTable64::drop` skips those subtrees. This prevents double release by the borrower but does not keep the source alive. The source-outlives-destination contract must be checked at each call site. | Partial; source lifetime is caller-owned and not type-checked. |
+| T-06 | `map_region` leaves partial mappings after failure. | Medium | An intermediate mapping returns `AlreadyMapped` or `NoMemory`. | `map_region()` returns the first `map()` error without rollback. Reproduce by pre-mapping a later page, mapping a region spanning it, then querying the successful prefix. Callers requiring atomic behavior must clean up that prefix without removing pre-existing mappings. | Accepted limitation; rollback and recovery belong to the caller. |
+| T-07 | An incorrect SEV C-bit position applies the wrong encryption attribute. | High | `kbuild_config::SEV_CBIT_POS` differs from the hardware setting. | `EncodedPtePhys` centralizes C-bit encoding and decoding in `arch/x86_64.rs`; validate the build's `SEV_CBIT_POS` against the deployment hardware. The wrapper does not discover or validate that hardware setting. | Delegated to build and platform configuration. |
+| T-08 | Invalid addresses reach mapping or query operations. | High | A noncanonical virtual address or an unsupported physical address. | Entry points call `vaddr_is_valid()` and, for physical mapping inputs, `paddr_is_valid()`, returning `InvalidAddress` on failure. `test_paging_metadata_bounds` checks physical bounds. These checks establish address format/range, not mapping ownership or the validity of `H::p2v()`. | Mitigated for address range errors; metadata correctness remains a provider contract. |
+| T-09 | A COW commit overwrites an intervening PTE update. | High | The fault handler uses unconditional `remap()` after preparing a page. | `replace_if_same()` compares the snapshot and returns `Changed` without writing on mismatch. `replace_if_same_reports_changed_without_overwrite` verifies the competing mapping survives. The caller must abort its prepared resource on that result. | Partial; PTE preservation is implemented, resource abort is caller-owned. |
+| T-10 | An old data page is reused before invalidating its former translation. | High | An unmap or COW replacement frees a page before a deferred flush. | `PageTableMut::finish()` returns `TlbFlushReceipt`; `finish_reports_explicit_flush_boundary` checks finalization. Audit data-page release sites for a preceding explicit `finish()` after the PTE change. The receipt does not prevent a caller from releasing early. | Partial; release ordering is enforced by callers. |
+| T-11 | A cached intermediate descriptor reaches a reused page table frame. | High | An AArch64 user page table is destroyed before retiring its ASID's walk-cache entries. | With a registered provider, `PageTable64::drop` executes `dsb ishst` and `flush_tlb_process_asid(None, asid)` before the first `dealloc_frame()`. `user_drop_invalidates_latest_asid_before_freeing_frames` verifies full-ASID scope, the current ASID, and flush-before-free ordering. | Partial; hardware quiescence and provider lifetime remain address-space-owner obligations. |
 
-## 已知限制
+For T-01, provider integration validation must check that each returned table
+frame has a full writable 4 KiB mapping within the live linear-map RAM region,
+that `v2p(p2v(pa)) == pa`, and that distinct live frames have distinct virtual
+addresses. Round-trip arithmetic alone cannot establish that a PTE exists.
+`vaddr_is_valid()` / `paddr_is_valid()` validate mapping inputs; neither checks
+the address returned by `H::p2v()` or establishes the direct map.
 
-1. `PageTable64` 非 `Sync`，多线程共享需外部加锁，当前无内置锁支持。
-2. `map_region` 部分失败时不回滚已映射页面，调用者需自行处理。
-3. `copy_from` 功能要求源页表生命周期覆盖目标页表，无编译期检查。
-4. `walk_page_table!` 宏仅支持 3 级和 4 级页表，5 级页表（如 x86_64 LA57）需扩展。
-5. `dealloc_tree` 使用递归释放，极端情况下可能导致栈溢出（实际 4 级深度可控）。
-6. `vaddr_is_valid` / `paddr_is_valid` 的正确性依赖 `PagingMetaData` 实现者，无编译期保证。
+For T-02, an allocator validation must hold multiple frames live simultaneously,
+check `pa % PAGE_SIZE_4K == 0` and pairwise-distinct physical addresses, then
+release each frame exactly once and exercise reuse. Existing
+[`alloc-engine` tests](../../alloc-engine/src/buddy_alloc.rs), including
+`test_alloc_one_page` and `test_alloc_exhaust_then_free`, check alignment,
+exhaustion, and returned capacity; they are not an end-to-end proof of the
+production handler's uniqueness under concurrent PCP allocation. These are
+external validation obligations, not new runtime checks in `page_table`.
 
-## 审计清单
+### AArch64 Teardown Regression Coverage
 
-修改本模块时需验证：
+The `table64.rs::tests::aarch64_drop` tests run the actual AArch64 destructor
+with a recording `PagingMetaData` implementation and frame-release handler:
 
-- [ ] 每个 `unsafe` 块均有 `SAFETY:` 注释
-- [ ] 新增 PTE 修改路径后 TLB 刷新未被遗漏
-- [ ] 新增条件替换路径后，Changed 分支不会覆盖当前 PTE
-- [ ] 新增释放旧物理页路径后，释放发生在显式 `PageTableMut::finish()` 之后
-- [ ] `PagingHandler` 实现满足 `p2v` 单射性和帧分配对齐要求
-- [ ] `Drop` 实现正确处理所有状态（含 `copy-from` 借入条目）
-- [ ] 新增 `PagingFlags` 变体后所有架构的 `From` 转换已更新
-- [ ] `walk_page_table!` 宏变更后 3 级和 4 级路径均正确
-- [ ] SMP TLB shootdown 路径在 `feature = "smp"` 下已测试
-- [ ] `map`/`remap` 入口的 `paddr_is_valid` / `vaddr_is_valid` 检查未被绕过
+- `user_drop_invalidates_latest_asid_before_freeing_frames` maps a page, completes
+  its leaf invalidation, changes the provider's ASID, and then drops the table.
+  It checks exactly one full-ASID invalidation using the new ASID, no per-VA or
+  unscoped invalidation during teardown, and no frame release before that call.
+- `user_drop_without_provider_skips_asid_flush` checks the unregistered path.
+- `kernel_drop_skips_user_asid_flush` checks the kernel-table exclusion even
+  when a provider is installed. Both exclusion cases still release all table
+  frames.
+
+These tests use serial execution and a scoped probe reset to isolate their
+recordings. The page tables are never installed in hardware. The destructor's
+real `dsb ishst` executes, but the metadata hook records rather than issuing
+TLBI; the assertions prove call scope and release order, not microarchitectural
+cache eviction or cross-CPU visibility. Barrier presence/order and the real
+`karch::flush_tlb_asid()` sequence still require architecture code review.
+
+Run the tests on AArch64 through the project configuration/build flow:
+
+```bash
+cp platforms/kplat-aarch64/qemu_defconfig .config
+make defconfig
+make unittest UNITTEST_CRATE=page_table
+```
+
+## Failure Mode and Effects Analysis (FMEA)
+
+| ID | Failure mode | Cause | Local effect | System effect | Severity | Mitigation |
+|----|--------------|-------|--------------|---------------|----------|------------|
+| F-01 | `alloc_table()` cannot allocate a frame. | Physical memory exhaustion. | A new page table or mapping cannot be created. | Process or address space creation fails. | 2 | Return `PtError::NoMemory`; callers may reclaim memory and retry. |
+| F-02 | `unmap` targets an unmapped address. | Caller logic error. | Returns `NotMapped`. | No mapping change. | 4 | Return an error for the caller to handle. |
+| F-03 | `map` targets an already mapped address. | Duplicate mapping request. | Returns `AlreadyMapped`. | No existing mapping is overwritten. | 4 | Return an error instead of silently overwriting the entry. |
+| F-04 | Excessive recursion in `dealloc_tree`. | Unsupported or excessive page table depth. | Stack overflow. | Kernel crash. | 1 | Supported page tables have at most four levels. Each level has 512 entries, but sibling entries do not increase recursion depth. |
+| F-05 | A TLB shootdown IPI is lost. | A remote CPU does not respond in SMP mode. | The remote CPU retains stale mappings. | Memory consistency is violated. | 1 | The IPI implementation must deliver shootdowns reliably; AArch64 uses hardware TLBI broadcast without software IPIs. |
+| F-06 | `protect_region` skips unmapped pages. | Holes in the requested region. | Permissions change only on mapped pages. | A caller's assumption of complete region coverage may be invalid. | 2 | Unmapped pages are silently skipped in 4 KiB steps; callers requiring full coverage must ensure the region is mapped. |
+| F-07 | `remap` changes an entry while it is in use. | Uncoordinated access to the same address space. | Stale translations may remain in use before finalization. | Data corruption. | 1 | Callers must synchronize updates and complete the required TLB invalidation before reusing old resources. |
+| F-08 | An invalid address is passed to mapping or query operations. | The caller omits address range validation. | Returns `InvalidAddress`. | The operation is rejected. | 4 | Validate with `vaddr_is_valid`/`paddr_is_valid` at operation entry and return an error. |
+| F-09 | `unmap` clears a non-present entry. | Clearing before checking presence. | Architecture-specific state or reserved bits may be modified incorrectly. | Undefined hardware behavior. | 2 | Check `is_present()` before `clear()`; return `NotMapped` for a non-present entry. |
+| F-10 | `map_region` panics partway through. | The `phys_getter` closure panics. | Some mappings are installed with invalidations still pending. | TLB consistency depends on cleanup running. | 2 | `PageTableMut::Drop` finalizes recorded invalidations if destruction runs; callers must keep `phys_getter` free of panics and cannot rely on unwinding in aborting configurations. |
+| F-11 | Mapping or unmapping runs in interrupt context. | An interrupt handler invokes page table operations. | Locks or shootdown completion may deadlock. | System hang. | 1 | Callers must respect allocator, lock, and TLB completion context requirements; do not use `PageTableMut` in interrupt context without establishing that these requirements are met. |
+| F-12 | Prepared pages leak after `replace_if_same` returns `Changed`. | The caller omits abort or cleanup. | A page or object reference leaks. | Persistent memory leakage. | 2 | `page_table` only preserves the current PTE; the COW, anonymous-page, or file-page owner must release prepared resources on `Changed`. |
+| F-13 | An unmapped frame is freed before explicit flush finalization. | Incorrect resource release order. | A stale TLB entry may still access the reused frame. | Isolation failure or data corruption. | 1 | Release only after `finish()` returns; audit `dealloc_frame` and object-page release call sites. |
+
+## Failure Handling
+
+- **Error codes**: `PtError` covers six conditions: `NoMemory`, `NotAligned`,
+  `NotMapped`, `AlreadyMapped`, `MappedToHugePage`, and `InvalidAddress`.
+  With `feature = "kerrno"`, these convert to `KError`.
+  Conditional replacement uses `PteReplaceError` to distinguish page table
+  errors from an intervening PTE change that may require a retry.
+- **TLB finalization**: `PageTableMut::finish()` returns `TlbFlushReceipt` to mark
+  a completed flush boundary. The receipt is not an error code and does not
+  specify the architecture's invalidation mechanism.
+- **Panic policy**: ordinary operation failures use typed errors.
+  Traversal macros and `copy_from()` contain `unreachable!()` branches for
+  unsupported `LEVELS` values; all provided architectures use three or four
+  levels. Caller callbacks and violated preconditions must not be assumed to
+  be free of panics.
+- **Recovery**: page table operation errors are returned through `PtResult`,
+  while conditional replacement uses `Result<_, PteReplaceError>`.
+  Callers choose whether to retry or fall back.
+
+## Privacy Analysis
+
+The module does not process user data directly, but virtual address mappings
+determine memory isolation between user processes. Higher layers must ensure:
+
+- Page tables for distinct address spaces preserve the intended isolation.
+- Kernel mappings are inaccessible to user mode, with page table isolation
+  such as KPTI where required.
+- SEV C-bits are configured correctly to protect encrypted memory.
+- Invalid addresses cannot create unintended mappings through `map`.
+
+## Known Limitations
+
+1. `PageTable64` has no internal lock. Callers must synchronize mutations to
+   shared page tables independently of their `Send`/`Sync` auto-traits.
+2. `map_region` does not roll back earlier mappings after a partial failure;
+   callers must handle cleanup.
+3. `copy_from` requires the source page table to outlive the destination.
+   The compiler does not enforce this lifetime relationship.
+4. `walk_page_table!` supports only three and four levels. Five-level layouts,
+   such as x86_64 LA57, require extensions.
+5. `dealloc_tree` frees tables recursively. Stack usage depends on the number
+   of levels, which is bounded by four for the supported layouts.
+6. Correctness of `vaddr_is_valid` / `paddr_is_valid` depends on the
+   `PagingMetaData` implementation and is not checked at compile time.
+
+## Audit Checklist
+
+When modifying this module, verify that:
+
+- [ ] Every `unsafe` block has a `SAFETY:` comment.
+- [ ] New PTE mutation paths record the required TLB invalidations.
+- [ ] Conditional replacement does not overwrite the current PTE on `Changed`.
+- [ ] Old physical pages are released after an explicit `PageTableMut::finish()`.
+- [ ] `PagingHandler` implementations provide injective `p2v` mappings and aligned frame allocation.
+- [ ] `Drop` handles all ownership states, including entries borrowed through `copy-from`.
+- [ ] New `PagingFlags` variants are reflected in every architecture's `From` conversions.
+- [ ] Changes to `walk_page_table!` preserve both three-level and four-level traversal.
+- [ ] SMP TLB shootdown paths are tested with `feature = "smp"`.
+- [ ] `map`/`remap` cannot bypass `paddr_is_valid` / `vaddr_is_valid` checks.
