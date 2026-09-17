@@ -264,7 +264,7 @@ pub fn probe_pci_device<H: VirtIoHal, C: ConfigurationAccess>(
     let msix = None;
 
     let transport = PciTransport::new_with_msix::<H, C>(root, bdf, msix).ok()?;
-    if dev_kind == DeviceKind::Vsock {
+    if matches!(dev_kind, DeviceKind::Vsock | DeviceKind::Input) {
         let (_, command) = root.get_status_command(bdf);
         root.set_command(bdf, command | Command::INTERRUPT_DISABLE);
     }
