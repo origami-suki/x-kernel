@@ -41,6 +41,12 @@ pub struct FutexWakeOp {
 
 impl FutexWakeOp {
     /// Decodes Linux's `FUTEX_OP()` bit layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` (`InvalidInput`) when the shift form is used with an
+    /// operation argument outside `0..=31`, or `ENOSYS` (`Unsupported`) when
+    /// the operation or comparison opcode is not one of the defined values.
     pub fn decode(encoded: u32) -> KResult<Self> {
         let operation_raw = (encoded >> 28) & 0x7;
         let comparison_raw = (encoded >> 24) & 0xf;

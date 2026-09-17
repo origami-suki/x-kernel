@@ -1,52 +1,53 @@
-# fs_context — 设计文档
+# fs_context design
 
-## 定位
+## Purpose and background
 
-`fs_context::FsStruct` 对应 Linux `struct fs_struct`，保存任务路径解析所需的 root、pwd、umask
-和 exec transition 状态。它是进程的文件系统视图；`kprocess::ProcessRuntime` 负责持有、
-共享或复制其 `Arc<Mutex<FsStruct>>`。
+`FsStruct` owns process filesystem state: root, working directory, umask, and an
+exec-transition flag. `kprocess::ProcessRuntime` owns or shares its
+`Arc<Mutex<FsStruct>>`. This is distinct from `kvfs::FsContext`, which describes
+a filesystem creation/reconfiguration transaction. Path lookup, access policy,
+and mount ownership belong to KVFS and POSIX callers.
 
-它与 KVFS `FsContext` 不同：`FsStruct` 是进程生命周期状态；`FsContext` 是一次文件系统
-创建或重配置事务。
+## Scope and architecture
 
-## 结构与所有权
+All implementation is in `src/lib.rs`. The initial object is published lazily
+through `INIT_FS`; `init_fs()` clones its handle. `copy_init_fs_struct()` makes a
+process-private copy. `FsStruct` owns `Option<Path>` root/pwd values, a `u32`
+umask, and a boolean `in_exec`. `Path` references keep mount/dentry objects alive.
 
-```text
-ProcessRuntime -- Arc<Mutex<fs_context::FsStruct>>
-                              |
-                              +-- root: kvfs::Path
-                              +-- pwd: kvfs::Path
-                              +-- umask
-                              `-- in_exec
+## Execution context and concurrency
 
-mount transaction -----------> kvfs::FsContext
-```
+Use task context with allocator and sleepable mutex support initialized. Initial
+state can be created before mounting; path access requires a root to be installed.
+The crate does not require a current task, CPU-local state, or device mappings.
+The shared object requires the caller's outer mutex; direct `&mut FsStruct`
+operations require exclusive access instead. Updates can drop VFS references and
+are unsuitable for interrupt context or incompatible spinlock critical sections.
+Take `root_and_pwd()` snapshots under the lock and release it before path I/O.
 
-`root` 和 `pwd` 对应 Linux 的同名字段。Rust 的 `Option<Path>` 只表达 Linux 静态
-`init_fs` 在首个 mount tree 安装前零初始化这两个 `struct path` 的状态；boot 通过一次
-`attach_root` 同时安装二者，不引入额外的路径环境对象。
+## State and algorithms
 
-crate 提供进程生命周期的 `FsStruct`；KVFS 的 `FsContext` 是一次 mount transaction，
-两者职责不同。
+`for_init_task` starts with both paths absent, umask `0o022`, and `in_exec=false`.
+`attach_root` validates a directory and installs it as both root and pwd. A caller
+must do this before calling `root`/`pwd`, which panic on absent paths.
 
-## 调用约束
+`from_root_and_pwd` and paired replacement validate both paths before mutation.
+They do not prove that pwd is below root or in the same namespace. `set_root`
+only initializes pwd if absent; `set_pwd` rejects an absent root. `new` panics
+on a non-directory root instead of returning the constructor error.
 
-本 crate 用于普通任务和 early-boot VFS 上下文。访问方必须持有外层 mutex；不得在中断
-上下文或持有不兼容自旋锁时进入可能释放 `Path` 的更新操作。
+- Fork without `CLONE_FS` uses `clone_for_process`, sharing `Path` references but
+  clearing `in_exec`. Sharing the `Arc<Mutex<_>>` implements `CLONE_FS`.
+- `snapshot` and `clone_with_pwd` retain `in_exec`, unlike `clone_for_process`.
+- `replace_umask` keeps only `0o777` bits and returns the previous mask.
+- `set_in_exec` only records a flag; callers implement the exec protocol.
+- Namespace cloning may retarget a private context with `replace_root_and_pwd`.
 
-## 生命周期算法
+## Decisions and resource lifecycle
 
-- `init_fs()` 返回 init task 共享的静态对象；boot 安装首个 root 时调用 `attach_root`。
-- 不带 `CLONE_FS` 的 clone 使用 `clone_for_process` 复制 root/pwd/umask，并清除 `in_exec`。
-- 带 `CLONE_FS` 的线程或进程共享同一个 `Arc<Mutex<FsStruct>>`。
-- chdir/chroot/mount-namespace retarget 先验证目录，再在锁内替换对应 `Path`。
-- mount source lookup 在短临界区取得 `root_and_pwd()` 快照，随后释放锁再执行路径 I/O。
-
-## 并发与设计决策
-
-外层 `Mutex` 承担 Linux `fs_struct::seq` 和共享更新串行化的职责；`Path` 的引用计数承担
-`path_get/path_put` 生命周期。crate 位于 `process/`，因为 `CLONE_FS`、fork、exec 和 exit
-决定它的共享与生命周期；它依赖 KVFS 的 `Path`，但不属于任何 filesystem instance。
-
-独立 crate 避免 `kprocess` 与 KVFS 之间形成反向依赖，同时让 namespace、exec 和 POSIX
-路径代码共享同一个语义对象。
+A separate crate lets namespace and process code share one filesystem-state
+owner without placing process lifecycle in KVFS. `Option` represents genuine
+pre-mount initialization, not a user-visible path-resolution error. There is no
+custom `Drop`: replacement and final context release drop `Path` references.
+The final `Arc` release destroys a private context; the lazy initial context is
+retained globally. Authorization and namespace compatibility remain caller duties.

@@ -2,7 +2,25 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Shared kernel identity number-space allocation.
+//! Shared kernel PID/TID number allocation and namespace projections.
+//!
+//! Use [`PidHandle::allocate_in`] for a namespace or
+//! [`allocate_root_pid_handle`] for the global root. Allocation does not publish
+//! or schedule a task, and dropping a handle does not recycle its numbers.
+//!
+//! # Example
+//!
+//! ```
+//! extern crate alloc;
+//! use alloc::sync::Arc;
+//!
+//! use kidentity::{PidHandle, PidNamespace};
+//! let root = Arc::new(PidNamespace::new_root());
+//! let child = PidNamespace::new_child(&root);
+//! let handle = PidHandle::allocate_in(&child).unwrap();
+//! assert_eq!(handle.nr_in(&child), Some(1));
+//! assert_eq!(handle.nr_in(&root), Some(handle.root_nr()));
+//! ```
 
 #![cfg_attr(not(test), no_std)]
 
@@ -92,6 +110,11 @@ pub struct PidHandle {
 
 impl PidHandle {
     /// Allocates a new handle visible in `active_ns` and all its ancestors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::WouldBlock` if a namespace counter cannot increment.
+    /// Numbers already consumed in other namespaces are not rolled back.
     pub fn allocate_in(active_ns: &Arc<PidNamespace>) -> KResult<Arc<Self>> {
         let mut chain = Vec::new();
         let mut cursor = Some(active_ns.clone());
@@ -112,6 +135,9 @@ impl PidHandle {
     }
 
     /// Creates a root-only handle with a fixed number.
+    ///
+    /// This does not reserve the number in the root allocator or check uniqueness.
+    /// The caller must prevent conflicting numeric registrations.
     pub fn fixed_root(nr: u32) -> Arc<Self> {
         Arc::new(Self {
             numbers: alloc::vec![Upid {
@@ -122,6 +148,11 @@ impl PidHandle {
     }
 
     /// Returns the root-visible number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle has no root projection; both public constructors
+    /// maintain that invariant.
     pub fn root_nr(&self) -> u32 {
         self.numbers
             .iter()
@@ -131,6 +162,10 @@ impl PidHandle {
     }
 
     /// Returns the number visible in `ns`, if present.
+    ///
+    /// A different root namespace deliberately receives the root projection too;
+    /// `None` only describes a missing non-root projection. This is not an
+    /// authorization or namespace-equality predicate.
     pub fn nr_in(&self, ns: &Arc<PidNamespace>) -> Option<u32> {
         self.numbers
             .iter()
@@ -148,12 +183,22 @@ impl PidHandle {
 static ROOT_PID_NS: LazyInit<Arc<PidNamespace>> = LazyInit::new();
 
 /// Returns the shared root PID namespace.
+///
+/// # Panics
+///
+/// Panics if the root remains uninitialized after `call_once`, which would
+/// violate the lazy-initialization contract.
 pub fn root_pid_namespace() -> &'static Arc<PidNamespace> {
     ROOT_PID_NS.call_once(|| Arc::new(PidNamespace::new_root()));
     ROOT_PID_NS.get().unwrap()
 }
 
 /// Allocates a root-visible PID/TID handle.
+///
+/// # Errors
+///
+/// Returns `KError::WouldBlock` if a namespace counter cannot increment.
+/// Numbers already consumed in other namespaces are not rolled back.
 pub fn allocate_root_pid_handle() -> KResult<Arc<PidHandle>> {
     PidHandle::allocate_in(root_pid_namespace())
 }

@@ -154,6 +154,16 @@ impl ProcessTimerManager {
         deliveries
     }
 
+    /// Creates a POSIX timer with the given clock and notification policy.
+    ///
+    /// # Returns
+    ///
+    /// The kernel timer ID allocated for the new timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` (`InvalidInput`) when `clock_id` is not a supported
+    /// POSIX timer clock or when the ID space is exhausted.
     pub fn create_posix_timer(
         &mut self,
         clock_id: i32,
@@ -171,6 +181,14 @@ impl ProcessTimerManager {
         Ok(timer_id)
     }
 
+    /// Returns the current `(interval, remaining)` state of a POSIX timer.
+    ///
+    /// `process_utime`/`process_stime` must be the owner process's current
+    /// CPU-time totals (needed by `CLOCK_PROCESS_CPUTIME_ID` timers).
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` when `timer_id` does not name a live timer.
     pub fn get_posix_timer(
         &self,
         timer_id: i32,
@@ -183,6 +201,28 @@ impl ProcessTimerManager {
             .ok_or(KError::InvalidInput)
     }
 
+    /// Arms or re-arms a POSIX timer and returns its previous state plus any
+    /// delivery that already expired at `settime`.
+    ///
+    /// A zero `value` disarms the timer. Absolute values select the
+    /// `TIMER_ABSTIME` deadline interpretation. `signal_seq` is bumped so
+    /// in-flight notifications from the previous arming become stale.
+    ///
+    /// # Returns
+    ///
+    /// The previous `(interval, remaining)` state and the immediate delivery,
+    /// if the timer expired during this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` when `timer_id` is unknown or the requested deadline
+    /// is not representable in the timer's clock domain (state is preserved).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the timer disappears between internal validation and
+    /// re-lookup; both operate on `&mut self` with no interior removal in
+    /// between, so the invariant is structural.
     pub fn set_posix_timer(
         &mut self,
         timer_id: i32,
@@ -214,6 +254,12 @@ impl ProcessTimerManager {
         Ok((old, delivery))
     }
 
+    /// Deletes a POSIX timer, dropping any queued alarm entry at the next
+    /// poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` when `timer_id` does not name a live timer.
     pub fn delete_posix_timer(&mut self, timer_id: i32) -> KResult<()> {
         self.posix_timers
             .remove(&timer_id)
@@ -221,6 +267,12 @@ impl ProcessTimerManager {
             .ok_or(KError::InvalidInput)
     }
 
+    /// Returns the overrun count of the most recently *delivered* POSIX
+    /// timer notification, clamped to `i32::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` when `timer_id` does not name a live timer.
     pub fn get_posix_timer_overrun(&self, timer_id: i32) -> KResult<i32> {
         self.posix_timers
             .get(&timer_id)
@@ -228,10 +280,23 @@ impl ProcessTimerManager {
             .ok_or(KError::InvalidInput)
     }
 
+    /// Removes all POSIX timers of the owner, used on exec (`execve` keeps
+    /// itimers but not POSIX timers).
     pub fn clear_posix_timers(&mut self) {
         self.posix_timers.clear();
     }
 
+    /// Dequeue validation for POSIX timer signals.
+    ///
+    /// Called from the signal-dequeue observer with the `timer_id` and
+    /// `signal_seq` embedded in the pending signal. A matching sequence
+    /// clears the pending-signal state (freezing `last_overrun`); a stale
+    /// sequence reports `false` so the signal is dropped.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the notification belongs to the current timer generation
+    /// and should be delivered.
     pub fn on_timer_signal_dequeued(&mut self, timer_id: i32, signal_seq: u32) -> bool {
         if let Some(timer) = self.posix_timers.get_mut(&timer_id) {
             if timer.signal_seq() != signal_seq {

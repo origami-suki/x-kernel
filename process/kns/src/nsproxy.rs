@@ -30,8 +30,9 @@ pub enum NamespaceFsContext<'a> {
 /// Bundle of namespace references held by a process.
 ///
 /// Analogous to Linux's `struct nsproxy`. Each field is an `Arc` so that
-/// namespaces can be shared between processes (e.g., via `fork` without
-/// `CLONE_NEW*`) or individually replaced (e.g., via `unshare` or `setns`).
+/// namespaces can be shared between processes through `fork` without
+/// `CLONE_NEW*`, or selected references can be copied during child creation.
+/// This crate does not implement runtime `unshare` or `setns` replacement.
 /// User namespaces belong to credentials, and the active PID namespace belongs
 /// to task identity rather than this bundle.
 pub struct NsProxy {
@@ -87,6 +88,11 @@ impl NsProxy {
     }
 
     /// Creates the initial `NsProxy` used by the init process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial VFS mount namespace has not been installed.
+    /// Boot must initialize VFS before calling this entry point.
     pub fn new_initial() -> Arc<Self> {
         Arc::clone(INIT_NSPROXY.call_once(|| {
             let mnt_ns =
@@ -119,6 +125,35 @@ impl NsProxy {
     /// - With `CLONE_NEWIPC`, a new empty `IpcNamespace` is created.
     /// - Unimplemented flags (`CLONE_NEWCGROUP`, `CLONE_NEWNET`, etc.) return an
     ///   error so the caller can translate it to the appropriate errno.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CloneNsError::Unimplemented` for NEWNET, NEWUSER, NEWCGROUP,
+    /// NEWPID, or NEWTIME. Returns `CloneNsError::InvalidFlagCombination` for
+    /// NEWNS with a shared filesystem context. Mount cloning or root/pwd retarget
+    /// errors are wrapped in `CloneNsError::Mount`.
+    ///
+    /// # Panics
+    ///
+    /// With NEWNS, panics if the private context has no initialized root or pwd.
+    /// The caller must prepare a mounted private context before cloning.
+    ///
+    /// # Example
+    ///
+    /// After VFS boot initialization, clone the mount namespace using a private,
+    /// already-mounted filesystem context:
+    ///
+    /// ```no_run
+    /// extern crate alloc;
+    /// use fs_context::FsStruct;
+    /// use kns::{NamespaceFlags, NamespaceFsContext, NsProxy};
+    /// let parent = NsProxy::new_initial();
+    /// let mut fs = FsStruct::new(parent.mnt_ns().visible_root_path());
+    /// let child = parent
+    ///     .clone_for_child(NamespaceFlags::NEWNS, NamespaceFsContext::Private(&mut fs))
+    ///     .unwrap();
+    /// assert!(!alloc::sync::Arc::ptr_eq(parent.mnt_ns(), child.mnt_ns()));
+    /// ```
     pub fn clone_for_child(
         &self,
         flags: NamespaceFlags,

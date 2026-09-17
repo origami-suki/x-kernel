@@ -29,6 +29,11 @@ pub unsafe fn load_vec_unsafe<T>(p: *const T, count: usize) -> MemResult<Vec<T>>
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 /// Load a fixed-length vector from user memory.
+///
+/// # Errors
+///
+/// Returns [`MemError::InvalidAddr`] when `p` is misaligned, or the
+/// provider's error when the `count`-element range is inaccessible.
 pub fn load_vec<T: AnyBitPattern>(p: *const T, count: usize) -> MemResult<Vec<T>> {
     // SAFETY: `AnyBitPattern` guarantees that any copied byte pattern is a
     // valid `T`, so the only remaining requirement is a readable `count`
@@ -43,6 +48,17 @@ fn check_zero<T: Pod>(v: &T) -> bool {
 const LIMIT: usize = 128 * 1024;
 
 /// Load elements until a zeroed terminator is found or a length limit is hit.
+///
+/// Reads in batches of 32 elements and scans for an all-zero element,
+/// growing the vector without a priori length knowledge. Intended for
+/// NUL-terminated user arrays such as environment or path strings.
+///
+/// # Errors
+///
+/// Returns [`MemError::InvalidAddr`] when `p` is misaligned, the provider's
+/// error when the scanned range is inaccessible, or
+/// [`MemError::NameTooLong`] when no terminator appears within the fixed
+/// 128 KiB scan limit.
 pub fn load_vec_until_null<T: Pod>(p: *const T) -> MemResult<Vec<T>> {
     if !p.is_aligned() {
         return Err(MemError::InvalidAddr);

@@ -2,10 +2,24 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Namespace proxy and namespace types for X-Kernel.
+//! Process namespace references and namespace-specific data.
 //!
-//! This crate defines the `NsProxy` structure that bundles all namespace
-//! references for a process, along with individual namespace types.
+//! [`NsProxy`] selects copied/shared references during child creation. Mount trees
+//! belong to KVFS, PID numbers to kidentity, credentials to kcred, and cgroups to
+//! kcgroup. [`UtsNamespace`] owns mutable hostname/domainname bytes. Unsupported
+//! clone flags return an error instead of claiming isolation.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use kns::UtsNamespace;
+//! let parent = UtsNamespace::new();
+//! parent.set_nodename(b"parent").unwrap();
+//! let child = UtsNamespace::clone_from(&parent);
+//! child.set_nodename(b"child").unwrap();
+//! assert_eq!(parent.nodename(), b"parent");
+//! assert_eq!(child.nodename(), b"child");
+//! ```
 
 #![no_std]
 

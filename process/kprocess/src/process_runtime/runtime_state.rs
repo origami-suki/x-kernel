@@ -101,8 +101,8 @@ impl ProcessRuntimeState {
         &self.mm_cpu_residency
     }
 
-    #[cfg(target_arch = "aarch64")]
     /// Returns the latest hardware page-table root for context switching.
+    #[cfg(target_arch = "aarch64")]
     pub(super) fn page_table_hw_root(&self) -> karch::HwPageTableRoot {
         self.user_asid_context.prepare_switch_root()
     }

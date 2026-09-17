@@ -1,39 +1,61 @@
-# fs_context — 安全与可靠性分析
+# fs_context security and reliability
 
-## 信任边界
+## Scope and trust model
 
-本 crate 接收已经由 VFS 解析得到的 `Path`。用户 pathname、权限和 namespace 可见性
-必须在调用前由 KVFS/POSIX 层校验；`fs_context::FsStruct` 只维护解析结果的共享状态。
+This analysis covers `src/lib.rs`, the whole crate. Assets are the process root,
+working directory, umask, and exec flag. Trusted KVFS/POSIX callers pass resolved
+`kvfs::Path`s; they must perform pathname copying, permission checks, chroot and
+namespace policy before updating the context. No raw user pointer, MMIO, DMA,
+firmware, FFI, assembly, or direct network input is consumed here.
 
-## unsafe 与内存安全
+## Unsafe inventory and invariants
 
-`process/fs_context/src` 没有 `unsafe` block。
+There is no local unsafe code. `Path` ownership pins referenced VFS objects.
+Directory checks precede replacement; paired replacement validates both inputs
+before committing either one. Initialized readers require root/pwd to be present.
+`replace_umask` masks unwanted bits. These checks do not prove namespace
+membership or path ancestry, and `in_exec` is not a lock or authorization token.
 
-- boot 通过 `attach_root` 同时初始化 root 和 pwd；后续更新维持有效路径。
-- root、pwd 的替换目标必须是目录。
-- `Path` 通过引用计数维持 mount/dentry 生命周期。
-- umask 只保留 `0o777` 范围内的位。
-- 所有共享读写都通过外层 `Mutex`。
+## Thread safety
 
-## 并发与故障模式
+`FsStruct` has no interior locking. Shared process access uses the external
+`Mutex`; snapshots preserve path lifetimes after the lock is released. Changes
+must be serialized with callers' exec/namespace protocols. Reentrant VFS work
+must not acquire the same context lock while it is already held.
 
-| 故障模式 | 结果 | 缓解 |
-|---|---|---|
-| boot 完成前读取 root/pwd | 内核 panic | 启动顺序必须先 `attach_root` 再创建用户进程 |
-| chdir/chroot 目标非目录 | 状态不变 | 返回 `VfsError::NotADirectory` |
-| mount namespace copy 后仍引用旧 mount tree | 路径跨 namespace | namespace clone 使用成对 root/pwd retarget |
-| mount I/O 期间长期持有 fs_struct 锁 | 阻塞并发 chdir/chroot | 先取得 `root_and_pwd` 引用快照，再释放锁 |
-| `CLONE_FS` 组合错误 | 非预期共享路径环境 | clone/namespace 层校验 flags 并选择共享或复制 |
+## Threat analysis
 
-## 隐私与已知限制
+| ID | Threat and asset | Severity | Trigger | Response and residual risk |
+|---|---|---|---|---|
+| T-01 | Incorrect filesystem confinement | High | Caller installs an unauthorized root or a pwd in another tree | Setters check directories only; KVFS/POSIX authorization and paired namespace retargeting are required. This crate cannot establish confinement. |
+| T-02 | Boot denial of service | Medium | Root/pwd read before mount attachment | `expect` prevents silent invalid state; boot must install paths before readers run. |
+| T-03 | Cross-process path-state contamination | Medium | Caller shares a context when it should copy | `clone_for_process` provides an independent state object; `CLONE_FS` selection and flag validation belong to process/namespace code. |
+| T-04 | Reentrant lock deadlock | Medium | Slow VFS work tries to reacquire the context lock | Clone path snapshots and unlock before I/O; direct callers must maintain that discipline. |
 
-对象保存内核 `Path` 引用和 umask，不保存 pathname 文本或文件内容。early boot 的
-`None` 只对应 Linux 静态 `init_fs` 中尚未安装的零值 `root/pwd`；用户进程创建前必须
-已经通过 `attach_root` 安装有效路径。
+## Failure modes and effects (FMEA)
 
-## 审计清单
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1-4) | Handling |
+|---|---|---|---|---|---|---|
+| F-01 | Non-directory path | Bad caller target | `NotADirectory`, unchanged fields | Operation rejected | 3 | Validate before update; `new` instead panics on this error. |
+| F-02 | Missing root | `set_pwd` before initialization | `InvalidInput` | Context update rejected | 3 | Attach root first. |
+| F-03 | Uninitialized reader | Premature root/pwd access | Panic | Process startup may fail | 2 | Respect boot ordering. |
+| F-04 | Old namespace paths retained | Clone without retargeting | Wrong filesystem view | Isolation semantics fail | 2 | `kns` clones mount tree and replaces both paths in private context. |
 
-- 新 API 是否错误地把 `FsStruct` 称作 mount `FsContext`？
-- 更新 root/pwd 前是否验证目录并保持成对状态？
-- clone flags 是否正确选择共享或复制？
-- 路径解析或设备 I/O 前是否只取得快照而没有长期持锁？
+## Failure handling, privacy, and limitations
+
+Fallible setters return `VfsResult` without partial paired updates. Constructors
+and path readers documented as panicking have no recovery path here. Allocation
+and referenced-object teardown follow their owning subsystem policies.
+
+The object retains paths and permission metadata, not pathname text or file
+contents, and emits no logs. Retained paths can reveal filesystem relationships
+to authorized consumers. It does not enforce root/pwd ancestry, namespace
+consistency, access permissions, or exec lifecycle transitions by itself.
+
+## Audit checklist
+
+- Preserve directory validation before mutations.
+- Attach paths before initialized readers are exposed.
+- Distinguish snapshot from fork cloning of `in_exec`.
+- Retarget root and pwd together on namespace copy.
+- Release the context lock before slow/reentrant VFS work.

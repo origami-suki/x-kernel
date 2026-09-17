@@ -317,6 +317,11 @@ impl PublishedUserTask {
     ///
     /// If `finalize` returns an error, publication is rolled back before the
     /// error is returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from `finalize` after rolling back publication. The task
+    /// remains non-runnable when completion fails.
     pub fn commit(mut self, finalize: impl FnOnce(&KtaskRef) -> KResult<()>) -> KResult<KtaskRef> {
         if let Err(err) = finalize(&self.task) {
             self.rollback_publication();

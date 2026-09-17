@@ -1,90 +1,88 @@
-# posix-process — 设计文档
+# posix-process — Design
 
-## 定位
+## Purpose and scope
 
-`posix-process` 负责进程/线程生命周期相关的上层 owner 逻辑：
+This crate orchestrates user-thread execution, PID 1 construction and exit.
+The complete implementation is `src/lib.rs`, `src/init_process.rs` and
+`src/runtime.rs`. `kprocess` owns process identities, runtime resources,
+publication and process relationships; `kexec` owns executable loading;
+`ksyscall` owns syscall decoding. This crate supplies the trap loop and orders
+calls to those owners rather than duplicating their registries.
 
-- clone / exit / signal-return 需要共享的用户态 trap 主循环；
-- 初始用户进程的地址空间、`Process`/`Thread` runtime、TTY 和 stdio 组装；
-- 线程退出时的 robust futex 清理、group-exit 和父进程通知；
-- 保持这些逻辑依赖 `kprocess` 原语，但不把它们塞回 `kprocess` 本体。
+## Architecture and entry points
 
-纯 syscall adapter（`getpid`、`getrusage`、`umask`、job control、rlimit 等）
-已经迁回 `ksyscall/task`，不再由本 crate 承接。
+Boot code calls `spawn_init_process` with argv, environment, a syscall dispatcher
+and an exit callback. It allocates root PID 1, prepares and loads an `ExecRequest`,
+creates the process/thread runtime, installs console stdio, seeds the task's page
+table root, and publishes with `publish_user_task(...).commit(...)`. It creates a
+fresh task and leaves the bootstrap thread intact. It does not acquire a
+controlling terminal; session/TTY acquisition belongs to later userspace.
 
-## 范围
+Clone adapters use `new_user_task` with matching `PidHandle` and `Thread` values.
+The returned task is still unpublished: the caller completes process publication
+before activation. Its closure enters `run_user_thread_loop`, which calls the
+provided dispatcher for syscalls and `MmSpace::handle_page_fault` for faults.
+`BusError` maps to SIGBUS; other unresolved faults map to SIGSEGV. Retryable faults
+retry user execution after checking preemption. Signal delivery is delegated to
+`Thread::signal_manager`; default actions call `do_exit`.
 
-本次相关范围包括：
+A concrete integration example is `spawn_init_process` in `src/init_process.rs`:
+it shows identity/runtime preparation, task construction, publication and the
+observable effect (the initial image enters userspace on its own kernel stack).
 
-- `src/runtime.rs`
-- `src/init_process.rs`
-- `src/lib.rs`
+## Execution context
 
-## 架构
+`spawn_init_process` runs from a PID-less late-init kernel thread after the
+allocator, scheduler, root filesystem, initial filesystem context and stdio
+providers are available. The first root PID allocation must yield 1. It keeps
+the task's default all-online-CPU affinity. Its `after_init_exit` callback runs
+on the init task when the loop ends and normally shuts the system down.
 
-```text
-entry / ksyscall
-        |
-        v
-  posix-process
-    |   \
-    v    v
-  kexec  kprocess
-```
+`do_exit`, `raise_signal_fatal` and `check_signals` are current-user-thread paths;
+`check_signals` must receive that thread and its saved context. The loop uses
+current-task state, mapped userspace and scheduler services. These paths may
+allocate, lock, yield or block and are unsuitable for interrupt context or early
+boot. Do not reenter teardown for the same thread or hold a TEE session context
+across its exit cleanup.
 
-## 调用约束 / 执行上下文
+## Runtime and teardown flow
 
-- `new_user_task()` 仅用于创建会进入用户态执行的 task，并且要求调用方先准备好该线程的 `PidHandle` 和 `Thread`。
-- 用户 task 启动路径必须遵守：
-  - 先由 process-domain owner 决定 PID namespace 和线程 identity
-  - 先构造 matching `Thread`，再通过 `new_user_task(..., thread, ...)` 一次性构造 task 与 `UserTaskRuntime`
-  - 调用 `start_user_task(...)`
-  - `kprocess` 内部先完成 publish，再使 task runnable
-- `spawn_init_process()` 依赖 rootfs、TTY 和默认 stdio 初始化路径可用；它由 PID-less 的 late-init 线程调用，分配 PID 1 并构造一个全新的 `User` 身份用户任务（走与 fork 相同的 `new_user` + `publish_user_task().commit()` 路径），不再原地转换 current task。PID 1 只继承 console stdio，不预先绑定 controlling TTY 或设置 foreground process group，后续 getty 通过标准 session/TTY ioctl 获取控制终端。
-- `do_exit()`、`check_signals()` 依赖 current task 是携带 `UserTaskRuntime` 的用户 task。
-- 这些接口会访问地址空间、信号状态、fd 表和共享内存管理器，可阻塞，不适用于中断上下文。
+The loop alternates user execution, trap handling, kernel CPU accounting and
+signal checks. `SkipSignalCheckOnce` suppresses the normal post-syscall signal
+check after signal return. Before reentering userspace, the loop clears the old
+interrupt flag, polls CPU timers and checks preemption; a newly raised interrupt
+causes another signal check. This prevents timer or scheduler work in that
+window from waiting for an unrelated future trap.
 
-## 状态机
+`do_exit` performs the following order:
 
-### 用户线程运行
+1. Traverse the registered robust-futex list, then clear `clear_child_tid` and
+   wake its futex if the write and key resolution succeed.
+2. Release optional per-thread TEE state and detach cgroup membership.
+3. Remove the thread from process membership/publication, close its CPU-accounting
+   interval and accumulate final thread CPU time.
+4. For the last thread, detach the mm owner, clear SysV shm accounting, release
+   optional TEE private state, then detach files, filesystem context and namespaces.
+   With TIPC enabled, close process-local handles before publishing process exit.
+5. Complete process exit/parent notification. If group exit was requested and
+   not already marked, mark it and send SIGKILL to surviving sibling threads.
+6. Mark the current thread exited; the trap loop subsequently stops.
 
-1. task 完成发布并进入 run queue。
-2. 进入用户态运行 `UserContext`。
-3. 因 syscall / page fault / exception / interrupt 返回内核。
-4. 处理返回原因并更新 CPU 计时状态。
-5. 执行信号检查和默认动作。
-6. 先清掉本次 trap 的 interrupt 标志，再轮询 CPU timer、检查抢占；若这段
-   窗口里又发生 `interrupt()`（CPU timer 投递或 `alarm_task` 抢占），再次
-   检查信号，然后返回用户态。NOHZ 下 lone runner 可能已停调度 tick，因此
-   运行中任务的 `TaskInner::interrupt()` 还会 kick 目标 CPU（本 CPU
-   `need_resched` / 远端 IPI），不能依赖下一次 syscall 或周期 tick 才进入
-   `check_signals`。
+## Concurrency and resource release
 
-### 线程退出
+This crate creates no global process registry or additional lifecycle lock.
+`kprocess` serializes membership, parent notification and runtime owner slots.
+Objects taken out of owner slots are destroyed outside the slot locks.
+`SHM_MANAGER` serializes shared-memory exit accounting. Robust-futex updates use
+`kuaccess` atomic load/compare-exchange and `kfutex` keys/wake queues; the list
+walk yields between nodes and has a fixed traversal limit.
 
-1. 清理 `clear_child_tid` 并唤醒 futex。
-2. 遍历 robust futex list，标记 owner-dead。
-3. 从进程线程集合中摘除当前线程。
-4. 若为最后线程，释放 mm owner，再清理共享内存和可选 TEE 私有状态。
-5. 依次释放 files、filesystem context 和 namespace owner。
-6. 关闭进程本地 TIPC handle table（`close_all_tipc_handles`），解除 port 发布并通知 channel 对端。
-7. owner 全部释放后发布 process exit 并通知父进程。
-8. 若触发 group exit，向线程组广播 `SIGKILL`。
+## Decisions and limitations
 
-## 并发模型
-
-- 线程/进程基础状态由 `kprocess` 和其内部锁保护。
-- 本 crate 负责组织退出与信号路径的调用顺序，不重复持有额外全局状态。
-- robust futex owner-dead 标志通过原子位和等待队列协作。
-- owner slot 的 `take()` 与 capability 查询由各自 runtime 锁串行化；取出的对象在
-  slot 锁外 drop，避免资源析构重入 owner 锁。
-
-## 设计决策
-
-- 该逻辑放在 `posix-process`，因为它围绕进程/线程生命周期状态机，不应该污染 `kprocess` 的基础职责。
-- `posix-process` 可以自然承接这类面向进程生命周期的上层 owner 逻辑，并避免 `kprocess <-> posix-ipc` 环依赖。
-- 纯 adapter 迁回 `ksyscall/task` 后，本 crate 只保留真正依赖进程生命周期状态机的 owner 逻辑。
-- 用户态 runtime 直接消费 `MmSpace::handle_page_fault()` 的结构化结果，
-  因此架构 trap glue 不需要理解 file-backed fault 细节，同时 runtime 可以把
-  file-backed EOF 等对象级 fault 转换为 `SIGBUS`，把普通权限或缺页错误转换为
-  `SIGSEGV`。
+Keeping IPC cleanup here avoids a `kprocess` dependency on `posix-ipc` while
+preserving release-before-parent-notification ordering. Page-fault classification
+comes from MM so architecture trap code need not understand file-backed EOF.
+Stop currently terminates the group with exit code 1; CoreDump terminates with
+128 plus the signal number and does not write a core image. PI-tagged robust
+entries are skipped. Cleanup errors are generally logged or ignored so teardown
+can continue; these are current limitations, not complete Linux compatibility.

@@ -13,6 +13,10 @@ pub trait AsThread {
     fn try_as_thread(&self) -> Option<&Thread>;
 
     /// Returns the thread from the task, panicking if it is a kernel task.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task has no matching user Thread runtime.
     fn as_thread(&self) -> &Thread {
         self.try_as_thread().expect("kernel task")
     }

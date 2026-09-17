@@ -26,7 +26,11 @@ pub struct EventFd {
 }
 
 impl EventFd {
-    /// Create a new eventfd object.
+    /// Creates a counter object with the supplied initial value and read mode.
+    ///
+    /// Semaphore mode decrements by one; the current file read implementation
+    /// returns the pre-update counter in either mode. The syscall adapter
+    /// supplies the ABI-bounded initial value.
     pub fn new(initval: u64, semaphore: bool) -> Arc<Self> {
         Arc::new(Self {
             count: AtomicU64::new(initval),
@@ -39,6 +43,11 @@ impl EventFd {
     /// Create the anonymous-inode file used by eventfd.
     ///
     /// `cred` is captured as the new file's immutable open credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` for unknown open-flag bits and forwards
+    /// errors from anonymous-inode file creation.
     pub fn new_file(
         initval: u64,
         semaphore: bool,
@@ -58,6 +67,10 @@ impl EventFd {
     }
 
     /// Returns the eventfd object attached to an eventfd file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` when the file has no matching private data.
     pub fn from_file(file: &VfsFile) -> KResult<Arc<Self>> {
         file.private_data_get::<Self>()
             .ok_or(KError::BadFileDescriptor)

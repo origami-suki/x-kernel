@@ -32,6 +32,10 @@ static OBSERVERS: SpinNoIrq<[Option<ObserverFn>; MAX_SIGNALS]> =
 /// The observer runs synchronously in the context that dequeues the signal.
 /// Callbacks must therefore only rely on execution-context properties that are
 /// guaranteed by every dequeue path that can deliver `signo`.
+///
+/// # Panics
+///
+/// Panics when `signo` is outside the supported `1..=64` range.
 pub fn register_signal_observer(signo: Signo, observer: ObserverFn) {
     let idx = signo as usize;
     assert!((1..=MAX_SIGNALS).contains(&idx));
@@ -39,6 +43,10 @@ pub fn register_signal_observer(signo: Signo, observer: ObserverFn) {
 }
 
 /// Removes the observer previously registered for `signo`.
+///
+/// # Panics
+///
+/// Panics when `signo` is outside the supported `1..=64` range.
 pub fn unregister_signal_observer(signo: Signo) {
     let idx = signo as usize;
     assert!((1..=MAX_SIGNALS).contains(&idx));

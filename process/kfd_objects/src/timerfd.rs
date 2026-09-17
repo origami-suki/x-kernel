@@ -135,7 +135,10 @@ pub struct TimerFd {
 }
 
 impl TimerFd {
-    /// Create a new timerfd for the given clock.
+    /// Creates a disarmed timer for a caller-validated clock ID.
+    ///
+    /// MONOTONIC and BOOTTIME use monotonic time; other IDs select realtime.
+    /// The caller must initialize the timer runtime before programming it.
     pub fn new(clock_id: u32) -> Arc<Self> {
         Arc::new(Self {
             clock_id,
@@ -150,6 +153,11 @@ impl TimerFd {
     }
 
     /// Creates the timerfd anonymous-inode file and captures `cred` as its open credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` for unknown open-flag bits and forwards
+    /// errors from anonymous-inode file creation.
     pub fn new_file(clock_id: u32, open_flags: u32, cred: Arc<Cred>) -> KResult<Arc<VfsFile>> {
         let open_flags = OpenFlags::from_bits(open_flags).ok_or(KError::InvalidInput)?;
         AnonInodeFs::global().get_file(
@@ -163,6 +171,10 @@ impl TimerFd {
     }
 
     /// Returns the timerfd object attached to a timerfd file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` when the file has no matching private data.
     pub fn from_file(file: &VfsFile) -> KResult<Arc<Self>> {
         file.private_data_get::<Self>()
             .ok_or(KError::BadFileDescriptor)
@@ -215,6 +227,7 @@ impl TimerFd {
     }
 
     /// Program the timer and return the previous `(interval, remaining)` pair.
+    ///
     ///
     /// # Errors
     ///

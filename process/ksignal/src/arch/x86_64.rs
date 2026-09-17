@@ -26,6 +26,10 @@ signal_trampoline:
 
 #[repr(C)]
 #[derive(Clone)]
+/// Machine context in the Linux x86_64 `mcontext_t` ABI.
+///
+/// The register array is kept private so callers use
+/// [`MContext::new`]/[`MContext::restore`] instead of hand-packing gregs.
 pub struct MContext {
     // Match Linux x86_64/musl `mcontext_t` so user-space signal handlers can
     // read and edit `uc_mcontext.gregs[...]` (notably `MC_PC` for cancellation).
@@ -128,14 +132,22 @@ impl MContext {
     }
 }
 
+/// User-visible `ucontext_t` frame for x86_64 signal handlers (musl layout).
 #[repr(C)]
 #[derive(Clone)]
 pub struct UContext {
+    /// `uc_flags`; written as zero by the kernel.
     pub flags: usize,
+    /// `uc_link`; not used by signal frames and written as zero.
     pub link: usize,
+    /// `uc_stack` snapshot of the alternate stack state.
     pub stack: SignalStack,
+    /// `uc_mcontext` general-purpose register snapshot.
     pub mcontext: MContext,
+    /// `uc_sigmask` restored into the thread blocked set at `sigreturn`.
     pub sigmask: SignalSet,
+    /// Floating-point state save area; currently zeroed because FPU state is
+    /// restored through `UserRestorableContext`, not this frame.
     pub fpregs_mem: [u64; 64],
 }
 

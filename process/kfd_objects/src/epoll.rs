@@ -41,7 +41,9 @@ bitflags! {
     /// Flags for entries in an `epoll` instance.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct EpollFlags: u32 {
+        /// Rearm notification through source transitions rather than retained level readiness.
         const EDGE_TRIGGER = EPOLLET;
+        /// Disable an interest after one event until MOD rearms it.
         const ONESHOT = EPOLLONESHOT;
     }
 }
@@ -478,6 +480,10 @@ impl Epoll {
     }
 
     /// Creates an epoll anonymous-inode file and captures `cred` as its open credential.
+    ///
+    /// # Errors
+    ///
+    /// Forwards errors from anonymous-inode file creation.
     pub fn new_file(cred: Arc<Cred>) -> KResult<Arc<VfsFile>> {
         AnonInodeFs::global().get_file(
             "[eventpoll]",
@@ -490,6 +496,10 @@ impl Epoll {
     }
 
     /// Returns the epoll instance attached to an epoll file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` when the file has no matching private data.
     pub fn from_file(file: &VfsFile) -> KResult<Arc<Self>> {
         file.private_data_get::<Self>()
             .ok_or(KError::BadFileDescriptor)
@@ -619,6 +629,11 @@ impl Epoll {
     }
 
     /// Adds a file descriptor interest to the epoll instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::AlreadyExists` for the same fd/file key; forwards mapped
+    /// poll-source registration failures and rolls back insertion.
     pub fn add(
         &self,
         fd: i32,
@@ -659,6 +674,11 @@ impl Epoll {
     }
 
     /// Modifies an existing interest for the given file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NotFound` for an absent fd/file key; forwards mapped
+    /// registration failures after restoring the previous configuration.
     pub fn modify(
         &self,
         fd: i32,
@@ -701,6 +721,10 @@ impl Epoll {
     }
 
     /// Removes an existing interest for the given file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NotFound` when no interest matches the fd/file key.
     pub fn delete(&self, fd: i32, file: Arc<VfsFile>) -> KResult<()> {
         let _ctl_guard = self.inner.ctl_lock.lock();
         let key = EntryKey::new(fd, &file);
@@ -716,6 +740,11 @@ impl Epoll {
     }
 
     /// Polls for ready events and writes them into `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mapped poll-source registration error when no event was emitted.
+    /// If events were already written, returns their count and requeues retry work.
     pub fn poll_events(&self, out: &mut [epoll_event]) -> KResult<usize> {
         trace!("Epoll: poll_events called, out.len()={}", out.len());
 

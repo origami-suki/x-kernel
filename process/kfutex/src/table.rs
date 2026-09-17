@@ -548,6 +548,21 @@ pub struct GlobalFutexTable;
 
 impl GlobalFutexTable {
     /// Blocks while `uaddr` still equals `expected`.
+    ///
+    /// The caller must run in a context that may block (syscall context of a
+    /// user task); the wait is interruptible by signals and honors `timeout`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(false)` when the value mismatched before enqueueing (the syscall
+    /// layer maps this to `EAGAIN`), `Ok(true)` when a matching wake selected
+    /// this waiter (including the case where wake won the race against a
+    /// concurrent timeout/signal cancellation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `EFAULT` when `uaddr` is not accessible, `ETIMEDOUT` when the
+    /// timeout elapsed first, or `EINTR` when interrupted by a signal.
     pub fn wait(
         self,
         key: FutexKey,
@@ -560,12 +575,25 @@ impl GlobalFutexTable {
     }
 
     /// Wakes at most `count` waiters matching `key` and `mask`.
+    ///
+    /// # Returns
+    ///
+    /// The number of waiters transitioned to the woken state.
     pub fn wake(self, key: FutexKey, count: usize, mask: u32) -> usize {
         FUTEX_TABLE.wake(key, count, mask)
     }
 
     /// Applies an atomic operation to `uaddr2`, wakes `source_count` waiters,
-    /// and conditionally wakes `target_count` waiters.
+    /// and conditionally wakes `target_count` waiters when the operation's
+    /// comparison holds on the old value.
+    ///
+    /// # Returns
+    ///
+    /// The total number of woken waiters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EFAULT` when `uaddr2` is not accessible.
     pub fn wake_op(
         self,
         source: FutexKey,
@@ -585,7 +613,20 @@ impl GlobalFutexTable {
         )
     }
 
-    /// Wakes waiters on `source` and requeues further waiters to `target`.
+    /// Wakes up to `wake_count` waiters on `source` and requeues up to
+    /// `requeue_count` further waiters onto `target`.
+    ///
+    /// When `compare` is present (`FUTEX_CMP_REQUEUE`), the comparison is
+    /// serialized with the queue operation.
+    ///
+    /// # Returns
+    ///
+    /// The sum of woken and moved waiters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EAGAIN` (`WouldBlock`) when the compare value mismatches, or
+    /// `EFAULT` when the compare word is not accessible.
     pub fn requeue(
         self,
         source: FutexKey,

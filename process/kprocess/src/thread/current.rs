@@ -33,12 +33,20 @@ impl CurrentThread {
     }
 
     /// Commits a prepared credential to the current task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if objective and subjective pointers differ because credentials
+    /// are overridden when commit is attempted.
     pub fn commit_creds(&self, cred: Cred) {
         self.commit_cred(cred);
     }
 }
 
-/// Returns the current user thread.
+/// Returns a handle to the current task for user-thread access.
+///
+/// The handle itself is not validated here. Dereferencing it requires an
+/// installed Thread runtime and panics for a kernel task.
 pub fn current_user_thread() -> CurrentThread {
     CurrentThread(current().clone())
 }
@@ -49,6 +57,11 @@ pub fn current_user_tid() -> Tid {
 }
 
 /// Returns the current filesystem context for shared current-path helpers.
+///
+/// # Panics
+///
+/// Panics if a current user thread has already detached its filesystem
+/// context. A kernel task instead uses the initialized global filesystem context.
 pub fn current_fs_context() -> Arc<Mutex<FsStruct>> {
     current()
         .try_as_thread()

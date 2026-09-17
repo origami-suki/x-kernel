@@ -2,11 +2,34 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! User program loading and exec image setup.
+//! User program loading and exec image setup over the memory-management APIs.
+//!
+//! Create an [`ExecRequest`], optionally call [`ExecRequest::prepare`] to pin and
+//! inspect the executable, and use [`load_user_app_request`] to replace an address
+//! space. The loader owns image layout; MM owns mappings and pages. Errors after
+//! address-space clearing are not rolled back.
+//!
+//! # Example
+//!
+//! With kernel allocation initialized, an owned request can be built without
+//! accessing the filesystem; `prepare` later needs a valid current fs context.
+//!
+//! ```no_run
+//! extern crate alloc;
+//! use alloc::{string::String, vec};
+//!
+//! use kexec::ExecRequest;
+//! let request = ExecRequest::from_path(
+//!     "/bin/app",
+//!     vec![String::from("app")],
+//!     vec![],
+//!     kcred::initial_cred(),
+//! );
+//! assert_eq!(request.args()[0], "app");
+//! ```
 
 #![no_std]
 #![warn(missing_docs)]
-#![allow(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 
 extern crate alloc;
 

@@ -47,6 +47,11 @@ impl PreparedUserClone {
 
     /// Returns the page-table root that the target task should install before
     /// first entering user space.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the prepared thread has lost its process runtime or live
+    /// address-space owner.
     pub fn page_table_root(&self) -> karch::HwPageTableRoot {
         self.thread
             .process()
@@ -145,7 +150,7 @@ impl SchedulerState {
     }
 }
 
-/// The inner data of a thread.
+/// Task-bound user-thread state, credentials, signals and shared process runtime.
 pub struct Thread {
     task_number: Arc<kidentity::PidHandle>,
     process: Arc<Process>,
@@ -218,12 +223,24 @@ impl Thread {
 
     /// Forks a child process from this thread's current process and returns the
     /// child thread object for installation into a new task.
+    ///
+    /// # Errors
+    ///
+    /// Forwards `Thread::prepare_process_fork` errors; no task is activated.
     pub fn fork_process_child(&self, config: ProcessForkConfig) -> KResult<Box<Self>> {
         self.prepare_process_fork(config)
             .map(|prepared| prepared.into_parts().0)
     }
 
     /// Prepares a child process clone together with its leader task identity.
+    ///
+    /// # Errors
+    ///
+    /// Forwards cgroup reservation/commit, identity allocation, namespace, MM and
+    /// fd-table preparation errors. Runtime fork returns NoSuchProcess for detached
+    /// owners, WouldBlock for shared fs during exec, InvalidInput for invalid or
+    /// changed parent/namespace contracts, and Unsupported for an unimplemented
+    /// namespace request. The prepared child is not activated.
     pub fn prepare_process_fork(&self, config: ProcessForkConfig) -> KResult<PreparedUserClone> {
         let _transaction = self.process.cgroup_transaction();
         let charge = self.cgroup.reserve_child()?;
@@ -243,12 +260,21 @@ impl Thread {
     }
 
     /// Creates a sibling thread within the same process runtime.
+    ///
+    /// # Errors
+    ///
+    /// Forwards `Thread::prepare_thread_clone` errors; no task is activated.
     pub fn clone_thread_in_process(&self) -> KResult<Box<Self>> {
         self.prepare_thread_clone()
             .map(|prepared| prepared.into_parts().0)
     }
 
     /// Prepares a sibling thread clone together with its thread identity.
+    ///
+    /// # Errors
+    ///
+    /// Forwards cgroup reservation/commit and root thread-identity allocation
+    /// errors. The sibling shares its process runtime and is not activated.
     pub fn prepare_thread_clone(&self) -> KResult<PreparedUserClone> {
         let _transaction = self.process.cgroup_transaction();
         let charge = self.cgroup.reserve_child()?;
@@ -278,6 +304,10 @@ impl Thread {
     }
 
     /// Moves this task to an existing cgroup.
+    ///
+    /// # Errors
+    ///
+    /// Forwards `kcgroup::TaskMembership::migrate` errors for the requested group.
     pub fn migrate_cgroup(&self, target: &Arc<Cgroup>) -> KResult<()> {
         self.cgroup.migrate(target)
     }
@@ -378,6 +408,11 @@ impl Thread {
 
     /// Updates the scheduler priority after validating it against the current
     /// effective policy while holding the scheduler state lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation callback error without changing priority. The
+    /// callback runs under the scheduler state lock and must not reenter it.
     pub fn set_scheduler_priority_with<F>(
         &self,
         priority: i32,
@@ -415,8 +450,8 @@ impl Thread {
             .store(accessing, Ordering::Release);
     }
 
-    #[cfg(feature = "tee")]
     /// Installs a per-thread TEE session context if one is not present yet.
+    #[cfg(feature = "tee")]
     pub fn set_tee_session_ctx(&self, ctx: Box<dyn TeeSessionCtxTrait>) {
         let mut guard = self.tee_session_ctx.lock();
         if guard.is_none() {
@@ -424,8 +459,8 @@ impl Thread {
         }
     }
 
-    #[cfg(feature = "tee")]
     /// Executes `f` with mutable access to the optional per-thread TEE session context.
+    #[cfg(feature = "tee")]
     pub fn with_tee_session_ctx_mut<R>(
         &self,
         f: impl FnOnce(&mut Option<Box<dyn TeeSessionCtxTrait>>) -> R,
@@ -433,8 +468,8 @@ impl Thread {
         f(&mut self.tee_session_ctx.lock())
     }
 
-    #[cfg(feature = "tee")]
     /// Executes `f` with shared access to the optional per-thread TEE session context.
+    #[cfg(feature = "tee")]
     pub fn with_tee_session_ctx<R>(
         &self,
         f: impl FnOnce(&Option<Box<dyn TeeSessionCtxTrait>>) -> R,
@@ -512,6 +547,11 @@ impl Thread {
     }
 
     /// Temporarily swaps the blocked-signal mask while executing `f`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the closure error through the signal manager temporary-mask
+    /// operation; mask restoration follows that provider contract.
     pub fn with_temp_blocked<R>(
         &self,
         blocked: Option<ksignal::SignalSet>,

@@ -14,7 +14,7 @@ use crate::{Process, ProcessExitPublication, process_signals, wait_reap};
 ///
 /// `task` must be the exiting published task so TID directory unpublish can
 /// identity-check against the live publication slot before retiring it. See
-/// [`Process::exit_thread`] for the visibility contract: the global TID entry
+/// the visibility contract below: the global TID entry
 /// is removed before later teardown steps such as fd/mm cleanup complete.
 pub fn finish_thread_exit(process: &Arc<Process>, task: &KtaskRef, exit_code: i32) -> bool {
     process.exit_thread(task, exit_code)

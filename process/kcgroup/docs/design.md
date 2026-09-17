@@ -1,67 +1,104 @@
 # kcgroup design
 
-`kcgroup` owns the canonical cgroup v2 hierarchy, task membership, and controller
-state. Linux ABI and cgroup2fs code are adapters and must not keep a second
-membership table or derive controller policy independently.
+## Purpose and scope
 
-`CgroupNamespace::initial()` lazily owns the system's initial namespace and
-hierarchy. It is available before PID 1 exists, so boot-time filesystem setup and
-the init process share one canonical root. `CgroupNamespace::new()` remains the
-constructor for an independent hierarchy used by isolated callers and tests.
+`kcgroup` owns the canonical cgroup v2 hierarchy, pids controller accounting,
+and task membership. All implementation and kernel tests are in `src/lib.rs`.
+`kprocess` integrates task publication, process-wide migration, and exit;
+cgroup2fs and syscall adapters provide authorization, ABI parsing, and views.
+They must not maintain parallel membership or controller state. This crate
+provides no filesystem implementation or credential-based authorization.
 
-Each task owns one `TaskMembership`. Fork and clone first obtain a `TaskCharge`;
-dropping an uncommitted charge rolls the count back. Publication commits it to a
-stable `Arc<PidHandle>` identity and returns `EEXIST` rather than overwriting an
-existing identity. The membership map retains that strong identity for its full
-lifetime, so the PID allocator cannot reuse the numeric projection while a cgroup
-entry still exists. Existing-task migration transfers both the identity and charge
-without checking `pids.max`, matching cgroup v2 semantics.
+## Background and architecture
 
-`PidsController` is separate from hierarchy identity. The hierarchy root has no
-pids controller files. Enabling `pids` in a node's `subtree_control` activates a
-controller state on each direct child; task admission charges the attached
-controller lineage and skips the hierarchy root. Inactive controller objects
-remain as internal accounting anchors so disable/re-enable preserves an exact
-count while files and limit enforcement are absent. Reactivation resets the
-limit to `max`.
+A fork needs a reversible admission charge before a visible task exists, while
+migration of an existing task must transfer accounting without applying the
+new-task limit. `TaskCharge` and `TaskMembership` separate those lifetimes.
 
-Numeric `pids.max` values are limited to Linux's PID domain
-(`4 * 1024 * 1024`). Unlimited state remains an internal `usize::MAX` sentinel
-and is exposed only through the textual value `max`, so numeric input cannot
-collide with it.
+```text
+CgroupNamespace -> Arc<Cgroup> view root
+Cgroup -> strong children / weak parent / shared CgroupHierarchy
+       -> optional PidsController
+       -> member_tasks: stable Arc<PidHandle> indexed by pointer identity
+reserve_task -> TaskCharge -> commit -> TaskMembership -> detach/drop
+```
 
-Controller enable follows cgroup v2 top-down and no-internal-process rules. A
-non-root node can delegate `pids` only when it receives the controller from its
-parent and has no directly attached tasks. A parent cannot disable `pids` while
-a child still delegates it. Existing-task migration ignores `pids.max`, but it
-cannot place tasks into a non-root domain with active subtree controllers.
+`CgroupNamespace::initial` lazily publishes the system hierarchy once, available
+before PID 1 so boot cgroup2fs setup and init share it. `new` creates an independent
+hierarchy for isolated callers/tests; `new_view` creates a view of an existing
+node without migrating tasks. `CgroupNamespaceId` is a separate relaxed atomic
+ID allocator, not an authorization token.
 
-The hierarchy uses strong child links and weak parent links. One hierarchy-wide
-sleepable transaction lock serializes topology mutation, controller transitions,
-reservation, migration, and detach. Per-controller atomics retain cheap snapshot
-reads and checked count updates, but multi-node changes are committed under the
-transaction lock.
+## Execution context and synchronization
 
-`Cgroup::path_from()` first proves that the node and namespace view root share
-the same hierarchy root. Cross-hierarchy inputs return `EXDEV`; callers cannot
-accidentally render an unrelated hierarchy as a relative path.
+Hierarchy mutations, reservations, migration, and detach use a hierarchy-wide
+sleepable `Mutex<()>`. Children and optional controller references use `RwLock`;
+membership maps use `Mutex`; each task's current cgroup uses `RwLock<Option<_>>`.
+Atomic controller values permit cheap snapshot reads. Lifecycle, reservations,
+and delegation bits are atomic; multi-node edits occur under the transaction.
+`set_pids_max` updates its atomic limit after controller validation without
+acquiring the hierarchy transaction itself.
 
-Each non-root node has an `ACTIVE -> REMOVING -> REMOVED` lifecycle. Removal
-first closes admission, then checks descendants and hierarchical task charges.
-Reservation and migration revalidate lifecycle after incrementing and roll back
-if removal won the race, preventing detached nodes from accepting new members.
-Filesystem operations acquire `CgroupOperationGuard` under the same hierarchy
-transaction. The guard contributes a lifecycle reservation, so removal cannot
-complete during an operation; operations started on a removed node return
-`ENODEV`. Removal also deactivates that node's controller view.
+Use task context with allocation and sleepable locking available, not IRQ or
+atomic/spinlocked context. There is no local current-task or CPU dependency;
+initial namespace construction is valid during boot once these services exist.
+Do not reenter the hierarchy transaction while holding it. `kprocess` adds an
+outer process cgroup gate so migration and publication agree on a thread-group
+target; integration uses process gate -> publication lookup -> hierarchy
+transaction ordering. The core does not acquire that process gate for callers.
 
-`is_descendant_of()` and `common_ancestor()` provide stable hierarchy queries
-under the transaction lock. Filesystem adapters can enforce mount-view and
-delegation policy without copying parent links or traversing them outside the
-canonical synchronization boundary.
+## Controller and task flows
 
-`kprocess` adds a process-level cgroup gate above this hierarchy transaction.
-Fork/clone selects membership under that gate, whole-process migration updates
-all published threads under it, and publication reconciles a prepared sibling
-to the process target before making the task visible. The lock order is process
-cgroup gate, publication lookup, then hierarchy transaction.
+The hierarchy root has no pids controller files. Enabling `pids` in a parent's
+subtree activates controllers on direct children. A non-root node must receive
+the controller from its parent and have no direct members before delegating;
+a parent cannot disable it while a child still delegates. Inactive controllers
+remain accounting anchors; reactivation resets the limit to unlimited.
+The first activation initializes a child's count from its subtree membership.
+Numeric limits must be at most `4 * 1024 * 1024`; `None` represents textual `max`
+using a private `usize::MAX` sentinel. Lowering a limit below current usage is
+allowed and affects later admission.
+
+`reserve_task` increments a lifecycle reservation and charges each controller
+in root-to-leaf order. A failure drops the partial charge and releases counts.
+`TaskCharge::commit` checks duplicate pointer identity before publishing the
+strong `PidHandle` in the membership map. A duplicate returns `EEXIST` and rolls
+back the new charge; equal numeric projections in distinct handles are not the
+same identity. The higher task registry owns numeric uniqueness policy.
+
+`migrate_group` sorts/deduplicates memberships by stable identity, locks their
+current nodes, validates every source hierarchy, and charges target-only
+controller suffixes before changing membership. It skips detached memberships
+and unchanged targets. Mixed hierarchies return `EXDEV` before counts change;
+count overflow rolls back added counts. Migration ignores pids limits but
+rejects a non-root target that delegates controllers (`EBUSY`).
+
+## Node lifecycle and path queries
+
+Non-root lifecycle is `ACTIVE -> REMOVING -> REMOVED` during child removal.
+The remover validates exact child identity, reserves removal, and checks direct
+members, children, and outstanding reservations. A busy check restores ACTIVE;
+success unlinks the node and deactivates its controller. Operation guards and
+pending task charges prevent removal from completing while they are live.
+New filesystem operations on an inactive node receive `ENODEV`.
+
+`is_descendant_of` and `common_ancestor` traverse under the transaction lock.
+`path_from` compares live lineage roots and rejects unrelated roots; nodes
+outside a view render `..` components, which describe position rather than grant
+access. Parent links are weak: callers need the canonical hierarchy owner alive
+when interpreting ancestry/path snapshots.
+
+## Decisions and resource release
+
+Strong child links and weak parents avoid ownership cycles. Membership retains
+stable task handles rather than only reusable numeric projections. An uncommitted
+charge drops its reservation and charged controllers in reverse order.
+Membership detach/drop removes its index entry and releases controller lineage
+counts; repeated detach is harmless. `CgroupOperationGuard::drop` releases its
+reservation. Checked decrement prevents wrap; underflow triggers a debug
+assertion and otherwise leaves the counter unchanged.
+
+There are no memory/CPU controllers, authorization engine, or full namespace
+clone syscall implementation here. Namespace IDs and reservation increments
+have no explicit wrap protection. Recursive subtree counts and linear lineage
+walks are not depth-bounded by this crate.

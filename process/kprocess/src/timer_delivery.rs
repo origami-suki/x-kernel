@@ -50,6 +50,11 @@ pub(crate) fn poll_timer(pid: Pid) {
 /// Polls CPU-driven timers for the current user thread's process.
 ///
 /// This is part of the user-return path and requires a current user thread.
+///
+/// # Panics
+///
+/// Panics if the current task has no user Thread runtime or its process
+/// timer runtime can no longer be reached.
 pub fn poll_cpu_timers() {
     let thread = current_user_thread();
     let process = thread.process().clone();

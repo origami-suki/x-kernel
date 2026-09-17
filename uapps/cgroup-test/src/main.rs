@@ -2,6 +2,14 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
+//! Guest regression for cgroup v2 pids admission and procfs membership.
+//!
+//! Run `cgroup-test` in a disposable, single-threaded guest process initially in
+//! the root cgroup, with writable cgroup2fs and procfs mounted. It enables pids,
+//! moves self into a one-task group, requires fork to fail with EAGAIN, restores
+//! membership, removes the group, and prints `cgroup v2 pids regression: PASS`.
+//! Errors may leave cgroup changes behind; root pids enablement is not restored.
+
 use std::{
     fs,
     io::{self, ErrorKind},

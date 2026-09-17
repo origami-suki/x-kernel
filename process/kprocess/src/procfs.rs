@@ -22,12 +22,22 @@ pub fn visible_processes() -> alloc::vec::Vec<Arc<Process>> {
 }
 
 /// Resolves the representative task used for a `/proc/<pid>` lookup.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when the requested published target
+/// is absent or no longer has the required live backing.
 pub fn process_task(pid: Pid) -> KResult<KtaskRef> {
     let process = lookup::published_process(pid)?;
     lookup::representative_task_for_process(&process).map_err(|_| KError::NoSuchProcess)
 }
 
 /// Resolves a thread task used for `/proc/<pid>/task/<tid>` lookups.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when a nonzero TID has no live
+/// published task. TID zero selects the current task.
 pub fn thread_task(tid: Tid) -> KResult<KtaskRef> {
     lookup::task(tid)
 }

@@ -1,106 +1,93 @@
-# posix-ipc — 设计文档
+# posix-ipc — Design
 
-## 定位
+## Purpose and ownership
 
-`posix-ipc` 实现 Linux/POSIX IPC syscall 适配层。它负责用户可见的 IPC
-标识符、权限元数据、生命周期规则和 syscall ABI，不拥有页缓存、VMA tree
-或页表。
+This crate implements System V message-queue and shared-memory syscall adapters.
+The complete source scope is `src/lib.rs` (common IPC constants, ID allocation,
+time and permission helper), `src/msg.rs` (messages) and `src/shm.rs` (segments).
+All public items in the latter modules are re-exported at the crate root.
+`kprocess` provides current identity/address spaces, `osvm` provides user copying,
+`memfs::shmem` owns segment backing files, and `filemap`/`memspace` own VMAs and
+page mappings. IPC metadata and attachment bookkeeping belong here; page frames,
+filesystem namespace objects and process lifecycle orchestration do not.
 
-当前共享内存路径中：
+## Components and interaction
 
-- SysV shm keys、shmid、attach count、`IPC_RMID` 状态由 `posix/ipc` 管理。
-- SysV shm 段内容由 `memfs::shmem::create_kernel_file()` 创建的 shmem file 承载。
-- 实际 shared mapping 由 `mm/filemap` 创建 `VmArea + VmRuntimeRef`。
+Syscall dispatch calls `sys_msgget`, `sys_msgsnd`, `sys_msgrcv`, `sys_msgctl` or
+the corresponding `sys_shm*` entry points. `MSG_MANAGER` maps keys/IDs to
+`Arc<Mutex<MessageQueue>>`; queues hold `Message` vectors and ABI counters.
+`SHM_MANAGER` maps keys/IDs to `Arc<Mutex<ShmInner>>` and maps each process's
+attachment start addresses to IDs. `BiBTreeMap` maintains the key/ID bijection.
+`ShmInner` holds a backing `VfsFile`, ABI metadata and a vector of ranges per PID.
+The process-exit owner calls `ShmManager::clear_proc_shm` after releasing the mm
+owner to remove attachment accounting and reap marked segments.
 
-## 范围
+Both IPC object classes allocate IDs from the shared relaxed `AtomicI32`
+`IPC_ID`. Namespace-scoped ID allocation is not implemented.
 
-- `src/msg.rs`
-- `src/shm.rs`
+## Message flow
 
-## SysV shm 架构
+`sys_msgget` checks the queue limit, resolves a key, handles create/exclusive
+flags and publishes a new queue when required. `sys_msgsnd` copies the type and
+payload from userspace, checks positive type, `MSGMAX`, byte and message limits,
+then appends and updates sender/time metadata. `sys_msgrcv` chooses FIFO, exact
+type, first nonmatching type, smallest qualifying type, or indexed `MSG_COPY`;
+it copies type/payload out before removing a consumed message. `MSG_NOERROR`
+permits truncation. Control operations query metadata/statistics, change selected
+metadata or mark removal. An empty removed queue is removed from the manager;
+nonempty removed queues remain stored. Blocking send/receive and wakeups are
+not implemented: full queues return EAGAIN and no match returns ENOMSG.
 
-```text
-sys_shmget()
-  -> snapshots current Arc<Cred>
-  -> ShmManager allocates shmid / key mapping
-       -> ShmInner::new(cred)
-            -> memfs::shmem::create_kernel_file("SYSV...")
-       -> shmem object into opened VfsFile
-       -> set file length to page-aligned segment size
+## Shared-memory flow and state
 
-sys_shmat()
-  -> lookup ShmInner
-  -> choose process virtual address
-  -> filemap::mmap_shared_file(FileMmapRequest)
-  -> MmSpace::map_runtime_vma()
-  -> record pid -> shmid -> vaddr attach
+`sys_shmget` derives page count and mapping flags, then resolves or creates a
+segment. `ShmInner::new` receives explicit credentials, creates a shmem file,
+unlinks its directory entry, opens it and truncates to the page-aligned length.
+Its `shmid_ds` stores the requested byte size and effective creator/owner IDs.
+An existing keyed segment requires exactly matching size and mapping flags.
 
-sys_shmdt()
-  -> lookup shmid by process vaddr
-  -> MmSpace::unmap()
-  -> decrement attach count
-  -> remove segment if IPC_RMID and attach count is zero
-```
+`sys_shmat` snapshots the segment file/flags/length, drops the segment lock,
+obtains a mapping owner and selects a free range. `SHM_RDONLY` removes write
+permission; `SHM_RND` rounds a supplied address down. It calls
+`mmap_shared_file`, installs the runtime VMA, records the range in `ShmInner`,
+then updates the manager address index. Multiple attachments of the same segment
+by the same process are supported and tracked independently by start address.
 
-`ShmInner` stores IPC metadata and an `Arc<kvfs::VfsFile>`. It does not store
-physical pages or an anonymous shared object. The file is a private
-tmpfs/shmem-style regular inode whose content is owned by inode-scoped
-`kvfs::AddressSpace`.
+`sys_shmdt` finds the exact registered start address, holds the segment lock
+while unmapping, then removes its attachment record. After dropping that lock,
+it takes manager then segment locks to recheck removal and attachment count.
+`IPC_RMID` sets `rmid`; a marked segment is destroyed from global lookup only
+when the rechecked attachment count is zero. `clear_proc_shm` removes all ranges
+for a PID without unmapping them: the process-exit caller handles mm release.
 
-`ShmInner::new()` receives the operation's credential snapshot explicitly. It uses
-the snapshot for the backing file and initializes `shm_perm.uid/gid/cuid/cgid`
-from effective IDs, matching Linux `ipc_addid()`. The credential itself is not
-stored as duplicate `ShmInner` state; the opened `VfsFile` owns its `f_cred`.
+## Execution context and concurrency
 
-## 执行上下文
+Syscall entries require a current user thread, scheduler, allocator, filesystem
+and address-space facilities. They can sleep on mutexes and copy user memory;
+they must not run in interrupt context or early boot. Kernel tests can construct
+standalone queues and can construct segment backing using explicit credentials.
+A concrete queue usage sequence is `tests_msg::test_message_queue_remove_updates_accounting`
+in `src/msg.rs`: create, enqueue, remove and verify accounting.
 
-- SysV IPC syscall runs in process context.
-- `shmget` may allocate IPC metadata, shmem inode state and page-cache owner
-  metadata.
-- Unit-test and kernel-task callers must explicitly choose `initial_cred()` or
-  another credential instead of implicitly reading a nonexistent user thread.
-- `shmat` may allocate VMA metadata and file-backed runtime state.
-- These syscalls must not run from interrupt context.
+The manager mutexes protect global indices; each queue/segment mutex protects
+its local metadata and contents. When both manager and object are needed, take
+manager before object. `sys_shmat` drops the object lock before entering MM;
+`sys_shmdt` currently holds it across `MmSpace::unmap`, but never acquires the
+manager under that object lock. User copies in message/control paths may execute
+under object locks. Attachment publication spans separate MM, object and manager
+steps; it is not documented as a single atomic transaction.
 
-## 并发模型
+## Decisions, lifecycle and limitations
 
-- `SHM_MANAGER` protects global key/shmid and process attach maps.
-- Each `ShmInner` has its own sleepable `Mutex`.
-- Lock order is `SHM_MANAGER -> ShmInner` when both are needed.
-- `shmat` releases `ShmInner` before mapping through `MmSpace` and filemap, then
-  reacquires it to publish the attach record.
-- `shmdt` unmaps the process range before removing the attach record.
+File-backed shmem shares content ownership with inode pagecache rather than
+creating another physical-page owner. Unlinking the backing file makes final
+file/mapping references determine its lifetime. Removing global IPC metadata
+only releases this crate's references; mappings may still keep file state alive.
 
-## 设计决策
-
-1. SysV shm content is file-backed shmem, not anonymous shared pages.
-   原因：Linux ordinary SysV shm is implemented on top of shmem/tmpfs files, and
-   X-Kernel should share one content owner model across SysV shm, memfd and
-   `/dev/shm`.
-
-2. IPC metadata remains in `posix/ipc`.
-   原因：keys, ids, `shmid_ds`, attach count and `IPC_RMID` are syscall-visible
-   IPC semantics, not KFS or MM responsibilities.
-
-3. The shmem file length is page-aligned.
-   原因：SysV mappings are page-granular; keeping the backing file length aligned
-   prevents file-backed fault handling from reporting EOF inside the mapped
-   segment tail.
-
-## 当前兼容边界
-
-Supported:
-
-- `shmget` segment creation and keyed lookup;
-- `shmat` shared mapping through filemap/pagecache;
-- `shmdt` detach and address-space unmap;
-- `shmctl(IPC_STAT/IPC_SET/IPC_RMID)` metadata operations;
-- process-exit cleanup through `clear_proc_shm()`;
-- `/dev/shm` is mounted as a tmpfs instance during VFS bootstrap.
-
-Not supported:
-
-- `SHM_HUGETLB`;
-- full credential/capability checks;
-- complete Linux namespace and `/proc/sysvipc` reporting;
-- multi-attach of the same shmid by one process at different addresses.
+Message permission helpers are called with hard-coded UID/GID zero, so they do
+not enforce real per-user isolation. Shared-memory authorization and Linux flag
+semantics are incomplete: `SHM_REMAP` is parsed but not implemented, unknown bits
+are truncated, and creation/exclusive/huge-page semantics are not fully checked.
+`IPC_SET` for shm replaces the user-supplied ABI structure, including fields
+normally maintained by the kernel. IPC namespaces, full Linux accounting and
+robust global ID exhaustion handling are not provided here.

@@ -32,7 +32,7 @@ use crate::{
     publication::PublishedProcessSlot,
 };
 
-/// A process.
+/// Stable process identity with parent/group relations, exit state and runtime capabilities.
 pub struct Process {
     /// Stable process-leader PID handle. Future PID namespace work should keep
     /// namespace-specific numbers behind this identity object.
@@ -255,11 +255,19 @@ impl Process {
         self.fork_with_task_number(PidHandle::fixed_root(pid), exit_signal)
     }
 
+    /// Constructs a parentless identity using an already allocated leader handle.
+    ///
+    /// The first such process becomes global init. This does not construct a Thread
+    /// or publish a runnable task; boot code must complete runtime setup first.
     #[doc(hidden)]
     pub fn new_init_with_task_number(leader_task_number: Arc<PidHandle>) -> Arc<Process> {
         Self::new_with_task_number(leader_task_number, None, None)
     }
 
+    /// Constructs and attaches a child identity with its allocated leader handle.
+    ///
+    /// This low-level helper does not copy a runtime or activate a task. Prefer
+    /// `Thread::prepare_process_fork` for complete fallible clone preparation.
     #[doc(hidden)]
     pub fn fork_with_task_number(
         self: &Arc<Process>,
@@ -275,6 +283,10 @@ pub(crate) static INIT_PROC: LazyInit<Arc<Process>> = LazyInit::new();
 /// Gets the init process.
 ///
 /// This function panics if the init process has not been initialized yet.
+///
+/// # Panics
+///
+/// Panics when no initial process has been constructed.
 pub fn init_proc() -> Arc<Process> {
     INIT_PROC.get().unwrap().clone()
 }

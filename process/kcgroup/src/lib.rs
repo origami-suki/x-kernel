@@ -2,11 +2,30 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Cgroup v2 hierarchy and task membership.
+//! Cgroup v2 hierarchy, pids admission, and stable task membership.
 //!
-//! This crate owns the kernel's canonical cgroup state. Filesystems and Linux
-//! syscall compatibility code are adapters over these objects; they must not
-//! maintain parallel membership or controller state.
+//! Use [`CgroupNamespace::initial`] for the system hierarchy. Adapters must supply
+//! authorization; they must not keep parallel membership/controller state.
+//! Reserve a [`TaskCharge`] before task publication and commit it to a stable
+//! identity, or drop it to roll back. APIs require kernel allocation and sleepable
+//! locks; migration intentionally ignores new-task pids limits.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use kcgroup::CgroupNamespace;
+//! let root = CgroupNamespace::new().root();
+//! root.set_pids_subtree_enabled(true).unwrap();
+//! let group = root.create_child("worker").unwrap();
+//! let operation = group.begin_operation().unwrap();
+//! group.set_pids_max(Some(1)).unwrap();
+//! drop(operation);
+//! let identity = kidentity::allocate_root_pid_handle().unwrap();
+//! let member = group.reserve_task().unwrap().commit(identity).unwrap();
+//! assert_eq!(group.pids_current(), Ok(1));
+//! member.detach();
+//! root.remove_child("worker").unwrap();
+//! ```
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -181,6 +200,11 @@ impl Cgroup {
     }
 
     /// Creates a direct child node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` for an empty, dot, dot-dot, or slash-containing name,
+    /// `ENOENT` for an inactive parent, or `EEXIST` for a duplicate child name.
     pub fn create_child(self: &Arc<Self>, name: &str) -> KResult<Arc<Self>> {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(KError::from(LinuxError::EINVAL));
@@ -222,6 +246,11 @@ impl Cgroup {
     }
 
     /// Removes an empty direct child node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` if the named child is absent, or `EBUSY` if it is not
+    /// active or still has children, members, or lifecycle reservations.
     pub fn remove_child(&self, name: &str) -> KResult<()> {
         let _transaction = self.hierarchy.transaction.lock();
         let child = self
@@ -234,6 +263,12 @@ impl Cgroup {
     }
 
     /// Removes the exact child node previously resolved by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` unless the parent contains this exact child object.
+    /// Returns `EBUSY` if removal is already active or children, members, or
+    /// reservations remain.
     pub fn remove_child_node(self: &Arc<Self>, child: &Arc<Self>) -> KResult<()> {
         let _transaction = self.hierarchy.transaction.lock();
         self.remove_child_exact_locked(child)
@@ -274,6 +309,15 @@ impl Cgroup {
     ///
     /// Removal cannot complete while the returned guard is alive. Operations
     /// started after removal receive `ENODEV`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENODEV` if the node is not active. Keep the guard alive through
+    /// the complete filesystem operation; it guarantees liveness, not authorization.
+    ///
+    /// See the [crate example](crate) for controller setup and the
+    /// reserve/commit/detach lifecycle. Filesystem adapters additionally acquire an
+    /// operation guard before using a node and drop it when the operation finishes.
     pub fn begin_operation(self: &Arc<Self>) -> KResult<CgroupOperationGuard> {
         let _transaction = self.hierarchy.transaction.lock();
         if !self.is_active() {
@@ -292,6 +336,11 @@ impl Cgroup {
     }
 
     /// Returns the nearest common ancestor in the same hierarchy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EXDEV` if the nodes belong to different hierarchies or their
+    /// live parent lineages have no common ancestor.
     pub fn common_ancestor(self: &Arc<Self>, other: &Arc<Self>) -> KResult<Arc<Self>> {
         let _transaction = self.hierarchy.transaction.lock();
         if !Arc::ptr_eq(&self.hierarchy, &other.hierarchy) {
@@ -391,6 +440,11 @@ impl Cgroup {
     }
 
     /// Returns the configured task limit, or `None` for `max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENODEV` for an inactive node, or `ENOENT` if no active pids
+    /// controller is attached (including the hierarchy root).
     pub fn pids_max(&self) -> KResult<Option<usize>> {
         let pids = self.active_pids_controller()?;
         Ok(match pids.max.load(Ordering::Acquire) {
@@ -401,6 +455,15 @@ impl Cgroup {
 
     /// Changes the task limit. A value below `pids.current` is valid and only
     /// prevents later task creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` for a numeric limit above [`Self::PIDS_MAX_LIMIT`],
+    /// `ENODEV` for an inactive node, or `ENOENT` without an active controller.
+    ///
+    /// See the [crate example](crate) for controller setup and the
+    /// reserve/commit/detach lifecycle. Filesystem adapters additionally acquire an
+    /// operation guard before using a node and drop it when the operation finishes.
     pub fn set_pids_max(&self, limit: Option<usize>) -> KResult<()> {
         if limit.is_some_and(|limit| limit > Self::PIDS_MAX_LIMIT) {
             return Err(KError::from(LinuxError::EINVAL));
@@ -412,6 +475,11 @@ impl Cgroup {
     }
 
     /// Returns the number of live and reserved tasks charged to this node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENODEV` for an inactive node, or `ENOENT` without an active
+    /// pids controller (including the hierarchy root).
     pub fn pids_current(&self) -> KResult<usize> {
         Ok(self
             .active_pids_controller()?
@@ -425,6 +493,16 @@ impl Cgroup {
     }
 
     /// Enables or disables pids control in direct children.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` for an inactive node, `EINVAL` when enabling a controller
+    /// not available from the parent, or `EBUSY` when enabling on a non-root node
+    /// with direct members or disabling while a child still delegates the controller.
+    ///
+    /// See the [crate example](crate) for controller setup and the
+    /// reserve/commit/detach lifecycle. Filesystem adapters additionally acquire an
+    /// operation guard before using a node and drop it when the operation finishes.
     pub fn set_pids_subtree_enabled(&self, enabled: bool) -> KResult<()> {
         let _transaction = self.hierarchy.transaction.lock();
         if !self.is_active() {
@@ -471,6 +549,16 @@ impl Cgroup {
     }
 
     /// Reserves one task charge for fork or clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` for an inactive node, or `EAGAIN` when an active
+    /// controller limit is reached or a count would overflow. Partial charges
+    /// are rolled back before returning an error.
+    ///
+    /// See the [crate example](crate) for controller setup and the
+    /// reserve/commit/detach lifecycle. Filesystem adapters additionally acquire an
+    /// operation guard before using a node and drop it when the operation finishes.
     pub fn reserve_task(self: &Arc<Self>) -> KResult<TaskCharge> {
         let _transaction = self.hierarchy.transaction.lock();
         if !self.is_active() {
@@ -562,6 +650,16 @@ impl TaskCharge {
     ///
     /// Returns `EEXIST` when that identity already has membership in this
     /// cgroup. The reserved controller charge is rolled back on failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if not every controller was charged or the reserved node is inactive.
+    /// Successful reservation and its retained lifecycle reservation maintain these
+    /// invariants until commit or rollback.
+    ///
+    /// See the [crate example](crate) for controller setup and the
+    /// reserve/commit/detach lifecycle. Filesystem adapters additionally acquire an
+    /// operation guard before using a node and drop it when the operation finishes.
     pub fn commit(mut self, task: Arc<kidentity::PidHandle>) -> KResult<TaskMembership> {
         let task_key = TaskIdentityKey::new(&task);
         assert_eq!(
@@ -618,11 +716,24 @@ impl TaskMembership {
     }
 
     /// Moves an existing task without applying `pids.max` to the target.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::migrate_group`] errors: `ENOENT` for an inactive target,
+    /// `EBUSY` for a non-root delegating target, `EXDEV` for another hierarchy,
+    /// and `EAGAIN` for controller-count overflow.
     pub fn migrate(&self, target: &Arc<Cgroup>) -> KResult<()> {
         Self::migrate_group(&[self], target)
     }
 
     /// Moves a fixed set of tasks as one membership transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ENOENT` for an inactive target, `EBUSY` if a non-root target
+    /// delegates controllers, `EXDEV` for any attached source in another hierarchy,
+    /// or `EAGAIN` on controller-count overflow. Validation precedes mutation and
+    /// failed additions are rolled back. Detached members are skipped.
     pub fn migrate_group(memberships: &[&Self], target: &Arc<Cgroup>) -> KResult<()> {
         let _transaction = target.hierarchy.transaction.lock();
         if !target.is_active() {
@@ -704,6 +815,11 @@ impl TaskMembership {
     }
 
     /// Reserves a child task in the same cgroup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ESRCH` if membership is detached; otherwise propagates
+    /// [`Cgroup::reserve_task`] errors (`ENOENT` or `EAGAIN`).
     pub fn reserve_child(&self) -> KResult<TaskCharge> {
         let cgroup = self
             .cgroup

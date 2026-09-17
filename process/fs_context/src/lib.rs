@@ -2,11 +2,23 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Process filesystem context state.
+//! Process filesystem state: root, working directory, umask, and exec flag.
 //!
-//! This crate owns the Rust counterpart of Linux `struct fs_struct`: root,
-//! current working directory, file creation mask, and exec transition state.
-//! Process runtime code owns or shares references to this object.
+//! [`FsStruct`] is the process-owned counterpart of Linux `fs_struct`;
+//! [`init_fs`] returns its initial shared instance. Path resolution and mount
+//! transactions belong to KVFS. Attach mounted paths before using root/pwd readers.
+//!
+//! # Example
+//!
+//! ```
+//! use fs_context::FsStruct;
+//! let mut fs = FsStruct::for_init_task();
+//! assert_eq!(fs.replace_umask(0o077), 0o022);
+//! fs.set_in_exec(true);
+//! let child = fs.clone_for_process();
+//! assert_eq!(child.umask(), 0o077);
+//! assert!(!child.in_exec());
+//! ```
 
 #![cfg_attr(any(not(test), doc), no_std)]
 
@@ -58,11 +70,21 @@ impl FsStruct {
     }
 
     /// Creates a mounted filesystem context with root as both root and pwd.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `root` is not a directory. Use [`Self::from_root_and_pwd`]
+    /// when the caller needs a recoverable error.
     pub fn new(root: Path) -> Self {
         Self::from_root_and_pwd(root.clone(), root).expect("initial root must be a directory")
     }
 
     /// Creates a mounted filesystem context from explicit root and pwd.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VfsError::NotADirectory` if any supplied path is not a directory.
+    /// No path fields are changed on error.
     pub fn from_root_and_pwd(root: Path, pwd: Path) -> VfsResult<Self> {
         Self::require_directory(&root)?;
         Self::require_directory(&pwd)?;
@@ -92,6 +114,26 @@ impl FsStruct {
     }
 
     /// Attaches the first mounted root to this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VfsError::NotADirectory` if any supplied path is not a directory.
+    /// No path fields are changed on error.
+    ///
+    /// # Example
+    ///
+    /// The caller supplies a resolved, authorized directory from its mounted tree.
+    /// After attachment, the initialized path readers are available:
+    ///
+    /// ```no_run
+    /// # fn mount_context(root: kvfs::Path) -> kvfs::VfsResult<()> {
+    /// let mut fs = fs_context::FsStruct::for_init_task();
+    /// fs.attach_root(root)?;
+    /// let (root, pwd) = fs.root_and_pwd();
+    /// assert!(root.is_dir() && pwd.is_dir());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn attach_root(&mut self, root: Path) -> VfsResult<()> {
         Self::require_directory(&root)?;
         self.root = Some(root.clone());
@@ -100,16 +142,37 @@ impl FsStruct {
     }
 
     /// Returns this context's root path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root has not been initialized.
+    /// Install paths with [`Self::attach_root`] before calling this method.
+    ///
+    /// See [`Self::attach_root`] for a complete initialization sequence.
     pub fn root(&self) -> &Path {
         self.root.as_ref().expect("fs root not initialized")
     }
 
     /// Returns this context's current working directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the working directory has not been initialized.
+    /// Install paths with [`Self::attach_root`] before calling this method.
+    ///
+    /// See [`Self::attach_root`] for a complete initialization sequence.
     pub fn pwd(&self) -> &Path {
         self.pwd.as_ref().expect("fs pwd not initialized")
     }
 
     /// Returns root and pwd as a stable snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root or working directory has not been initialized.
+    /// Install paths with [`Self::attach_root`] before calling this method.
+    ///
+    /// See [`Self::attach_root`] for a complete initialization sequence.
     pub fn root_and_pwd(&self) -> (Path, Path) {
         (self.root().clone(), self.pwd().clone())
     }
@@ -140,6 +203,11 @@ impl FsStruct {
     }
 
     /// Changes this context's root.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VfsError::NotADirectory` if any supplied path is not a directory.
+    /// No path fields are changed on error.
     pub fn set_root(&mut self, root: Path) -> VfsResult<()> {
         Self::require_directory(&root)?;
         if self.pwd.is_none() {
@@ -150,6 +218,13 @@ impl FsStruct {
     }
 
     /// Changes this context's current working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VfsError::NotADirectory` for a non-directory path, or
+    /// `VfsError::InvalidInput` if root has not been initialized. State is unchanged.
+    ///
+    /// See [`Self::attach_root`] for a complete initialization sequence.
     pub fn set_pwd(&mut self, pwd: Path) -> VfsResult<()> {
         Self::require_directory(&pwd)?;
         if self.root.is_none() {
@@ -160,6 +235,11 @@ impl FsStruct {
     }
 
     /// Replaces root and current working directory in one validated update.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VfsError::NotADirectory` if any supplied path is not a directory.
+    /// No path fields are changed on error.
     pub fn replace_root_and_pwd(&mut self, root: Path, pwd: Path) -> VfsResult<()> {
         Self::require_directory(&root)?;
         Self::require_directory(&pwd)?;
@@ -169,6 +249,11 @@ impl FsStruct {
     }
 
     /// Clones this context and replaces pwd in the clone.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the directory and initialization errors from [`Self::set_pwd`].
+    /// The original context is unchanged.
     pub fn clone_with_pwd(&self, pwd: Path) -> VfsResult<Self> {
         let mut fs = self.snapshot();
         fs.set_pwd(pwd)?;

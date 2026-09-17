@@ -1,143 +1,99 @@
-# kfd_objects - 设计文档
+# kfd_objects — Design
 
-## 定位
+## Purpose and scope
 
-`kfd_objects` 是 x-kernel 中 fd-backed kernel object 的 owner crate。
-它承接那些通过进程 fd table 暴露给用户态、实现 VFS `FileOperations` / `Pollable`，
-但本质上不属于路径/VFS 对象的数据和状态机。
+This crate owns epoll, eventfd, signalfd and timerfd object state and file
+operations. `src/lib.rs` publicly exposes `epoll`, `eventfd`, `signalfd` and
+`timerfd`, implemented in the corresponding source files. `ksyscall` decodes ABI
+arguments, resolves descriptor tables and validates operation-specific flags;
+`kfd_objects` accepts resolved `VfsFile` references and typed object inputs.
+`anon_inodefs` creates anonymous files, `kvfs` dispatches their file operations,
+`kpoll` owns poll registration and `ktask::future` supplies blocking/timer runtime.
+Credentials are explicit constructor inputs captured by `VfsFile`, not duplicated
+in object state. This crate does not own process descriptor-number allocation.
 
-当前该 crate 承接 `TimerFd`、`EventFd`、`Signalfd` 和 `Epoll`。
-目标读者是维护 `ksyscall` syscall adapter、`kfd`/`kresources` fd table，
-以及 `timerfd`、`eventfd`、`signalfd`、`epoll` 等匿名对象实现的开发者。
+## Object architecture and direct flows
 
-## 背景
+| Object | State and providers | Flow |
+|---|---|---|
+| `EventFd` | Atomic counter, semaphore flag, read/write `PollSet`s | `new_file` constructs anonymous private data; file read atomically decrements/reset-count, write conditionally adds, and each wakes the opposite side. |
+| `TimerFd` | Clock ID, `SpinNoIrq<TimerFdInner>`, timer-handle lock and `PollSet` | `settime` validates a deadline, cancels the old handle, updates state and arms a `ktask::future` timer; callback/read/poll tick expiration state. |
+| `Signalfd` | `RwLock<SignalSet>` and read `PollSet` | Each file read/poll resolves the current `ThreadSignalManager`, selects pending signals by the mask and serializes one 128-byte record per read. |
+| `Epoll` | `Arc<EpollInner>`, interest table, ready queue and poll set | `add`/`modify` register watched file poll sources; callbacks enqueue weak interest references; `poll_events` returns ready ABI events and rearms interests. |
 
-历史上，`timerfd` 之类对象因为“通过 fd 暴露”而被顺手放进了
-`posix-fs` 一类按 syscall/API 分类的 crate。
-这会让资源 owner 和 syscall adapter 混在一起：
+`from_file` retrieves the typed private data and rejects an unrelated file.
+The anonymous file operations implement `kvfs::FileOperations`; eventfd/timerfd
+and epoll implement `kpoll::Pollable`, while signalfd uses a current-thread access
+wrapper. These are provider-to-object callbacks, distinct from syscall entry
+points. A constructor/use example is in crate rustdoc.
 
-- syscall 层承担 ABI 参数和用户指针转换；
-- 资源对象自身承担状态、不变量和生命周期；
-- fd table 只负责持有和索引对象句柄。
+## Execution context
 
-`kfd_objects` 的目标是把第二层单独收出来，按对象状态边界组织实现。
+File construction requires allocator and initialized anonymous-inode filesystem.
+`read`/`write` may block through `block_on(poll_io(...))` unless the file carries
+NONBLOCK. The authoritative nonblocking flag is on `VfsFile`. Epoll control uses
+a sleepable mutex and may allocate; it must run in task context. Signalfd data
+access requires a current user thread; a kernel task gets
+`OperationNotPermitted` on read and ERR readiness. Object construction itself
+requires no current credentials because the caller supplies them.
 
-## 范围
+Timer polling/rearming requires initialized clock/timer/scheduler services.
+Timer callbacks use IRQ-safe inner state; epoll ready/config/table locks disable
+preemption but are not IRQ-masking locks. Do not infer interrupt-context support
+for arbitrary watched-file callbacks from the object API. No API is a general
+early-boot or reentrant-syscall guarantee; callers must satisfy provider context
+contracts and avoid holding locks across calls that can block.
 
-当前涉及的源文件：
+## State machines and algorithms
 
-```text
-process/kfd_objects/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs
-│   ├── epoll.rs
-│   ├── eventfd.rs
-│   ├── signalfd.rs
-│   └── timerfd.rs
-└── docs/
-    ├── design.md
-    └── security.md
-```
+Timer state is disarmed (`deadline=None`) or armed with a monotonic/realtime
+deadline. Expiration of a one-shot timer increments the saturated count and
+clears the deadline. A periodic timer counts overdue periods and advances its
+deadline by that many intervals; representational overflow can clear the next
+deadline. Read consumes accumulated expirations. `settime` with zero value clears
+the interval/count/deadline. Validation happens before cancellation, preserving
+the previous timer when a new deadline is unrepresentable.
 
-## 架构
+Eventfd read decrements by one in semaphore mode and by the whole counter
+otherwise. The current implementation copies the pre-update counter to the
+caller in both modes; it does not claim Linux's semaphore-mode return value of
+one. Write rejects `u64::MAX` and only commits when the new counter is below it.
 
-```text
-core/ksyscall adapter
-    │ eventfd2 / timerfd_* / signalfd4 / epoll_* ABI binding
-    v
-process/kfd_objects::{Epoll, EventFd, Signalfd, TimerFd}
-    │ owns epoll/timer/event/signalfd state and FileOperations/Pollable behavior
-    v
-kfd / kresources fd table
-    │ stores Arc<VfsFile>
-    v
-read/poll/close via generic fd syscalls
-```
+Epoll `TriggerMode` has Level, Edge and OneShot `{ fired }` states. OneShot
+consumption sets `fired=true`; `modify` rearms by replacing configuration on the
+same interest identity. Level-ready interests are deferred for the next poll;
+Edge/OneShot consumption removes the current ready entry and handles rearming.
+The ready scan is bounded by the queue length at entry and deduplicates keys,
+so synchronous requeue cannot keep one call running indefinitely. A key contains
+both fd number and weak file identity. Generation checks reject stale wakers.
 
-## 设计原则
+## Concurrency and resource lifecycle
 
-- syscall ABI 适配留在 `ksyscall`。
-- `kfd_objects` 拥有对象状态、不变量和生命周期。
-- `kfd`/`kresources` 只负责 fd 槽位和对象句柄，不拥有对象业务语义。
-- 路径查找和通用 VFS 管理不进入该 crate；匿名 fd 对象通过 `VfsFile`
-  和对象自己的 `FileOperations` 暴露行为。
-- 文件构造函数显式接收 `Arc<Cred>`。syscall adapter 在操作入口取得一次当前凭据，
-  内核调用者则显式选择 `initial_cred()` 等凭据；`kfd_objects` 不反向读取当前 task。
-  该快照只进入 `VfsFile::f_cred`，对象本身不重复保存 credential 字段。
+Eventfd uses acquire loads and release/acquire fetch-update loops for its counter.
+Timer inner state and handle slots have separate `SpinNoIrq` locks. These protect
+their fields; they do not by themselves make every cancel/register/reprogram
+sequence one atomic transaction. Registered timer wakers own `Arc<TimerFd>`;
+`Drop` cancels a retained handle when final destruction actually occurs. Closing
+a file alone must not be described as proving immediate destruction, since a
+registered callback can retain the object.
 
-## `TimerFd` 角色
+Signalfd mask changes take the RwLock and wake readers. Signal queues belong to
+`ksignal`, not this object. Epoll's `ctl_lock` serializes ADD/MOD/DEL including
+registration failure rollback. Separate `SpinNoPreempt` locks protect table,
+ready queue and per-interest configuration; atomics track queue membership and
+waker generation. Registration owners are replaced under their lock and dropped
+outside it to avoid nested unregister locks. The table owns interests; ready
+entries, watched files and callback owner references use weak links where
+specified by their structures, so expired targets can be removed while polling.
 
-`TimerFd` 拥有：
+## Decisions and limitations
 
-- `clock_id`
-- 当前 `deadline`
-- 周期 `interval`
-- 未消费的 `expirations`
-- 注册到底层 timer runtime 的 handle
-- `poll(IN)` 与 `read()` 的一致性语义
-
-它不处理：
-
-- Linux `itimerspec` 的 `copyin/copyout`
-- syscall flag ABI 解析
-- fd table 分配策略
-
-这些分别留在 `ksyscall` adapter 和 `kresources`。
-
-## `EventFd` 角色
-
-`EventFd` 拥有：
-
-- 当前 64-bit 计数值；
-- semaphore 与普通累加两种读语义；
-- 基于打开文件状态的非阻塞读写语义；
-- `poll(IN/OUT)` 的就绪状态与唤醒点。
-
-它不处理：
-
-- `eventfd2` flags ABI 解析；
-- fd table 分配策略；
-- syscall 层错误码和参数边界。
-
-## `Signalfd` 角色
-
-`Signalfd` 拥有：
-
-- signal mask；
-- 基于打开文件状态的 nonblocking 语义；
-- `read()` 消费 pending signal 的 fd 语义；
-- `poll(IN)` 与 pending signal 可见性的对应关系。
-- Linux `signalfd_siginfo` 导出语义：通用 header 字段始终来自
-  `SignalInfo`，timer signal 导出 timer ID/overrun/sigval，child-exit
-  signal 按 `SIL_CHLD` 导出 child PID、UID、退出状态和 CPU clock ticks。
-
-它不处理：
-
-- `signalfd4` 的 syscall 参数校验；
-- signal syscall ABI 入口；
-- fd table 分配策略。
-
-## `Epoll` 角色
-
-`Epoll` 拥有：
-
-- interest table；
-- ready queue；
-- level / edge / oneshot 触发状态；
-- `poll(IN)` 与 ready queue 可见性的对应关系。
-
-每个 watched fd 在 `ADD` 到 `DEL` 之间对应一个稳定的 `EpollInterest` 对象。
-`MOD` 不替换 interest identity，而是在对象内原地更新 event mask、user data 和
-trigger mode；ready queue 中的 weak entry 因此始终指向同一个 interest。该模型
-与 Linux eventpoll 的 `epitem` 原地修改思路一致，避免旧 interest registration
-在 `MOD` 发布窗口内被唤醒后返回旧配置。
-`ADD` / `MOD` / `DEL` 通过 epoll 实例内的 sleepable ctl lock 串行化，保证
-registration 重装、失败回滚和 interest table 更新不会被另一个 epoll_ctl 操作交错。
-
-它不处理：
-
-- `epoll_*` 的 syscall 参数校验；
-- timeout / sigmask 的 ABI 解析；
-- watched file 的 fd table 解析；
-- fd table 分配策略。
+Keeping backend state here allows syscall adapters to handle descriptor lookup
+without creating process dependencies for each object. Stable MOD identities
+prevent queued events from referring to an abandoned configuration object.
+Current timer clock selection treats MONOTONIC/BOOTTIME as monotonic and other
+IDs as realtime; the adapter must restrict accepted clock IDs. Signalfd mask
+filtering (including uncatchable signals) belongs to its syscall adapter. This
+backend does not promise complete Linux epoll graph/cycle validation, timer
+clock-change cancellation, semaphore-mode return compatibility or synchronous
+file-close cancellation of retained timer callbacks.

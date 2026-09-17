@@ -2,7 +2,20 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Process resource-limit types.
+//! Process resource-limit values, Linux-indexed tables, and kernel defaults.
+//!
+//! Use [`Rlimits::new`] for a process table and [`Rlimit::new`] for a pair.
+//! Callers own validation, synchronization, and enforcement.
+//!
+//! # Example
+//!
+//! ```
+//! use krlimit::{Rlimit, Rlimits};
+//! use linux_raw_sys::general::RLIMIT_NOFILE;
+//! let mut limits = Rlimits::new(512 * 1024);
+//! limits[RLIMIT_NOFILE] = Rlimit::new(128, 256);
+//! assert_eq!(limits[RLIMIT_NOFILE].current, 128);
+//! ```
 
 #![no_std]
 
@@ -34,6 +47,9 @@ impl Rlimit {
     pub const INFINITY: Self = Self::new(RLIM_INFINITY, RLIM_INFINITY);
 
     /// Creates a new `Rlimit` with the specified soft and hard limits.
+    ///
+    /// The values are accepted without checking `soft <= hard`; callers applying
+    /// resource policy must validate the pair before storing it.
     pub const fn new(soft: u64, hard: u64) -> Self {
         Self {
             current: soft,
@@ -51,11 +67,18 @@ impl From<u64> for Rlimit {
     }
 }
 
-/// Process resource limits.
+/// A fixed table indexed by Linux resource numbers.
+///
+/// Indexing or mutably indexing with a value at least `RLIM_NLIMITS` panics.
+/// Entries and constructors do not enforce soft/hard policy; callers must
+/// validate indices and updates before using the indexing traits.
 pub struct Rlimits([Rlimit; RLIM_NLIMITS as usize]);
 
 impl Rlimits {
     /// Creates a new limit table with Linux-like defaults.
+    ///
+    /// `user_stack_size` is the configured stack capacity in bytes and sets
+    /// both stack limits. The file-count defaults use [`FILE_LIMIT`].
     pub fn new(user_stack_size: usize) -> Self {
         let mut result = Self([Rlimit::INFINITY; RLIM_NLIMITS as usize]);
 

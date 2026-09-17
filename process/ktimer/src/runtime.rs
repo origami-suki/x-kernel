@@ -69,6 +69,10 @@ pub(super) fn enqueue_alarm(deadline: MonotonicInstant, pid: Pid) {
 }
 
 /// Registers the callback used to handle expired timer owners.
+///
+/// The handler receives the PID whose timers must be polled; `kprocess`
+/// registers it during process-subsystem init. Only the first registration
+/// takes effect (`Once`).
 pub fn register_expired_task_handler(handler: fn(Pid)) {
     EXPIRED_TASK_HANDLER.call_once(|| handler);
 }
@@ -117,7 +121,11 @@ async fn alarm_task() {
     }
 }
 
-/// Spawns the alarm task.
+/// Spawns the global alarm task that waits on the earliest queued
+/// `MonotonicInstant` deadline and invokes the expired-owner handler.
+///
+/// Called once during kernel/process subsystem bring-up; the task runs for
+/// the lifetime of the kernel.
 pub fn spawn_alarm_task() {
     ktask::spawn_raw(
         || block_on(alarm_task()),

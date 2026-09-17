@@ -19,19 +19,28 @@ use super::{
     current_unix_seconds, has_ipc_permission, next_ipc_id,
 };
 
+/// A queued message type and owned payload.
 pub struct Message {
+    /// Positive message type used by syscall selection.
     pub mtype: i64,
+    /// Payload bytes excluding the message-type header.
     pub data: Vec<u8>,
 }
 
+/// Message storage and ABI accounting protected by its manager-provided mutex.
 pub struct MessageQueue {
+    /// User-visible permissions, limits, counts and timestamps.
     pub msqid_ds: msqid_ds,
+    /// Messages in enqueue order; update counters when mutating this vector.
     pub messages: Vec<Message>,
+    /// Total payload bytes represented by `messages`.
     pub total_bytes: usize,
+    /// Whether control operations marked this queue for removal.
     pub mark_removed: bool,
 }
 
 impl MessageQueue {
+    /// Creates an empty queue with the given owner IDs and default byte limit.
     pub fn new(key: i32, mode: __kernel_mode_t, pid: Pid, uid: u32, gid: u32) -> Self {
         MessageQueue {
             msqid_ds: msqid_ds {
@@ -62,6 +71,11 @@ impl MessageQueue {
         }
     }
 
+    /// Appends a payload and updates byte/message accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns ENOSPC when the resulting payload bytes exceed `msg_qbytes`.
     pub fn enqueue_message(&mut self, mtype: i64, data: Vec<u8>) -> KResult<()> {
         let data_len = data.len();
         if self.total_bytes + data_len > self.msqid_ds.msg_qbytes as usize {
@@ -78,12 +92,14 @@ impl MessageQueue {
         Ok(())
     }
 
+    /// Returns the first message as its index, type and borrowed payload.
     pub fn find_first_message(&self) -> Option<(usize, i64, &[u8])> {
         self.messages
             .first()
             .map(|message| (0, message.mtype, &message.data[..]))
     }
 
+    /// Returns the first message whose type equals `msgtyp`.
     pub fn find_message_by_type(&self, msgtyp: i64) -> Option<(usize, i64, &[u8])> {
         self.messages
             .iter()
@@ -92,6 +108,7 @@ impl MessageQueue {
             .map(|(index, message)| (index, message.mtype, &message.data[..]))
     }
 
+    /// Returns the first message whose type differs from `msgtyp`.
     pub fn find_message_not_equal(&self, msgtyp: i64) -> Option<(usize, i64, &[u8])> {
         self.messages
             .iter()
@@ -100,6 +117,7 @@ impl MessageQueue {
             .map(|(index, message)| (index, message.mtype, &message.data[..]))
     }
 
+    /// Returns the first message with the lowest type not exceeding `abs_typ`.
     pub fn find_message_less_equal(&self, abs_typ: i64) -> Option<(usize, i64, &[u8])> {
         let mut candidate = None;
 
@@ -118,14 +136,21 @@ impl MessageQueue {
         candidate
     }
 
+    /// Returns the number of stored messages, including a removed queue.
     pub fn get_total_message_count(&self) -> usize {
         self.messages.len()
     }
 
+    /// Borrows the message at an enqueue-order index, or returns `None`.
     pub fn get_message_by_index(&self, index: usize) -> Option<&Message> {
         self.messages.get(index)
     }
 
+    /// Removes an indexed message and subtracts its bytes from ABI accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns ENOMSG when `index` is outside the current message vector.
     pub fn remove_message_by_index(&mut self, index: usize) -> KResult<Message> {
         if index < self.messages.len() {
             let removed_msg = self.messages.remove(index);
@@ -139,6 +164,7 @@ impl MessageQueue {
     }
 }
 
+/// Global key/ID directory for mutex-protected message queues.
 pub struct MsgManager {
     key_msqid: BTreeMap<i32, i32>,
     msqid_queues: BTreeMap<i32, Arc<Mutex<MessageQueue>>>,
@@ -152,10 +178,12 @@ impl MsgManager {
         }
     }
 
+    /// Iterates all stored IDs and queue references, including removed queues.
     pub fn iter_msg_queues(&self) -> impl Iterator<Item = (i32, &Arc<Mutex<MessageQueue>>)> {
         self.msqid_queues.iter().map(|(&k, v)| (k, v))
     }
 
+    /// Iterates unremoved queues, taking each queue mutex to check its marker.
     pub fn iter_active_queues(&self) -> impl Iterator<Item = (i32, &Arc<Mutex<MessageQueue>>)> {
         self.iter_msg_queues().filter(|(_, queue)| {
             let guard = queue.lock();
@@ -163,31 +191,38 @@ impl MsgManager {
         })
     }
 
+    /// Looks up the queue ID registered for a key.
     pub fn get_msqid_by_key(&self, key: i32) -> Option<i32> {
         self.key_msqid.get(&key).cloned()
     }
 
+    /// Clones the stored queue reference for an ID, including removed queues.
     pub fn get_queue_by_msqid(&self, msqid: i32) -> Option<Arc<Mutex<MessageQueue>>> {
         self.msqid_queues.get(&msqid).cloned()
     }
 
+    /// Registers or replaces a key-to-ID association.
     pub fn insert_key_msqid(&mut self, key: i32, msqid: i32) {
         self.key_msqid.insert(key, msqid);
     }
 
+    /// Stores or replaces a queue reference for an ID.
     pub fn insert_msqid_queues(&mut self, msqid: i32, msg_queue: Arc<Mutex<MessageQueue>>) {
         self.msqid_queues.insert(msqid, msg_queue);
     }
 
+    /// Counts all stored queue entries, including entries marked removed.
     pub fn queue_count(&self) -> usize {
         self.msqid_queues.len()
     }
 
+    /// Removes an ID and every key association pointing to it.
     pub fn remove_msqid(&mut self, msqid: i32) {
         self.key_msqid.retain(|_, &mut v| v != msqid);
         self.msqid_queues.remove(&msqid);
     }
 
+    /// Sums payload bytes in active queues while taking their mutexes.
     pub fn total_bytes(&self) -> usize {
         self.iter_active_queues()
             .map(|(_, queue)| {
@@ -198,31 +233,50 @@ impl MsgManager {
     }
 }
 
+/// Maximum number of queue entries accepted by `sys_msgget`.
 pub const MSGMNI: usize = 32000;
+/// Default queue payload limit in bytes.
 pub const MSGMNB: usize = 16384;
+/// Maximum payload bytes accepted by `sys_msgsnd`.
 pub const MSGMAX: usize = 8192;
 
 static_lock! {
+    /// Global message directory; acquire this mutex before queue mutexes.
     pub static MSG_MANAGER: Mutex<MsgManager> = Mutex::new(MsgManager::new());
 }
 
 bitflags::bitflags! {
+    /// Receive selection, truncation and nonblocking request flags.
     #[derive(Debug)]
     pub struct MsgRcvFlags: i32 {
+        /// Return immediately when no transfer can proceed.
         const IPC_NOWAIT = 0o4000;
+        /// Truncate an oversized receive payload.
         const MSG_NOERROR = 0o10000;
+        /// Copy an indexed message without removing it.
         const MSG_COPY = 0o20000;
+        /// Select a message with a different positive type.
         const MSG_EXCEPT = 0o2000;
     }
 }
 
 bitflags::bitflags! {
+    /// Message-send nonblocking request flags.
     #[derive(Debug)]
     pub struct MsgSndFlags: i32 {
+        /// Return immediately when no transfer can proceed.
         const IPC_NOWAIT = 0o4000;
     }
 }
 
+/// Looks up or creates a queue and returns its ID in current-process context.
+///
+/// # Errors
+///
+/// Returns ENOSPC at the queue limit, ENOENT for an absent key without create
+/// or a missing mapped queue, EEXIST for create/exclusive collision, and EIDRM
+/// for a removed queue. The permission branch returns EACCES, but currently
+/// uses UID/GID zero rather than the current credentials.
 pub fn sys_msgget(key: i32, msgflg: i32) -> KResult<isize> {
     let current_uid: u32 = 0;
     let current_gid: u32 = 0;
@@ -294,6 +348,17 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> KResult<isize> {
     Ok(msqid as isize)
 }
 
+/// Copies a user message into a queue and returns zero.
+///
+/// `msgsz` excludes the type header. Requires sleepable current-process context;
+/// a full queue returns immediately even without IPC_NOWAIT.
+///
+/// # Errors
+///
+/// Returns EINVAL for excessive size, an unknown ID or nonpositive type;
+/// EAGAIN when byte/message capacity is exceeded; and forwards user-copy
+/// errors and `MessageQueue::enqueue_message` errors. The permission branch
+/// returns EACCES, but currently evaluates hard-coded UID/GID zero.
 pub fn sys_msgsnd(
     msqid: i32,
     msgp: UserConstPtr<msgbuf>,
@@ -361,6 +426,18 @@ pub fn sys_msgsnd(
     Ok(0)
 }
 
+/// Copies a selected queue message to userspace and returns payload bytes copied.
+///
+/// `msgtyp` selects FIFO (zero), exact/excluded type (positive), lowest type
+/// within an upper bound (negative), or an index with MSG_COPY. Requires
+/// sleepable current-process context. Empty queues do not block.
+///
+/// # Errors
+///
+/// Returns EINVAL for unsupported MSG_COPY combinations or an unknown ID,
+/// EIDRM for a removed queue, ENOMSG for no match/index, and E2BIG when the
+/// message exceeds `msgsz` without MSG_NOERROR. Forwards user-copy and indexed
+/// removal errors. EACCES is a permission branch using hard-coded zero IDs.
 pub fn sys_msgrcv(
     msqid: i32,
     msgp: UserPtr<msgbuf>,
@@ -478,6 +555,16 @@ pub fn sys_msgrcv(
     Ok(copy_len as isize)
 }
 
+/// Queries, updates or marks queue metadata for removal.
+///
+/// `buf` points to the ABI structure selected by `cmd`; metadata copying may
+/// block. Permission checks currently treat the caller as UID/GID zero.
+///
+/// # Errors
+///
+/// Returns EINVAL for unsupported commands/IDs/stat indices, EIDRM for a
+/// removed queue, EACCES on a failed read permission check, and EPERM for
+/// failed owner/creator/privilege or byte-limit checks. Forwards ABI copy errors.
 pub fn sys_msgctl(msqid: i32, cmd: i32, buf: UserPtr<u8>) -> KResult<isize> {
     let current_uid: u32 = 0;
     let current_gid: u32 = 0;

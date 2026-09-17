@@ -54,18 +54,32 @@ fn new_shmid_ds(
 
 /// Internal shared memory segment state.
 pub struct ShmInner {
+    /// Global identifier assigned to this segment.
     pub shmid: i32,
+    /// Page-aligned backing length measured in 4 KiB pages.
     pub page_num: usize,
     /// Multiple attachments per PID are allowed, one VMA per `shmat`.
     va_range: BTreeMap<Pid, Vec<VirtAddrRange>>,
+    /// Opened, unlinked shmem backing file held for this segment.
     pub file: Arc<VfsFile>,
+    /// Whether IPC_RMID requested deletion after the last detach.
     pub rmid: bool,
+    /// Permissions inherited by attachments before SHM_RDONLY restriction.
     pub mapping_flags: MappingFlags,
+    /// User-visible segment metadata and attachment accounting.
     pub shmid_ds: shmid_ds,
 }
 
 impl ShmInner {
     /// Creates a SysV shared-memory segment using the caller's credential snapshot.
+    ///
+    /// `size` is the requested byte length; backing storage is rounded to 4 KiB.
+    /// The caller supplies a valid bounded size and publishes the returned state
+    /// under its manager. This allocates and performs filesystem operations.
+    ///
+    /// # Errors
+    ///
+    /// Forwards errors from shmem creation, unlink, open and truncate.
     pub fn new(
         key: i32,
         shmid: i32,
@@ -108,6 +122,12 @@ impl ShmInner {
         })
     }
 
+    /// Validates an existing keyed segment and updates its last-operation PID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` unless requested size and mapping bits exactly
+    /// match the stored segment size and mode.
     pub fn try_update(
         &mut self,
         size: usize,
@@ -123,10 +143,12 @@ impl ShmInner {
         Ok(self.shmid as isize)
     }
 
+    /// Counts all registered ranges, including multiple attachments by one PID.
     pub fn attach_count(&self) -> usize {
         self.va_range.values().map(Vec::len).sum()
     }
 
+    /// Finds a PID attachment by its exact start address.
     pub fn get_addr_range_by_vaddr(&self, pid: Pid, vaddr: VirtAddr) -> Option<VirtAddrRange> {
         self.va_range
             .get(&pid)?
@@ -135,10 +157,15 @@ impl ShmInner {
             .cloned()
     }
 
+    /// Clones all registered ranges for a PID, or returns an empty vector.
     pub fn ranges_for_pid(&self, pid: Pid) -> Vec<VirtAddrRange> {
         self.va_range.get(&pid).cloned().unwrap_or_default()
     }
 
+    /// Records a mapped range and increments attachment/time/PID metadata.
+    ///
+    /// The caller must install the VMA before registering it and synchronize the
+    /// manager address index separately.
     pub fn attach_process(&mut self, pid: Pid, va_range: VirtAddrRange) {
         self.va_range.entry(pid).or_default().push(va_range);
         self.shmid_ds.shm_nattch += 1;
@@ -146,6 +173,7 @@ impl ShmInner {
         self.shmid_ds.shm_atime = current_unix_seconds();
     }
 
+    /// Removes all ranges for a PID and decrements metadata; does not unmap VMAs.
     pub fn detach_all_for_pid(&mut self, pid: Pid) {
         if let Some(ranges) = self.va_range.remove(&pid) {
             self.shmid_ds.shm_nattch -= ranges.len() as u16;
@@ -154,6 +182,7 @@ impl ShmInner {
         }
     }
 
+    /// Removes one matching start address and updates metadata; does not unmap.
     pub fn detach_process_by_vaddr(&mut self, pid: Pid, vaddr: VirtAddr) {
         if let Some(ranges) = self.va_range.get_mut(&pid)
             && let Some(pos) = ranges.iter().position(|range| range.start == vaddr)
@@ -169,6 +198,7 @@ impl ShmInner {
     }
 }
 
+/// A bidirectional one-to-one ordered map with replacement on either key.
 #[derive(Debug, Clone)]
 pub struct BiBTreeMap<K, V>
 where
@@ -184,6 +214,7 @@ where
     K: Ord + Clone,
     V: Ord + Clone,
 {
+    /// Creates an empty bidirectional map.
     pub const fn new() -> Self {
         BiBTreeMap {
             forward: BTreeMap::new(),
@@ -191,6 +222,7 @@ where
         }
     }
 
+    /// Inserts a pair, removing conflicting associations on either side.
     pub fn insert(&mut self, key: K, value: V) {
         if let Some(old_key) = self.reverse.insert(value.clone(), key.clone()) {
             self.forward.remove(&old_key);
@@ -200,14 +232,17 @@ where
         }
     }
 
+    /// Borrows the value paired with a forward key.
     pub fn get_by_key(&self, key: &K) -> Option<&V> {
         self.forward.get(key)
     }
 
+    /// Borrows the forward key paired with a reverse value.
     pub fn get_by_value(&self, value: &V) -> Option<&K> {
         self.reverse.get(value)
     }
 
+    /// Removes both directions by forward key and returns its former value.
     pub fn remove_by_key(&mut self, key: &K) -> Option<V> {
         if let Some(value) = self.forward.remove(key) {
             self.reverse.remove(&value);
@@ -217,6 +252,7 @@ where
         }
     }
 
+    /// Removes both directions by reverse value and returns its former key.
     pub fn remove_by_value(&mut self, value: &V) -> Option<K> {
         if let Some(key) = self.reverse.remove(value) {
             self.forward.remove(&key);
@@ -237,6 +273,7 @@ where
     }
 }
 
+/// Global segment directory and per-process attachment-address index.
 pub struct ShmManager {
     key_shmid: BiBTreeMap<i32, i32>,
     shmid_inner: BTreeMap<i32, Arc<Mutex<ShmInner>>>,
@@ -252,14 +289,17 @@ impl ShmManager {
         }
     }
 
+    /// Looks up the global segment ID associated with a key.
     pub fn get_shmid_by_key(&self, key: i32) -> Option<i32> {
         self.key_shmid.get_by_key(&key).cloned()
     }
 
+    /// Clones a segment reference by ID, including a segment marked for removal.
     pub fn get_inner_by_shmid(&self, shmid: i32) -> Option<Arc<Mutex<ShmInner>>> {
         self.shmid_inner.get(&shmid).cloned()
     }
 
+    /// Finds the segment attached at an exact start address in a PID.
     pub fn get_shmid_by_vaddr(&self, pid: Pid, vaddr: VirtAddr) -> Option<i32> {
         self.pid_shmid_vaddr
             .get(&pid)
@@ -275,14 +315,17 @@ impl ShmManager {
         Some(res)
     }
 
+    /// Registers the key/ID pair, replacing any conflicting pair.
     pub fn insert_key_shmid(&mut self, key: i32, shmid: i32) {
         self.key_shmid.insert(key, shmid);
     }
 
+    /// Stores the segment reference under its global ID.
     pub fn insert_shmid_inner(&mut self, shmid: i32, shm_inner: Arc<Mutex<ShmInner>>) {
         self.shmid_inner.insert(shmid, shm_inner);
     }
 
+    /// Registers one PID/start-address attachment after a successful mapping.
     pub fn insert_shmid_vaddr(&mut self, pid: Pid, shmid: i32, vaddr: VirtAddr) {
         self.pid_shmid_vaddr
             .entry(pid)
@@ -290,6 +333,7 @@ impl ShmManager {
             .insert(vaddr, shmid);
     }
 
+    /// Removes one PID/start-address index and drops an empty PID entry.
     pub fn remove_shmaddr(&mut self, pid: Pid, shmaddr: VirtAddr) {
         let mut empty: bool = false;
         if let Some(map) = self.pid_shmid_vaddr.get_mut(&pid) {
@@ -305,11 +349,16 @@ impl ShmManager {
         self.pid_shmid_vaddr.remove(&pid);
     }
 
+    /// Removes a segment ID and its key association; callers ensure detach policy.
     pub fn remove_shmid(&mut self, shmid: i32) {
         self.key_shmid.remove_by_value(&shmid);
         self.shmid_inner.remove(&shmid);
     }
 
+    /// Removes all exit-time attachment accounting for a PID and reaps marked segments.
+    ///
+    /// Call after the process mm owner is released: this does not unmap VMAs.
+    /// The manager is held while segment mutexes are acquired, so retain that order.
     pub fn clear_proc_shm(&mut self, pid: Pid) {
         // SHM_MANAGER is held throughout (&mut self).  Lock order is
         // SHM_MANAGER → ShmInner, matching sys_shmget and avoiding
@@ -341,6 +390,7 @@ impl ShmManager {
 }
 
 static_lock! {
+    /// Global segment directory; take this mutex before segment mutexes.
     pub static SHM_MANAGER: Mutex<ShmManager> = Mutex::new(ShmManager::new());
 }
 
@@ -353,6 +403,20 @@ bitflags::bitflags! {
     }
 }
 
+/// Creates or resolves a keyed shared-memory segment and returns its ID.
+///
+/// Requires sleepable current-user-thread context and available shmem backing.
+/// Existing segments require an exact size/mode match.
+///
+/// # Errors
+///
+/// Returns `KError::InvalidInput` for zero page count, a missing keyed object,
+/// or an existing segment size/mode mismatch. Forwards backing-file errors.
+///
+/// # Panics
+///
+/// Panics if `MappingFlags` does not define USER; current-thread accessors also
+/// require an installed user runtime.
 pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> KResult<isize> {
     let page_num = memaddr::align_up_4k(size) / PAGE_SIZE_4K;
     if page_num == 0 {
@@ -399,6 +463,16 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> KResult<isize> {
     Ok(shmid as isize)
 }
 
+/// Maps a segment into the current process and returns its start address.
+///
+/// Multiple attachments per PID are allowed. SHM_RDONLY removes write access;
+/// SHM_RND rounds an address down. This may sleep and allocate VMA state.
+///
+/// # Errors
+///
+/// Returns `KError::InvalidInput` for an unknown ID or unrounded unaligned
+/// address, and `KError::NoMemory` when no free range exists. Forwards process
+/// address-space, filemap and VMA installation errors.
 pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> KResult<isize> {
     let shm_inner_arc = {
         let shm_manager = SHM_MANAGER.lock();
@@ -489,6 +563,15 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> KResult<isize> {
     Ok(start_addr.as_usize() as isize)
 }
 
+/// Reads, replaces or marks shared-memory metadata according to `cmd`.
+///
+/// IPC_SET currently replaces the complete user-supplied structure. IPC_STAT
+/// accepts a null buffer as a no-op. Removal waits for the final attachment.
+///
+/// # Errors
+///
+/// Returns `KError::InvalidInput` for an unknown ID or unsupported command.
+/// Forwards fault-aware metadata read/write errors.
 pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<shmid_ds>) -> KResult<isize> {
     let shm_inner_arc = {
         let shm_manager = SHM_MANAGER.lock();
@@ -524,6 +607,15 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<shmid_ds>) -> KResult<isize
     Ok(0)
 }
 
+/// Unmaps the current process attachment at an exact registered start address.
+///
+/// Returns zero after accounting cleanup and any final marked-segment removal.
+/// Requires a current user process and sleepable context.
+///
+/// # Errors
+///
+/// Returns `KError::InvalidInput` for an unknown attachment address, segment
+/// or per-segment range. Forwards address-space lookup and unmap errors.
 pub fn sys_shmdt(shmaddr: usize) -> KResult<isize> {
     let shmaddr = VirtAddr::from(shmaddr);
 
@@ -573,6 +665,7 @@ pub fn sys_shmdt(shmaddr: usize) -> KResult<isize> {
     Ok(0)
 }
 
+/// Regression cases for segment metadata, backing and attachment cleanup.
 #[cfg(unittest)]
 pub mod tests_shm {
     use khal::paging::MappingFlags;

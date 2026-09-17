@@ -1,131 +1,78 @@
-# kns — 安全与可靠性分析
+# kns security and reliability
 
-## 信任模型
+## Scope, assets, and boundaries
 
-`kns` 信任内核调用方已经完成 syscall ABI 解析和基本 flag 校验。用户态不能直接构造
-`NsProxy` 或 namespace 对象；用户输入只能通过 `clone(2)`、后续 `unshare(2)` /
-`setns(2)`、UTS 名称 syscall 和 procfs namespace 视图间接影响本 crate。
+All modules under `src/` are covered. Assets are namespace references, mount
+view selection, and UTS name arrays. Kernel callers pass decoded flags,
+namespace handles, filesystem contexts, and copied UTS bytes. Syscall adapters
+own user-pointer copying and authorization. KVFS owns mount-tree visibility and
+lifetime; `fs_context` owns process path references; other namespace owners
+retain their respective policy responsibilities.
 
-`kns` 的职责是在已解析的内核语义值上维护 namespace 引用关系。权限检查、用户指针
-copy-in/copy-out 和 errno 映射属于 syscall 层或更上层策略代码。
+No direct user-pointer, MMIO, DMA, firmware, device/network packet, FFI, or
+assembly input is consumed. UTS setters receive user-controlled byte content
+through safe slices. Clone exchanges resolved paths with KVFS and updates the
+caller's private filesystem context.
 
-## 外部边界 / 攻击面
+## Unsafe inventory
 
-主要边界来自：
+The sole local unsafe boundary is `src/uts.rs::bytes_from_uts`, which calls
+`slice::from_raw_parts` to borrow a `c_char` array prefix as `u8`.
 
-- `clone(CLONE_NEW*)` flag 组合；
-- UTS hostname/domainname 内容和长度；
-- 未来 procfs namespace fd、`setns` 和 `unshare` 路径；
-- mount namespace 引用的复制与共享语义。
+Its private callers pass 65-element `UtsInner` arrays. The length is the first
+NUL index or 65, hence within the same allocation. `c_char` is `i8` or `u8`, each
+one byte and aligned like `u8`; every stored bit pattern is a valid `u8`.
+The output lifetime borrows the original immutable slice, preventing mutation
+or release while it is used. `UtsNamespace` callers hold the appropriate lock
+while borrowing/copying. No ASCII premise is required: setters only check length.
+There is no local unsafe trait impl or FFI/assembly operation.
 
-本 crate 不直接访问用户内存、MMIO/PIO、DMA、FFI 或 inline assembly。用户指针必须在
-进入 `kns` 前由 `kuaccess`/syscall 层复制成内核拥有的字节或标志值。
+## Memory invariants and thread safety
 
-## unsafe 代码清单
+`Arc`s keep namespace objects alive. NEWNS requires private root/pwd state and
+retargets both paths before returning the bundle. Initial construction reuses
+the canonical cgroup namespace. `UtsInner` setters preserve a zero terminator by
+reserving the final array byte; embedded NUL is accepted and shortens slice views.
 
-当前 `kns` 只有 `src/uts.rs::bytes_from_uts` 使用 `unsafe`，把 `[c_char]` 的前缀视作
-`[u8]`：
+UTS mutable data is protected by its `RwLock`; bundle mutation/publication locks
+are owned by process runtime. Mount copy delegates locking to KVFS. Callers
+should prepare the new bundle without holding locks that reentrant VFS work
+could need, then publish the completed pointer through their runtime protocol.
 
-- 输入 slice 来自 `UtsInner` 内部固定数组；
-- `c_char` 在目标平台上是 `i8` 或 `u8`，大小和对齐与 `u8` 相同；
-- 长度由首个 NUL 或数组长度限制，保持在原 slice allocation 内；
-- 写入路径只保存 ASCII 字节，避免 signedness 改变造成语义歧义。
+## Threat analysis
 
-`kcgroup` 当前没有 `unsafe`。
+| ID | Threat and asset | Severity | Trigger | Response and residual risk |
+|---|---|---|---|---|
+| T-01 | False namespace isolation | High | Caller requests unsupported NEW flags | `clone_for_child` returns `Unimplemented`; ID-only types do not prove manager isolation. Syscall policy and consumer state must be audited separately. |
+| T-02 | Wrong root/pwd after mount copy | High | NEWNS is combined with shared filesystem state or paths are not retargeted | Shared state returns `InvalidFlagCombination`; private copy uses KVFS retargeting and paired `replace_root_and_pwd`. Caller must supply initialized paths. |
+| T-03 | UTS buffer overrun | High | Name length is 65 or greater | Setters return `NameTooLong` before mutation; safe copying and zero-filled arrays retain termination. |
+| T-04 | Unauthorized hostname/namespace changes | High | Unprivileged request reaches trusted APIs | Authorization is external; these APIs check data/flag consistency, not caller credentials. |
+| T-05 | Misinterpreted hostname text | Low | Name contains NUL or non-UTF-8 bytes | Stored bytes are preserved and slice reads stop at NUL; consumers must handle bytes rather than assume ASCII or full-string round trips. |
+| T-06 | Namespace ID collision | Medium | External `NamespaceId` counter wraps | No local wrap prevention; IDs are metadata, not a substitute for live object identity and authorization. |
 
-## 内存安全不变量
+## Failure modes and effects (FMEA)
 
-- `NsProxy` 字段均为 `Arc<T>`，共享 namespace 不转移所有权。
-- `NsProxy` 不保存当前 user namespace；该引用属于 credentials。`MntNamespace`
-  只保存拥有该 mount namespace 的 user namespace。
-- `NsProxy` 不保存 task-active PID namespace；该语义属于 task/PID identity。
-- initial `NsProxy` 必须复用 `CgroupNamespace::initial()`，保持 PID 1 的 namespace view
-  与启动期 `/sys/fs/cgroup` superblock 指向同一 hierarchy。
-- `kprocess::ProcessRuntime` 替换 `NsProxy` 时必须一次性发布完整的新
-  `Arc<NsProxy>`，不能暴露半初始化 bundle。
-- `UtsInner` 的两个固定数组始终 NUL 初始化或由 ASCII 字节填充；setter 拒绝长度达到
-  65 字节的输入，保留 NUL 终止空间。
-- `kvfs::MntNamespace` 是唯一 mount namespace 对象，持有 mount tree 和所属
-  `kcred::UserNamespace`；它不直接保存进程 root/pwd/umask，这些 filesystem state
-  属于 `kprocess::ProcessRuntime` 持有的 `fs_context::FsStruct`。
-- `kvfs::MntNamespace` 强拥有 mount set；父 mount 的 child map 只保存弱引用并作为路径
-  解析索引，不能成为 mount 生命周期的唯一 owner。
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1-4) | Handling |
+|---|---|---|---|---|---|---|
+| F-01 | Unsupported clone | Unimplemented namespace bit | Typed error | Child creation rejected | 3 | Caller translates `Unimplemented` to its ABI. |
+| F-02 | Mount clone fails | KVFS copy/retarget error | `CloneNsError::Mount` | No successful child bundle | 3 | Preserve underlying `VfsError`. |
+| F-03 | Premature initial construction | VFS mount namespace absent | `expect` panic | Process boot fails | 2 | Initialize VFS before `new_initial`. |
+| F-04 | Private paths absent | NEWNS on uninitialized `FsStruct` | Root/pwd reader panic | Clone fails fatally | 2 | Construct a mounted private context first. |
+| F-05 | Name too long | More than 64 input bytes | `NameTooLong`, no change | UTS update rejected | 3 | Report typed error. |
 
-## 线程安全
+## Failure handling, privacy, and limitations
 
-`NsProxy` 本身是不可变引用集合，适合多进程/多线程通过 `Arc` 共享。内部可变状态由各
-namespace 自己同步：
+This crate chooses typed errors, not errno. It has no retry/rollback manager
+beyond ownership cleanup of partially constructed values. Allocation follows the
+kernel allocator policy. Hostname/domainname and namespace IDs may reveal system
+identity to consumers; this crate does not log them or handle other user payload.
+Only selected namespace clone behaviors are implemented; user/capability and
+namespace-FD policy is external, and IPC/net/time payloads are not owned here.
 
-- UTS 名称通过 `RwLock` 同步；
-- mount tree 复制和 mount/unmount 由 `kvfs::MntNamespace` 内部锁保护；
-- placeholder namespace 当前没有共享可变 payload；
-- ID 分配使用原子递增，仅用于唯一身份，不承载同步语义。
+## Audit checklist
 
-调用方不应在持有 `ProcessRuntime` 的 nsproxy 写锁时执行可能阻塞或递归进入 VFS/IPC
-的操作。构造新 bundle 应先在锁外完成，再短暂交换指针。
-
-## 威胁分析
-
-- **静默忽略 namespace flag**：会让用户态误以为获得隔离。当前对未实现 namespace 返回
-  `CloneNsError::Unimplemented`，由 syscall 层映射为显式错误。
-- **非法 flag 组合导致共享语义混乱**：`NEWNS` 与 `CLONE_FS` 冲突在 `kns` 中拒绝，
-  其他组合由 syscall 校验层负责。
-- **UTS 名称越界或非终止字符串**：setter 限制最大长度并重置缓冲区，保证 NUL 终止空间。
-- **mount namespace 与 fs context 不一致**：`CLONE_NEWNS` 必须和私有 `FsStruct`
-  一起执行；copy mount tree 后同步 retarget root/pwd，否则路径会继续指向旧 mount tree。
-- **mount 生命周期丢失**：VFS mount namespace 必须强拥有 mount set；父 mount 的 child
-  map 只能是可见性索引。如果 child map 是唯一引用，mount 会在 syscall 返回后释放。
-
-## 故障模式与影响分析（FMEA）
-
-| 故障模式 | 影响 | 缓解 |
-| --- | --- | --- |
-| 未实现 namespace flag 被接受 | 隔离失效且难以发现 | `clone_for_child` 返回 `Unimplemented` |
-| `NEWNS` 与 `CLONE_FS` 同时接受 | child root/cwd 共享语义不明确 | 返回 `InvalidFlagCombination` |
-| UTS 名称长度越界 | 固定数组越界或缺少 NUL | setter 拒绝超长输入 |
-| mount tree copy 未 retarget fs context | child root/cwd 指向父 namespace | `clone_for_child` 用 VFS clone 结果同步更新私有 `FsStruct` |
-| mount 生命周期只由弱引用索引维持 | mount 后立即不可见或释放 | `kvfs::MntNamespace` 强拥有 mount set |
-| ID 计数回绕 | procfs namespace 身份可能重复 | 现实中极难触发；未来可在分配器中加入回绕检测 |
-
-## 故障管理
-
-`kns` 使用 `Result` 报告可恢复错误：
-
-- `CloneNsError::InvalidFlagCombination`
-- `CloneNsError::Unimplemented`
-- `UtsError::NameTooLong`
-
-本 crate 不直接选择 errno。syscall 层应把非法组合映射为 `EINVAL`，把已知但未实现的
-namespace 映射为 `ENOSYS`，把 UTS 名称过长映射为 ABI 要求的错误。
-
-## 隐私分析
-
-`kns` 不处理用户数据内容，除 UTS hostname/domainname 外不保存来自用户态的字符串。
-UTS 名称本身是系统公开状态，通常可通过 `uname` 或 procfs 观察。未来 cgroup、PID、
-user namespace 接入后，需要重新审计路径视图、PID 可见性和 credential 映射是否泄露
-宿主全局状态。
-
-## 已知限制
-
-- `CLONE_NEWCGROUP` 的对象模型已建立，但 capability/delegation 授权尚未接入；clone
-  路径因此返回 `ENOSYS`，不能据此宣称支持 cgroup namespace 创建。
-- `clone3(CLONE_INTO_CGROUP)`、`unshare(CLONE_NEWCGROUP)` 和 `setns()` 尚未实现。
-
-- `NEWPID`、`NEWNET`、`NEWUSER`、`NEWTIME` 当前只建模类型或骨架，clone 路径返回
-  未实现。
-- mount propagation、shared/slave/private 传播组、recursive bind 和 namespace fd/setns
-  语义尚未由本 crate 闭环。
-- `IpcNamespace` 目前只是身份占位，SysV IPC manager 迁移需要后续补丁完成。
-- `setns`、namespace fd 和完整 `/proc/[pid]/ns/*` 语义尚未由本 crate 闭环。
-- user namespace 权限模型尚未接入，后续 capability 检查不能散落在 syscall 调用点。
-
-## 审计清单
-
-- [ ] 新增 `CLONE_NEW*` 处理时，确认未实现语义不会静默共享全局状态。
-- [ ] 修改 `NsProxy::clone_for_child` 时，重新检查 `CLONE_FS`、`NEWNS`、普通 fork 的
-      namespace 共享/复制关系，并确认 `FsStruct` 仍由 `ProcessRuntime` 路径处理。
-- [ ] 修改 UTS 字符串表示时，重新审计 NUL 终止、长度限制和 `c_char`/`u8` 转换。
-- [ ] 添加 namespace 内部可变状态时，明确锁类型、调用上下文和 drop 行为。
-- [ ] 将 cgroup controller 或 hierarchy 状态接入时，优先放入 `kcgroup`，避免把
-      `kns` 扩成资源管理 catch-all。
-- [ ] 接入 procfs/setns 时，检查权限、fd 类型匹配、多线程限制和引用生命周期。
+- Reject unsupported flags before constructing a child bundle.
+- Preserve private, initialized filesystem context for NEWNS.
+- Keep UTS bounds, one-allocation borrowing, and byte semantics aligned.
+- Preserve the single initial cgroup hierarchy reference.
+- Define owner, locks, authorization, and cleanup when adding namespace state.

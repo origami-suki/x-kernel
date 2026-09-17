@@ -2,7 +2,22 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! POSIX process credentials.
+//! POSIX credential snapshots and Linux-style set-ID transitions.
+//!
+//! Use [`Cred::prepare`] to derive an unpublished copy, apply checked changes,
+//! and let the process owner publish it. [`initial_cred`] supplies the shared root
+//! credential. Namespace types model identity/parentage, not complete ID mapping.
+//!
+//! # Example
+//!
+//! ```
+//! use kcred::Cred;
+//! let original = Cred::root();
+//! let mut prepared = original.prepare();
+//! prepared.set_uid(1000).unwrap();
+//! assert_eq!(prepared.euid(), 1000);
+//! assert_eq!(original.euid(), 0);
+//! ```
 
 #![no_std]
 #![warn(missing_docs)]

@@ -10,8 +10,8 @@
 /// into the correct errno instead of collapsing them into a single value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloneNsError {
-    /// An invalid flag combination was requested (e.g. `CLONE_NEWNS |
-    /// CLONE_FS`, or `CLONE_NEWPID | CLONE_PARENT`).
+    /// Mount namespace cloning was requested with a shared filesystem context
+    /// (`CLONE_NEWNS` with `CLONE_FS`).
     InvalidFlagCombination,
     /// A namespace flag was requested that has no implementation yet (e.g.
     /// `CLONE_NEWNET`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWTIME`).

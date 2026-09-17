@@ -1,120 +1,99 @@
-# kfd_objects - 安全与可靠性分析
+# kfd_objects — Security and reliability
 
-## 概述
+## Scope, trust and assets
 
-`kfd_objects` 负责 fd-backed kernel object 的内部状态和运行时回调。
-当前对象是 `TimerFd`、`EventFd`、`Signalfd` 和 `Epoll`。
-主要风险来自：
+The entire crate is covered, including unit-test unsafe sites. Assets include
+counter/timer readiness, signal payloads, watched-file identity, poll registrations
+and file-opening credentials. Syscall adapters supply resolved files, flags,
+masks, clock IDs, descriptor numbers and user data; those values can originate
+in userspace. `kvfs` supplies valid kernel byte slices to file operations and owns
+file flags/credentials; `ksignal` owns pending signals and `ktask::future` owns
+timer/blocking runtime. This crate does not dereference raw user pointers or
+perform descriptor-table permission checks.
 
-- timer callback 与 `read/poll/settime` 的并发交互；
-- fd close/drop 时的底层 timer handle 清理；
-- `read()` / `poll()` / `gettime()` 的状态一致性；
-- 非阻塞路径的可见性语义；
-- `epoll` interest table 与 ready queue 的一致性。
+## External boundaries and validation
 
-本 crate 当前不包含手写 `unsafe` 代码。
+`new_file` passes explicit `Arc<Cred>` into `AnonInodeFs::get_file`. Eventfd,
+timerfd and signalfd reject bits unknown to `OpenFlags`; detailed syscall flag
+restrictions remain adapter duties. `from_file` checks typed private data and
+returns `BadFileDescriptor` on mismatch. Eventfd/timerfd reads require at least
+eight bytes; signalfd requires 128. Eventfd write rejects `u64::MAX` and a short
+buffer; a full counter/empty read becomes `WouldBlock` through the polling helper.
+Timer `settime` rejects unrepresentable deadlines with `InvalidInput` before
+mutating the old setting. Signalfd access checks the current task for a `Thread`
+and returns `OperationNotPermitted` if absent.
 
-## 信任模型
+Epoll control receives a resolved file and fd; duplicate ADD returns
+`AlreadyExists`, absent MOD/DEL returns `NotFound`, and source registration
+failures are mapped to `KError`. Backend APIs do not establish user authorization
+or independently validate all epoll nesting rules. The syscall owner must supply
+those controls where required.
 
-```text
-userspace syscall args
-   │
-   v
-ksyscall adapter
-   │ validates ABI flags and syscall-specific user input
-   v
-kfd_objects::{Epoll, EventFd, Signalfd, TimerFd}
-   │ owns object state, callbacks, read/write/poll semantics
-   v
-ktask timer runtime / generic fd readiness
-```
+## Unsafe inventory
 
-- `ksyscall` 负责用户指针、flag、clockid 的 ABI 校验。
-- `ksyscall` 或其它上层调用者负责选择创建文件时的 `Arc<Cred>`；本 crate 不假定存在
-  当前用户线程。
-- `kfd_objects` 信任 `ktask` timer runtime 的 handle/register/cancel 语义。
-- `kfd_objects` 信任 `kfd`/`kresources` 在 fd 生命周期上维持 `VfsFile`
-  及其 private data 的强引用。
+| Source and function | Operation / invariant | Enforcing context |
+|---|---|---|
+| `src/signalfd.rs`, `SignalfdSiginfo::from_signal_info` | Reads both integer/pointer views of a C `sigval_t` union sharing storage. | `SignalInfo::sigval` supplies the value; adjacent SAFETY states both views may be read regardless of the written member. No pointer is dereferenced. The provider must supply initialized union storage. |
+| `src/epoll.rs`, test helper `assert_epoll_event` | Reads packed `epoll_event.events` and `.data` with `read_unaligned`. | Test supplies an initialized event; the SAFETY comments explicitly account for Linux ABI packed fields. |
+| `src/eventfd.rs`, `test_eventfd_register` | Constructs a `Waker` from `RawWaker`. | Test-only no-op callbacks never dereference the null data pointer, as the adjacent SAFETY comment requires. |
 
-## 状态不变量
+There is no explicit FFI declaration or inline assembly. Signal output has a
+compile-time 128-byte size assertion and initializes all output fields/padding;
+serialization uses `zerocopy::IntoBytes`. Unsafe descriptions above do not replace
+provider contracts or prove that all upstream union construction is correct.
 
-- `read()` 只有在存在未消费 expiration 时才成功返回 8 字节计数。
-- `poll(IN)` 与“是否有未消费 expiration”保持一致。
-- `settime(disarm)` 后不再保留旧的 pending handle。
-- `settime()` 的 deadline 校验失败时保留原有 state 和 pending handle。
-- `drop` 必须取消底层 timer handle，避免悬挂回调。
-- `gettime()` 返回对象视角的 interval/remaining，而不是 syscall 临时状态。
-- `EventFd::read/write/poll` 必须围绕同一计数器上限与 semaphore 语义保持一致。
-- `Signalfd::read/poll` 必须围绕同一 pending signal 可见性与 mask 语义保持一致。
-- `Epoll` 的 interest table、ready queue 与 trigger mode 必须围绕同一就绪语义保持一致。
-- 匿名文件构造必须使用调用者显式提供的 credential，并只由 `VfsFile` 保存该快照。
+## Thread safety and lifetime invariants
 
-## 并发模型
+Counter updates must use one atomic transition. Timer expiration/deadline/count
+updates share the inner lock; handle cancellation uses its own lock. Signalfd
+mask mutation uses its RwLock while signal access is through the current signal
+manager. Epoll table, ready queue, queue bit, waker generation and registration
+ownership must retain their coordinated protocol; MOD modifies existing interest
+identity and serializes rollback with the control lock.
 
-`TimerFd` 使用：
+Registered timer wakers hold strong object references, so the final `Drop` and
+its cancellation may occur later than file close. Weak epoll target references
+must be upgraded before access. Dropping poll-registration owners outside their
+mutex avoids unregister callbacks nesting under that lock.
 
-- `SpinNoIrq<TimerFdInner>` 保护核心 timer 状态；
-- `SpinNoIrq<Option<TimerHandle>>` 保护底层 handle；
-- nonblocking 标志由当前 `VfsFile` 保存；
-- `PollSet` 用于读就绪唤醒。
+## Threat analysis
 
-timer runtime 回调与 `read/poll/settime` 可能并发发生。
-因此所有对 `deadline/interval/expirations` 的更新都必须在同一把 `inner` 锁内完成。
+| ID | Threat / asset | Severity | Trigger | Existing response and residual risk |
+|---|---|---|---|---|
+| T-01 | Counter overflow or lost update corrupts readiness | Medium | Concurrent writes at the counter limit | Atomic conditional updates reject overflow and share readiness limits; constructor accepts raw `u64`, and semaphore reads currently expose pre-update count. |
+| T-02 | Invalid timer programming destroys prior state | Medium | Deadline cannot be represented | Validate before cancellation; return InvalidInput. Multi-step concurrent reprogramming still requires scrutiny beyond field locks. |
+| T-03 | Timer callback retains resources after close | Medium | A registered waker outlives the file reference | Waker Arc prevents use-after-free and final Drop cancels a remaining handle; prompt reclamation is not guaranteed. |
+| T-04 | Signal record leaks uninitialized bytes | High | Kernel serializes a pending signal | Explicit fields and zero padding, size assertion and IntoBytes; union storage validity depends on SignalInfo construction. |
+| T-05 | Stale epoll wake/config causes duplicate or wrong events | Medium | MOD/DEL or source wake races consumption | Stable interest identity, generation checks, queue bit and bounded/deduplicated consumption; preserve registration rollback protocol. |
+| T-06 | Wrong file type reaches backend state | Medium | Adapter passes unrelated file | Typed private-data lookup returns BadFileDescriptor; fd authorization remains outside this crate. |
+| T-07 | Kernel task accesses signalfd signal state | Medium | Read/poll without a user Thread | Read returns OperationNotPermitted; poll reports ERR; constructors require explicit credentials. |
 
-`EventFd` 使用原子计数和两个 `PollSet`。
-它没有外部 runtime 回调，但 `read/write/poll` 之间仍需对计数上限和就绪语义保持一致。
+## Failure modes and management
 
-`Signalfd` 使用：
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1–4) | Controls |
+|---|---|---|---|---|---|---|
+| F-01 | Anonymous file allocation fails | Anonymous-inode provider failure | No file returned | Descriptor creation fails | 3 | Propagate provider errors; references release normally. |
+| F-02 | Poll registration fails | Watched source rejects registration | Interest cannot be armed | Readiness wait may need retry | 3 | ADD rollback, MOD configuration restoration; poll preserves already-emitted partial results and requeues for retry. |
+| F-03 | Timer interval advance overflows | Deadline exceeds clock representation | Next deadline can disappear | Periodic notification stops | 3 | Saturating expiration accounting and checked deadline addition; document finite representational range. |
+| F-04 | Short I/O buffer | Caller supplies insufficient bytes | No record transfer | Caller must supply valid size | 4 | InvalidInput before copying/consuming. |
 
-- `RwLock<SignalSet>` 保护当前 mask；
-- nonblocking 标志由当前 `VfsFile` 保存；
-- `PollSet` 维护可读唤醒。
+## Privacy, limitations and verification
 
-它不拥有 signal 队列本身；队列 owner 仍在当前线程的 signal state。
-因此 `read()` / `poll()` 必须始终通过当前线程 signal manager 观察 pending signal。
+Signals carry PID/UID, exit status, timer values and CPU time. Epoll user data is
+returned verbatim; it is not a kernel pointer to dereference. Trace logs may
+expose watched fd/event state. No local log redaction is provided. Constructor
+credentials belong to the opened VfsFile; this crate does not maintain a second
+credential snapshot or independently enforce syscall access policies.
 
-`Epoll` 使用：
+Existing tests cover eventfd readiness/accounting, timer validation, signalfd
+layout/payload and epoll registration/trigger races. Their presence is not a
+claim they were executed by this documentation edit.
 
-- `SpinNoPreempt<HashMap<...>>` 保护 interest table；
-- `SpinNoPreempt<VecDeque<...>>` 保护 ready queue；
-- `Mutex<()>` ctl lock 串行化 `ADD` / `MOD` / `DEL` 的 table 更新、
-  registration 重装和失败回滚；
-- 每个 `EpollInterest` 内的 `SpinNoPreempt` config 保护 event mask、user data
-  和 trigger mode 的原地更新；
-- `AtomicBool` 跟踪 interest 是否已经入队；
-- `PollSet` 维护 `epoll_wait` 侧唤醒。
+## Audit checklist
 
-watched file 的 fd table 解析现在由 syscall adapter 完成。
-因此 backend 只需围绕 interest 键值稳定性、ready queue 去重和
-watched file 失效后的清理维护同一个状态机。
-`MOD` 保持 interest identity 稳定，只重置配置和 registration；失败时在同一个
-ctl lock 临界区内恢复旧配置，避免 ready queue 或旧 source wake 引用到被替换的
-旧对象，也避免并发 `MOD` rollback 覆盖另一个成功更新。
-
-## 主要风险
-
-| 编号 | 风险 | 影响 | 缓解 |
-|------|------|------|------|
-| T-01 | timer 到期与 `read()` 并发，导致 expiration 丢失或重复消费 | 中 | 统一在 `inner` 锁内 tick/consume |
-| T-02 | `settime()` 重编程失败后旧 timer 被意外取消 | 中 | 先验证新 deadline；成功后再取消旧 handle 并更新状态，失败时保持原 timer 不变 |
-| T-03 | `drop` 后底层仍保留回调 | 高 | `Drop` 中取消 handle |
-| T-04 | `poll()` 与 `read()` 对 readiness 观察不一致 | 中 | 两者都先 `tick(clock_now(...))` 再判断 |
-| T-05 | `eventfd` 计数溢出或 `poll(OUT)` 与写入条件不一致 | 中 | `fetch_update` 与 `poll()` 共享同一上限判断 |
-| T-06 | `eventfd` semaphore/普通模式读路径分叉导致计数错误 | 中 | 两种语义都经同一原子更新路径处理 |
-| T-10 | `signalfd` mask 更新与 `read/poll` 观察不一致 | 中 | mask 经 `RwLock` 更新，并在更新后唤醒 poller 重新观察 |
-| T-11 | `signalfd` 将不可捕获信号暴露给用户态 fd 语义 | 低 | syscall adapter 统一移除 `SIGKILL` / `SIGSTOP` |
-| T-12 | `epoll` ready queue 去重失效导致重复唤醒、事件风暴或 `MOD` 后返回旧事件配置 | 中 | `in_ready_queue` 位与 ready queue 统一维护；`MOD` 原地更新稳定 interest identity 并重装 registration |
-| T-13 | `epoll` oneshot / edge-triggered 状态机错误 | 高 | `TriggerMode` 集中建模并在消费路径统一更新 |
-| T-14 | watched file 失效后 interest 清理不完整 | 中 | ready 消费路径在 `Weak` 升级失败后立即回收 interest |
-| T-15 | 内核任务创建匿名 fd 时因隐式读取当前用户凭据而 panic | 高 | 构造函数调用 `current_cred()`，但当前 task 不是 `Thread` | 构造函数接收显式 `Arc<Cred>`；syscall adapter 传当前快照，内核调用者选择初始或其它明确凭据 |
-
-## 审计清单
-
-- [ ] 新增对象仍然符合“fd-backed object owner”边界，而不是 syscall adapter。
-- [ ] 新增状态更新是否与回调路径共用同一锁和不变量。
-- [ ] `drop` 是否清理底层 runtime 绑定。
-- [ ] `read/poll` 是否对外保持一致的 readiness 语义。
-- [ ] `EventFd` 计数上限、poll 可写性和 semaphore 语义是否同步更新。
-- [ ] `Signalfd` 的 mask 更新、pending signal 观察和 `poll(IN)` 语义是否保持一致。
-- [ ] `Epoll` 的 interest table、ready queue、oneshot/edge 触发语义是否保持一致。
-- [ ] 新增文件构造路径是否显式接收凭据，且没有把 credential 重复保存到对象状态。
+- Preserve explicit constructor credentials and typed private-data checks.
+- Preserve exact buffer-size checks and initialized signal output padding.
+- Check timer callback retention as well as final Drop cancellation.
+- Keep epoll MOD identity, queue deduplication and generation checks together.
+- Drop registration owners outside their mutex; verify callback lock context.
+- Keep limitations aligned with implementation rather than assumed Linux behavior.

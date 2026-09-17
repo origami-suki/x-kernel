@@ -29,6 +29,11 @@ impl FileDescriptor {
     }
 
     /// Closes the descriptor's file reference.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the VFS close/flush error from `VfsFile::close_file`. The owned
+    /// descriptor reference is consumed even on failure; other file references may remain.
     pub fn close(self) -> KResult {
         self.file.close_file()
     }

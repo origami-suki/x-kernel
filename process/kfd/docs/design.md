@@ -1,223 +1,85 @@
-# kfd - 设计文档
+# kfd design
 
-## 定位
+## Purpose and background
 
-`kfd` 是 x-kernel 的进程文件描述符运行时 crate。
-它提供进程本地 `FdTable`、单个 `FileDescriptor` 条目、
-`FdSnapshot` 稳定视图、`FileLike` trait 抽象以及内核态 `Kstat` 到 Linux ABI `stat/statx`
-的转换。
+`kfd` maps process-local integer descriptors to `Arc<kvfs::VfsFile>` objects and
+converts kernel metadata to Linux `stat`/`statx`. `kresources` attaches the table
+to a process and orchestrates close outside locks. POSIX adapters validate ABI
+rules and authorization. File operations, offsets, private object state, and
+I/O synchronization belong to `kvfs` and its `FileOperations` implementations.
+There is no local `FileLike` trait or file-like downcast layer.
 
-目标读者是维护 POSIX 文件 syscall、进程资源复制、socket/pipe/timerfd/eventfd
-等 descriptor-backed 对象的开发者。
+## Scope and architecture
 
-## 背景
-
-POSIX 进程通过小整数 fd 引用各种内核对象。
-这些对象来自 VFS 文件、目录、socket、pipe、timerfd、eventfd、pidfd、epoll 等不同子系统，
-但 syscall 层需要统一执行 read/write/stat/ioctl/mmap/poll、dup、close 和 exec 时关闭。
-`kfd` 把 fd 槽位管理与 file-like 操作抽象集中到一个 crate，
-上层 `kresources` 负责把表挂到进程状态并提供锁。
-
-## 范围
-
-涉及的源文件：
+- `src/lib.rs`: public re-exports and kernel tests.
+- `src/fd_table.rs`: `FdTable`, fixed-capacity slot operations and final cleanup.
+- `src/file_descriptor.rs`: `FileDescriptor` and `FdSnapshot` ownership.
+- `src/stat.rs`: `Kstat` and metadata/ABI conversions.
 
 ```text
-process/kfd/
-├── src/
-│   ├── lib.rs                  # crate 入口和公开 re-export
-│   ├── fd_table.rs             # FdTable 槽位管理、dup、close、cloexec
-│   ├── file_descriptor.rs      # FileDescriptor / FdSnapshot: Arc<dyn FileLike> + flags
-│   ├── file_like.rs            # FileLike trait 与 IoSrc/IoDst type aliases
-│   └── stat.rs                 # Kstat 与 Linux stat/statx ABI 转换
-├── Cargo.toml
-└── docs/
-    ├── design.md
-    └── security.md
+kresources -> Arc<RwLock<FdTable>>
+                         |
+       FlattenObjects<FileDescriptor, krlimit::FILE_LIMIT>
+                         |
+          FileDescriptor { Arc<VfsFile>, cloexec }
+                         |
+                    kvfs operations
 ```
 
-## 架构
+`FdSnapshot` retains the same file plus captured descriptor number, close-on-exec
+bit, and open flags. It is not a live view of later descriptor reuse or flag
+changes. `Kstat` is an independent value object with public metadata fields.
 
-```text
-posix/fs, posix/net, posix/mm, io-mpx
-        │
-        │ current process resources
-        v
-┌─────────────────────────────────────────────┐
-│ kresources                                  │
-│  Option<Arc<RwLock<FdTable>>>               │
-└──────────────────┬──────────────────────────┘
-                   │ read/write lock
-                   v
-┌─────────────────────────────────────────────┐
-│ kfd::FdTable                                │
-│  FlattenObjects<FileDescriptor, FILE_LIMIT> │
-└──────────────────┬──────────────────────────┘
-                   │ fd -> FileDescriptor
-                   v
-┌─────────────────────────────────────────────┐
-│ kfd::FileDescriptor                         │
-│  Arc<dyn FileLike>                          │
-│  cloexec: bool                              │
-└──────────────────┬──────────────────────────┘
-                   │ dynamic dispatch
-                   v
-VFS file / directory / socket / pipe / epoll / timerfd / eventfd / pidfd
-```
+## Execution context and concurrency
 
-| 组件 | 职责 |
-|------|------|
-| `FdTable` | 分配、查找、复制、关闭 fd 槽位；维护 close-on-exec 标志 |
-| `FileDescriptor` | 保存一个 file-like 对象的共享引用和 descriptor flags |
-| `FdSnapshot` | 在 fd 表锁内复制 fd 号、`Arc<dyn FileLike>` 和 descriptor/object flags，供 procfs magic link、exec 等路径无锁使用 |
-| `FileLike` | 统一 read/write/stat/path/ioctl/mmap/open flags/nonblocking 接口 |
-| `IoSrc` / `IoDst` | syscall I/O 路径使用的 buffer trait object 类型 |
-| `Kstat` | 内核元数据结构，负责转换为 Linux `stat` / `statx` ABI |
+`FdTable` has no interior lock. Standalone exclusive ownership suffices; shared
+lookup needs the external read lock and mutation the write lock. `new_shared`
+and `clone_shared_from` allocate, and the latter takes the source read lock.
+Snapshots allow callers to unlock before procfs path traversal or exec loading.
+No current process, CPU-local state, or hardware mapping is required locally.
+Use task context with heap and lock services available; close invokes VFS flush
+and may block or reenter callers, so these flows are not interrupt-safe.
 
+## Slot lifecycle and algorithms
 
-## 状态机
+A slot is absent or holds a descriptor; these are conceptual states, not a Rust
+state enum. `add_file` checks occupied count against the supplied soft cap, then
+inserts in the first free slot. Physical capacity is `krlimit::FILE_LIMIT` (1024).
+The count policy does not itself enforce a maximum descriptor-number value.
+`insert_file` skips the soft-cap check and returns the uninserted descriptor when
+full. Internal raw slot helpers are `pub(crate)`.
 
-### fd 槽位生命周期
+Lookups return `BadFileDescriptor` for absent entries, including negative signed
+FDs converted to out-of-range indices. A snapshot copies flags and clones the
+file reference while the caller has stable table access.
 
-```text
-Free
-  │ add / add_at / add_file_like
-  v
-Open(cloexec = false/true)
-  │ set_cloexec
-  v
-Open(updated cloexec)
-  │ duplicate_to
-  ├──────────────► Open at new fd (Arc cloned)
-  │
-  │ file_close_fd_locked / remove_range / remove_cloexec_files / final table drop
-  v
-Free
-```
+`duplicate_to` validates target capacity, clones the source descriptor, sets the
+requested close-on-exec flag, and returns any replaced descriptor for later
+close. Equal source/target succeeds without changing flags after checking that
+the source exists. The syscall layer must impose its own dup2/dup3 distinctions.
+This operation does not apply the process soft limit.
 
-| 从 | 到 | 触发条件 |
-|----|----|----------|
-| Free | Open | `add`、`add_at` 或 `add_file_like` 插入 `FileDescriptor` |
-| Open | Open | `set_cloexec` 只修改 descriptor flag |
-| Open | Open + Open | `duplicate_to` 克隆 `FileDescriptor`，共享同一 `Arc<dyn FileLike>` |
-| Open | Free | `remove`、`close_file_like`、`close_range` 或 exec 清理 |
-| Any | Rejected | fd 不存在、目标槽位越界或超过 `max_nofile` |
+Range removal clips its upper bound to the largest occupied index and ignores
+holes. Callers validate nonnegative ordered ranges. Close-on-exec removal first
+collects matching IDs, then removes them. These APIs return entries and do not
+run their close callbacks under the table lock.
 
-### close-on-exec 流程
+## Metadata conversion
 
-```text
-Open(cloexec = true)
-   │ remove_cloexec_files()
-   v
-Free
+`From<kvfs::Metadata>` populates `Kstat`; conversion to Linux ABI values starts
+with a zero value then assigns fields. Time values become seconds/nanoseconds;
+`statx` splits device major/minor and advertises 4096-byte atomic-write units for
+regular-file modes. Numeric casts follow target field widths; conversion is not
+a fallible range-checking API. ABI copyout belongs to POSIX/user-access code.
 
-Open(cloexec = false)
-   │ remove_cloexec_files()
-   v
-Open
-```
+## Decisions and resource release
 
-`remove_cloexec_files` 先收集要移除的 fd 列表，
-再逐个删除。
-这样可以避免边遍历 `FlattenObjects` 边修改同一结构。
+Per-descriptor flags stay with slots; shared file state stays with `VfsFile`.
+`clone_shared_from` copies slots and flags while sharing their file references.
+This supports separate fork tables without duplicating open-file objects.
 
-### fd table 共享和退出关闭
-
-```text
-Process A files ─┐
-                 ├──> Arc<RwLock<FdTable>>
-Process B files ─┘
-   │ first exit_files(): take this process owner
-   v
-table remains live for Process B
-   │ final exit_files()
-   v
-FdTable::drop(): remove and close all descriptors
-```
-
-进程退出只释放自己的 files owner，不根据瞬时 `Arc::strong_count` 猜测是否应该
-关闭共享表。最后一个 owner 消失时，`FdTable::drop()` 关闭剩余 descriptor；已经
-取得的临时 table capability 也按同一所有权规则延迟 final close。
-
-## 算法流程
-
-### 添加 file-like 对象
-
-1. `kresources` 或资源拥有者持有 `FdTable` 写锁。
-2. `add_file_like` 比较当前 `count()` 与调用方传入的 `max_nofile`。
-3. 构造 `FileDescriptor::new(file_like, cloexec)`。
-4. `FlattenObjects::add` 选择第一个空槽位。
-5. 成功时返回 fd；超过软限制或无空槽时返回 `TooManyOpenFiles`。
-
-### 查找 typed file-like 对象
-
-1. `get_file_like(fd)` 把 `c_int` 转为表索引并查找 `FileDescriptor`。
-2. 找不到时返回 `KError::BadFileDescriptor`。
-3. `get_file_like_as<T>` 对 `Arc<dyn FileLike>` 执行 `downcast_arc`。
-4. 类型不匹配返回 `KError::InvalidInput`。
-
-### 获取 descriptor snapshot
-
-1. 调用方持有 fd table 读锁。
-2. `snapshot(fd)` 查找 `FileDescriptor`。
-3. 找不到时返回 `KError::BadFileDescriptor`。
-4. 找到时复制 fd 号、`cloexec`、对象级 `open_flags`，
-   并克隆底层 `Arc<dyn FileLike>`。
-5. 调用方释放 fd table 锁后仍可通过 snapshot 访问同一个 open object。
-
-`FdSnapshot` 用于 `/proc/<pid>/fd/N`、`/proc/self/fd/N`、`fexecve`、
-exec loader 等需要先稳定引用 open file 再进入 VFS 或装载路径的场景。
-它不是 fd table 的 live view：
-snapshot 创建后，原 fd 可以被关闭或复用，
-但 snapshot 仍持有创建时的 open object 强引用。
-
-### `dup2` / `dup3` 固定目标复制
-
-1. 校验旧 fd 存在，克隆其 `FileDescriptor`。
-2. 按调用参数设置新 descriptor 的 `cloexec`。
-3. 移除目标 fd 旧条目。
-4. 把克隆 descriptor 插入目标槽位。
-5. 目标槽位越界时返回 `BadFileDescriptor`。
-
-`duplicate_to` 假定 syscall 层已经处理 `old_fd == new_fd` 的 Linux 语义。
-当前 `posix/fs` 的 `sys_dup2` 和 `sys_dup3` 在进入该函数前完成对应分支。
-
-### close range
-
-1. 获取当前最大已分配 fd。
-2. 将请求区间裁剪到最大已分配 fd。
-3. 按 fd 递增逐个 `remove`。
-4. 不存在的槽位被忽略。
-
-`sys_close_range` 在进入 `kfd` 前校验 `first >= 0` 和 `last >= first`。
-
-### `Kstat` 到 Linux ABI
-
-1. `From<kvfs::Metadata> for Kstat` 把 VFS 元数据转换为内核通用结构。
-2. `From<Kstat> for stat` 先构造全零 Linux ABI 结构，
-   再填充已知字段。
-3. `From<Kstat> for statx` 同样先全零初始化，
-   再设置 metadata、timestamp、device 和 regular-file atomic write 字段。
-
-## 并发模型
-
-`FdTable` 自身没有 interior locking。
-共享 fd table 由 `Arc<RwLock<FdTable>>` 承载，
-通常通过 `kresources` 进入。
-
-锁策略：
-
-- 查找 fd、读取 `cloexec`：调用方持读锁即可。
-- 创建 `FdSnapshot`：调用方持读锁，克隆 `Arc<dyn FileLike>` 后释放锁。
-- 添加、删除、dup、设置 `cloexec`、close range：调用方必须持写锁。
-- 普通 close/exec/range 路径在持写锁时只移除 descriptor，再由
-  `ProcessResources` 在表锁外关闭。
-- final `FdTable::drop()` 只会在外层 `RwLock` 的所有 `Arc` 都已释放后运行；
-  此时表已经不可访问，可以直接 drain 并关闭剩余 descriptor。
-
-这样可以避免 `FileLike::drop` 或底层对象释放路径在持有 fd table 写锁时重入 fd 表。
-
-`FileLike` trait 要求实现者满足 `DowncastSync`，
-并通过各自内部锁保证对象级并发安全。
-`kfd` 只管理 descriptor 到对象的引用关系，
-不串行化具体文件对象的读写偏移或 socket 状态。
+Removal transfers an obligation to call `FileDescriptor::close` after unlocking.
+Merely dropping that value releases its `Arc` but is not the explicit descriptor
+flush operation. `FdTable::drop` removes and closes all remaining descriptors,
+ignoring individual close errors so one failure cannot prevent other cleanup.
+A snapshot or cloned table owner can intentionally delay final file release.

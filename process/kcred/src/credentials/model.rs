@@ -126,6 +126,11 @@ impl Cred {
     /// consumes this state will be added together with capability sets. The
     /// bit is already process state: `PR_GET_KEEPCAPS` observes it, and exec
     /// clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when the keep-capabilities flag is
+    /// locked. The credential is unchanged on failure.
     pub fn keep_caps_enable(&mut self) -> KResult<()> {
         if self.keep_caps_locked() {
             return Err(KError::OperationNotPermitted);
@@ -135,6 +140,11 @@ impl Cred {
     }
 
     /// Clears the keep-capabilities flag (`prctl(PR_SET_KEEPCAPS, 0)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when the keep-capabilities flag is
+    /// locked. The credential is unchanged on failure.
     pub fn keep_caps_disable(&mut self) -> KResult<()> {
         if self.keep_caps_locked() {
             return Err(KError::OperationNotPermitted);
@@ -185,6 +195,11 @@ impl Cred {
     /// A privileged process sets real, effective, saved, and filesystem UIDs.
     /// An unprivileged process may set only its effective/filesystem UID, and
     /// only to its current real or saved set-user ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when the caller is unprivileged and `uid` matches neither real nor saved UID.
+    /// All checks precede mutation; failure leaves the credential unchanged.
     pub fn set_uid(&mut self, uid: Uid) -> KResult<()> {
         if self.is_privileged() {
             self.set_resuid_unchecked(Some(uid), Some(uid), Some(uid));
@@ -205,6 +220,11 @@ impl Cred {
     /// A privileged process sets real, effective, saved, and filesystem GIDs.
     /// An unprivileged process may set only its effective/filesystem GID, and
     /// only to its current real or saved set-group ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when the caller is unprivileged and `gid` matches neither real nor saved GID.
+    /// All checks precede mutation; failure leaves the credential unchanged.
     pub fn set_gid(&mut self, gid: Gid) -> KResult<()> {
         if self.is_privileged() {
             self.set_resgid_unchecked(Some(gid), Some(gid), Some(gid));
@@ -223,6 +243,12 @@ impl Cred {
     /// Implements Linux `setreuid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when an unprivileged real-UID request matches neither old real nor effective UID,
+    /// or its effective-UID request matches none of old real/effective/saved UIDs.
+    /// All checks precede mutation; failure leaves the credential unchanged.
     pub fn set_reuid(&mut self, ruid: Option<Uid>, euid: Option<Uid>) -> KResult<()> {
         let old_ruid = self.ruid;
         let old_euid = self.euid;
@@ -260,6 +286,12 @@ impl Cred {
     /// Implements Linux `setregid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when an unprivileged real-GID request matches neither old real nor effective GID,
+    /// or its effective-GID request matches none of old real/effective/saved GIDs.
+    /// All checks precede mutation; failure leaves the credential unchanged.
     pub fn set_regid(&mut self, rgid: Option<Gid>, egid: Option<Gid>) -> KResult<()> {
         let old_rgid = self.rgid;
         let old_egid = self.egid;
@@ -297,6 +329,12 @@ impl Cred {
     /// Implements Linux `setresuid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when any requested UID for an unprivileged credential matches none of its
+    /// real/effective/saved UIDs.
+    /// All checks precede mutation; failure leaves the credential unchanged.
     pub fn set_resuid(
         &mut self,
         ruid: Option<Uid>,
@@ -320,6 +358,12 @@ impl Cred {
     /// Implements Linux `setresgid`.
     ///
     /// `None` means the corresponding syscall argument was `-1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::OperationNotPermitted` when any requested GID for an unprivileged credential matches none of its
+    /// real/effective/saved GIDs.
+    /// All checks precede mutation; failure leaves the credential unchanged.
     pub fn set_resgid(
         &mut self,
         rgid: Option<Gid>,

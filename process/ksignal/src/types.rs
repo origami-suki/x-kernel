@@ -20,72 +20,139 @@ use crate::DefaultSignalAction;
 pub const MAX_SIGNALS: usize = 64;
 
 /// Signal number.
+///
+/// The discriminants match the Linux signal ABI: standard signals `1..=31`
+/// and real-time signals `32..=64` (`SIGRTMIN` is 32).
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, FromRepr, EnumIter)]
 pub enum Signo {
+    /// Hangup (`SIGHUP`, 1).
     SIGHUP    = 1,
+    /// Terminal interrupt (`SIGINT`, 2).
     SIGINT    = 2,
+    /// Terminal quit (`SIGQUIT`, 3).
     SIGQUIT   = 3,
+    /// Illegal instruction (`SIGILL`, 4).
     SIGILL    = 4,
+    /// Trace/breakpoint trap (`SIGTRAP`, 5).
     SIGTRAP   = 5,
+    /// Abort (`SIGABRT`, 6).
     SIGABRT   = 6,
+    /// Bus error, bad memory access (`SIGBUS`, 7).
     SIGBUS    = 7,
+    /// Floating-point exception (`SIGFPE`, 8).
     SIGFPE    = 8,
+    /// Kill, cannot be caught or blocked (`SIGKILL`, 9).
     SIGKILL   = 9,
+    /// User-defined signal 1 (`SIGUSR1`, 10).
     SIGUSR1   = 10,
+    /// Invalid memory reference (`SIGSEGV`, 11).
     SIGSEGV   = 11,
+    /// User-defined signal 2 (`SIGUSR2`, 12).
     SIGUSR2   = 12,
+    /// Write to pipe with no readers (`SIGPIPE`, 13).
     SIGPIPE   = 13,
+    /// Timer alarm from `alarm` (`SIGALRM`, 14).
     SIGALRM   = 14,
+    /// Termination (`SIGTERM`, 15).
     SIGTERM   = 15,
+    /// Stack fault, unused on Linux (`SIGSTKFLT`, 16).
     SIGSTKFLT = 16,
+    /// Child stopped or terminated (`SIGCHLD`, 17).
     SIGCHLD   = 17,
+    /// Continue if stopped (`SIGCONT`, 18).
     SIGCONT   = 18,
+    /// Stop, cannot be caught or blocked (`SIGSTOP`, 19).
     SIGSTOP   = 19,
+    /// Stop typed at terminal (`SIGTSTP`, 20).
     SIGTSTP   = 20,
+    /// Terminal input for background process (`SIGTTIN`, 21).
     SIGTTIN   = 21,
+    /// Terminal output for background process (`SIGTTOU`, 22).
     SIGTTOU   = 22,
+    /// Urgent condition on socket (`SIGURG`, 23).
     SIGURG    = 23,
+    /// CPU time limit exceeded (`SIGXCPU`, 24).
     SIGXCPU   = 24,
+    /// File size limit exceeded (`SIGXFSZ`, 25).
     SIGXFSZ   = 25,
+    /// Virtual alarm clock (`SIGVTALRM`, 26).
     SIGVTALRM = 26,
+    /// Profiling alarm clock (`SIGPROF`, 27).
     SIGPROF   = 27,
+    /// Window resize (`SIGWINCH`, 28).
     SIGWINCH  = 28,
+    /// I/O now possible (`SIGIO`, 29).
     SIGIO     = 29,
+    /// Power failure (`SIGPWR`, 30).
     SIGPWR    = 30,
+    /// Bad system call (`SIGSYS`, 31).
     SIGSYS    = 31,
+    /// First real-time signal (`SIGRTMIN`, 32).
     SIGRTMIN  = 32,
+    /// Real-time signal 1 (33).
     SIGRT1    = 33,
+    /// Real-time signal 2 (34).
     SIGRT2    = 34,
+    /// Real-time signal 3 (35).
     SIGRT3    = 35,
+    /// Real-time signal 4 (36).
     SIGRT4    = 36,
+    /// Real-time signal 5 (37).
     SIGRT5    = 37,
+    /// Real-time signal 6 (38).
     SIGRT6    = 38,
+    /// Real-time signal 7 (39).
     SIGRT7    = 39,
+    /// Real-time signal 8 (40).
     SIGRT8    = 40,
+    /// Real-time signal 9 (41).
     SIGRT9    = 41,
+    /// Real-time signal 10 (42).
     SIGRT10   = 42,
+    /// Real-time signal 11 (43).
     SIGRT11   = 43,
+    /// Real-time signal 12 (44).
     SIGRT12   = 44,
+    /// Real-time signal 13 (45).
     SIGRT13   = 45,
+    /// Real-time signal 14 (46).
     SIGRT14   = 46,
+    /// Real-time signal 15 (47).
     SIGRT15   = 47,
+    /// Real-time signal 16 (48).
     SIGRT16   = 48,
+    /// Real-time signal 17 (49).
     SIGRT17   = 49,
+    /// Real-time signal 18 (50).
     SIGRT18   = 50,
+    /// Real-time signal 19 (51).
     SIGRT19   = 51,
+    /// Real-time signal 20 (52).
     SIGRT20   = 52,
+    /// Real-time signal 21 (53).
     SIGRT21   = 53,
+    /// Real-time signal 22 (54).
     SIGRT22   = 54,
+    /// Real-time signal 23 (55).
     SIGRT23   = 55,
+    /// Real-time signal 24 (56).
     SIGRT24   = 56,
+    /// Real-time signal 25 (57).
     SIGRT25   = 57,
+    /// Real-time signal 26 (58).
     SIGRT26   = 58,
+    /// Real-time signal 27 (59).
     SIGRT27   = 59,
+    /// Real-time signal 28 (60).
     SIGRT28   = 60,
+    /// Real-time signal 29 (61).
     SIGRT29   = 61,
+    /// Real-time signal 30 (62).
     SIGRT30   = 62,
+    /// Real-time signal 31 (63).
     SIGRT31   = 63,
+    /// Last real-time signal (`SIGRTMAX`, 64).
     SIGRT32   = 64,
 }
 
@@ -175,7 +242,11 @@ impl SignalSet {
         self.0 == 0
     }
 
-    /// Dequeues the a signal in `mask` from this set, if any.
+    /// Removes and returns the lowest-numbered signal that is both pending in
+    /// this set and contained in `mask`, or `None` if no such signal exists.
+    ///
+    /// The signal is removed from this set; real-time queues with remaining
+    /// entries are re-added by the caller that owns them.
     pub fn dequeue(&mut self, mask: &SignalSet) -> Option<Signo> {
         let bits = self.0 & mask.0;
         if bits == 0 {
@@ -227,7 +298,13 @@ impl fmt::Debug for SignalSet {
 /// Signal information. Compatible with `struct siginfo` in libc.
 #[derive(Clone)]
 #[repr(transparent)]
-pub struct SignalInfo(pub siginfo_t);
+pub struct SignalInfo(
+    /// Raw Linux `siginfo_t` ABI payload.
+    ///
+    /// Accessing union arms directly is unsafe; use the decoding helpers on
+    /// [`SignalInfo`], which select the arm implied by `si_code`.
+    pub siginfo_t,
+);
 
 /// Linux child-exit signal payload fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +531,11 @@ impl SignalInfo {
         result
     }
 
-    /// Construct a user-originated signal with a code and pid.
+    /// Constructs a user-originated signal with a code and pid.
+    ///
+    /// The `pid` is stored in the `si_pid` slot shared by the user-signal
+    /// union arms; callers supply negative `code` values such as `SI_QUEUE`
+    /// for POSIX semantics.
     pub fn new_user(signo: Signo, code: i32, pid: u32) -> Self {
         let mut result = Self::empty();
         result.set_signo(signo);
@@ -479,6 +560,13 @@ impl SignalInfo {
     }
 
     /// Returns the signal number.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stored `si_signo` is not a valid Linux signal number
+    /// (`1..=64`). Values imported from user ABI payloads
+    /// (via [`From<k_siginfo>`](SignalInfo::from)) must be validated by the
+    /// syscall layer before any method that decodes the signo is called.
     pub fn signo(&self) -> Signo {
         Signo::from_repr(self.header().si_signo as _).unwrap()
     }
@@ -620,10 +708,16 @@ impl From<k_sigaltstack> for SignalStack {
 }
 
 /// Signal handler stack configuration.
+///
+/// Mirrors the Linux `stack_t` ABI: `sp`/`size` describe the alternate stack
+/// range and `flags` carries `SS_*` values.
 #[derive(Clone)]
 pub struct SignalStack {
+    /// Base address of the alternate stack.
     pub sp: usize,
+    /// `SS_*` flags; `SS_DISABLE` marks the stack inactive.
     pub flags: u32,
+    /// Size in bytes of the alternate stack.
     pub size: usize,
 }
 
@@ -644,6 +738,9 @@ impl SignalStack {
     }
 
     /// Returns `true` when `sp` points into this alternate signal stack.
+    ///
+    /// Mirrors Linux `on_sig_stack`: the comparison is exclusive at the base
+    /// and inclusive at the top, and a disabled stack contains no address.
     pub fn contains_sp(&self, sp: usize) -> bool {
         !self.disabled() && sp > self.sp && sp - self.sp <= self.size
     }

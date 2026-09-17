@@ -120,6 +120,16 @@ pub struct TaskStat {
 
 impl TaskStat {
     /// Creates a new [`TaskStat`] from a [`TaskInner`].
+    ///
+    /// # Errors
+    ///
+    /// The current implementation always returns `Ok` after constructing the
+    /// snapshot; this Result is retained for the public interface.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task has no Thread runtime, or when truncating a name at
+    /// byte 16 would split a UTF-8 character.
     pub fn from_thread(task: &TaskInner) -> KResult<Self> {
         let thread = task.as_thread();
         let proc = thread.process();

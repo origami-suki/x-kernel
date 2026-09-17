@@ -3,6 +3,31 @@
 // See LICENSES for license details.
 
 //! POSIX process runtime and init-process orchestration.
+//!
+//! Boot code starts with [`spawn_init_process`]; clone adapters construct tasks
+//! with [`new_user_task`] and publish them through `kprocess`. The trap loop
+//! dispatches syscalls and faults, checks signals and orders last-thread cleanup.
+//! [`spawn_init_process`] documents the complete image/runtime/publication
+//! sequence; its source shows the required provider calls in order.
+//!
+//! ```no_run
+//! # fn publish_prepared(
+//! #     context: khal::uspace::UserContext,
+//! #     prepared: kprocess::PreparedUserClone,
+//! #     dispatch: impl FnMut(&mut khal::uspace::UserContext)
+//! #         -> kprocess::UserThreadRuntimeAction + Send + 'static,
+//! # ) -> kerrno::KResult<ktask::KtaskRef> {
+//! let root = prepared.page_table_root();
+//! let (thread, identity) = prepared.into_parts();
+//! let mut task = posix_process::new_user_task("child", context, 0, identity, thread, dispatch);
+//! task.ctx_mut().set_page_table_root(root);
+//! // Complete parent-side setup before the published child becomes runnable.
+//! kprocess::publish_user_task(task)?.commit(|_| Ok(()))
+//! # }
+//! ```
+//!
+//! The caller must first prepare the matching image and clone result in an
+//! initialized kernel task context; this example only compiles in that target.
 
 #![no_std]
 

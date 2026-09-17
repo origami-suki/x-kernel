@@ -116,6 +116,7 @@ pub struct Signalfd {
 }
 
 impl Signalfd {
+    /// Creates a mask-filtering object without binding it to the constructing thread.
     pub fn new(mask: SignalSet) -> Arc<Self> {
         Arc::new(Self {
             mask: RwLock::new(mask),
@@ -124,6 +125,11 @@ impl Signalfd {
     }
 
     /// Creates a signalfd file and captures `cred` as its open credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` for unknown open-flag bits and forwards
+    /// errors from anonymous-inode file creation.
     pub fn new_file(mask: SignalSet, open_flags: u32, cred: Arc<Cred>) -> KResult<Arc<VfsFile>> {
         let open_flags = OpenFlags::from_bits(open_flags).ok_or(KError::InvalidInput)?;
         AnonInodeFs::global().get_file(
@@ -137,11 +143,18 @@ impl Signalfd {
     }
 
     /// Returns the signalfd object attached to a signalfd file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` when the file has no matching private data.
     pub fn from_file(file: &VfsFile) -> KResult<Arc<Self>> {
         file.private_data_get::<Self>()
             .ok_or(KError::BadFileDescriptor)
     }
 
+    /// Replaces the signal selection mask and wakes readers to recheck readiness.
+    ///
+    /// The syscall adapter is responsible for removing uncatchable signals.
     pub fn update_mask(&self, mask: SignalSet) {
         *self.mask.write() = mask;
         self.poll_rx.wake();

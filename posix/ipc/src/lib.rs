@@ -6,6 +6,21 @@
 //!
 //! - Message queues (msgget, msgsnd, msgrcv, msgctl)
 //! - Shared memory (shmget, shmat, shmdt, shmctl)
+//!
+//! Dispatch user requests through [`sys_msgget`] / [`sys_shmget`] and their
+//! transfer/control entry points in sleepable process context. Process teardown
+//! uses [`ShmManager::clear_proc_shm`] after releasing address-space ownership.
+//! A standalone queue sequence needs no user runtime:
+//!
+//! ```no_run
+//! let mut queue = posix_ipc::MessageQueue::new(1, 0o600, 1, 0, 0);
+//! queue.enqueue_message(1, b"hello".to_vec()).unwrap();
+//! let message = queue.remove_message_by_index(0).unwrap();
+//! assert_eq!(message.data, b"hello");
+//! ```
+//!
+//! Queue creation reads kernel realtime, so this example requires the project's
+//! kernel test environment; host execution is not a supported validation path.
 
 #![no_std]
 

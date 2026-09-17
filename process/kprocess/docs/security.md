@@ -1,186 +1,150 @@
-# kprocess — 安全与可靠性分析
+# kprocess — Security and reliability
 
-## 信任模型
+## Scope and trust model
 
-```text
-kprocess / posix/process / ksyscall / ktty
-   │
-   │ safe API: Process, ProcessGroup, Session, init_proc, Pid
-   v
-┌──────────────────────────────┐
-│ kprocess                     │
-│                              │
-│  process identity graph      │
-│  group/session membership    │
-│  exit/thread metadata        │
-│  per-thread credential refs  │
-│  lifecycle wait/exit events  │
-│  controlling terminal slot   │
-│                              │
-│  unsafe boundary: none       │
-└──────────────────────────────┘
-```
+This analysis covers the entire crate, including `process/`, `process_runtime/`,
+`thread/`, public facade files and tests. Syscall decoders are outside scope and
+own ABI validation and operation-specific authorization. Trusted kernel callers
+must pass matching task/thread `PidHandle` identities and obey publication,
+current-thread, lock and cleanup contracts. `kidentity` supplies number identity;
+`kcred` supplies immutable credential values; `memspace` supplies mm-user lifetime
+and mapping invariants; `ksignal`, `kcgroup`, `kns`, `kresources` and filesystem
+providers supply their respective state and validation.
 
-- 调用者负责分配唯一 PID、PGID 和 SID。一般 POSIX 权限检查仍由 syscall 层执行；
-  需要统一 task identity 语义的 ptrace-style 跨任务读取由 `kprocess::ptrace` 集中检查。
-- `kprocess` 负责在 safe API 内维护父子关系、进程组关系、session 关系和退出状态不变量。
-- `kprocess` 负责 current-task credential 的定位和 committed `Arc<Cred>` 发布；凭据转换
-  规则由 `kcred` 负责。
-- `kprocess` 不解析用户指针，不接收设备 DMA，不处理网络包，不直接读写用户内存。
+Protected assets are stable PID/TID bindings, parent/child membership, exit
+visibility, runtime mm/files/fs/ns ownership, objective/subjective credentials,
+cgroup charge, signal recipients, timer generations and controlling-terminal
+identity. Possession of a `Process` reference is not by itself syscall authority.
 
-## unsafe 代码清单
+## External boundaries and validation responsibilities
 
-本模块没有 unsafe 代码。
-未发现 `unsafe` 块、`unsafe fn`、`transmute`、`from_raw`、`as_mut_ptr`、`UnsafeCell` 或 `MaybeUninit` 使用。
+| Boundary / entry | Inputs and direction | Local check / responsibility |
+|---|---|---|
+| `publish_user_task` | Kernel task carrying a user runtime into global visibility | Preparation asserts pointer-identical task/thread identity; cgroup reconciliation may fail; publish precedes activation. Caller must prepare a valid runtime and parent writeback. |
+| Thread fork/clone | Typed clone policy, namespace flags and credential snapshot into runtime owners | Checks parent relation stability and Running state, delegates namespace/fs/mm/fd validation and cgroup charge; namespace InvalidFlagCombination/Unimplemented map to InvalidInput/Unsupported. |
+| Signal facade | PID/TID/group and optional `SignalInfo` into ksignal/task interrupt | Missing/nonlive targets return NoSuchProcess; thread runtime mismatch returns OperationNotPermitted; optional TGID must match. Syscall signal permission checks remain external. |
+| `ptrace::check_read_real_creds_access` | Caller/target threads into access decision | Same-process access succeeds; otherwise caller real IDs must match target real/effective/saved IDs or caller must be privileged. Failure returns OperationNotPermitted; effective UID zero is the current privilege approximation. |
+| Cgroup migration | Target group and authorization callback into membership transaction | Requires published members/source, runs callback under stable process cgroup gate, then delegates atomic group migration. Callback decides filesystem-owned authorization. |
+| Current-thread and credential helpers | Current TaskInner into a Thread/credential view | Dereference/downcast requires a user runtime. `current_fs_context` alone falls back to initial fs for kernel tasks. Commit asserts no subjective override before replacing both credential pointers. |
+| `Process::address_space` / mapping closure | Runtime active-mm handle into MM operations | Refuses missing runtime/mm user with NoSuchProcess. `LiveAddressSpace` retains an active user; MM owns address/range checks. |
+| Thread robust/clear-child pointer setters | User-originated addresses stored as integers | No dereference/validation here; `posix-process` performs fault-aware access and bounded robust cleanup on exit. |
+| Exec metadata and timer APIs | Kernel-prepared path/argv/heap/timer configuration into runtime | Caller/loader validates image metadata; ktimer validates timer requests. Missing runtime returns NoSuchProcess; close-on-exec errors propagate. |
+| Pidfd construction | Stable process and explicit credentials into anonymous file | OpenFlags rejects unknown bits; typed private data checks reject other file kinds. Pidfd live queries reject exited identity while poll retains exit visibility. |
+| TEE/TIPC callbacks (feature-gated) | Typed context/handle access across provider boundary | Owner locks protect contexts; closure callers must preserve provider invariants and avoid recursive locking. |
 
-## 内存安全不变量
+No direct user-memory read/write, device MMIO/PIO, DMA, firmware parsing or
+network-buffer parsing is implemented here. External data can still be present
+in paths, argv, signals and stored user addresses. Absence of local raw accesses
+is not an assertion that these values are trusted or that syscall authorization
+is complete.
 
-1. **父子所有权**：父进程 `children` 表持有子进程 `Arc`，子进程 `parent` 字段只保存 `Weak`。
-2. **group/session 非拥有索引**：`ProcessGroup::processes` 和 `Session::process_groups` 只保存 weak entry。
-3. **init 进程存在性**：普通进程 reparent 依赖 `INIT_PROC` 已初始化。
-4. **terminal 对象边界**：`Session::terminal` 保存 `Arc<dyn ControllingTerminal>`，只通过指针相等清除，不在 `kprocess` 内 downcast。
-5. **退出回收顺序**：`free` 只能作用于已退出进程，避免 still-running 子进程从父表中被移除。
-6. **lifecycle 事件归属稳定**：`child_exit_event` 事件流与 sticky `exit_event`
-   completion 归属于 `Process`，不依赖 `ProcessRuntime` 是否仍可升级。
-7. **弱 runtime 引用非拥有**：`Process` 只保存 `Weak<ProcessRuntime>`，
-   不延长 runtime 生命周期；upgrade 失败时由上层折叠为 `NoSuchProcess` 等语义错误。
-   runtime 内的 files、`FsStruct` 和 `NsProxy` owner 可在 runtime 对象仍存活时独立置空，
-   capability accessor 必须同时检查对应 owner 是否存在。
-8. **live 语义独立于弱 runtime 引用**：外部 `live process` 以 exited state 为准，
-   不允许把“runtime 还没释放”误判成“进程仍然活着”。
-9. **publication 原子可见性**：task/process/group/session 目录在同一 publication 锁下更新，
-   避免 `tgkill(tid)` 已命中而 `kill(pid)` / `pidfd_open(pid)` 仍暂时 `ESRCH` 的跨表半发布状态。
-10. **publication 失败必须可回滚**：若 parent-side `CLONE_PIDFD` / `PARENT_SETTID` 等收尾步骤失败，
-   staged publication 必须撤销 task/process 目录可见性，以及尚未提交 child 的 parent/group 成员关系，
-   不能留下“syscall 失败但 child 仍可见/可 wait”的残留对象。
-11. **凭据提交不可见半状态**：`Thread` 只发布不可变 `Arc<Cred>`；checked 转换在普通
-   `Cred` 副本上完成后，按 `real_cred`、`cred` 的固定锁顺序同时替换。
-12. **objective/subjective 关系明确**：当前未支持 override credential，普通提交要求两个
-   旧指针相同，避免静默覆盖未来的临时 subjective identity。
-13. **跨任务读取检查集中**：同线程组豁免、objective credential 快照、real-ID 匹配和
-    特权绕过由 `ptrace::check_read_real_creds_access()` 一次组合，syscall 不重复拼接字段规则。
-14. **cgroup task identity 稳定**：cgroup 枚举必须同时匹配 registry task 的
-   `PidHandle` 与 membership 持有的 `Arc<PidHandle>`，不能只信任数值 TID。
+## Unsafe inventory
 
-## 线程安全
+The explicit unsafe operation is in `src/process/tree.rs`,
+`Process::remove_child_slot_from_parent_locked`: `children.remove(slot)` operates
+on an intrusive list. Its SAFETY comment requires the process-domain lock to
+serialize every child-list mutation, a membership check proving this exact slot
+is in this exact parent's list, and absence of concurrent unlink between check
+and removal. The write-guard parameter plus pointer-identity search provide the
+local guarded path; `parent.children` is also locked during removal.
 
-| 类型 | `Send` 条件 | `Sync` 条件 |
-|------|-------------|-------------|
-| `Process` | 字段均满足 Send | `SpinNoIrq`、atomic state 和 `Arc` 保护共享状态 |
-| `ProcessGroup` | 字段均满足 Send | `SpinNoIrq<WeakMap<...>>` 保护成员表 |
-| `Session` | 字段均满足 Send | `SpinNoIrq` 保护进程组表和 terminal slot |
-| `Thread` credential refs | `Arc<Cred>` 可发送 | 两个 `RwLock` 保护指针替换；`Cred` 本身不可变共享 |
-| `ThreadMembership` | 在 `SpinNoIrq` 内使用 | 不直接跨线程共享 |
-| `ThreadGroupExitState` | 在 `SpinNoIrq` 内使用 | 不直接跨线程共享 |
+There are no explicit unsafe functions/traits/impls, FFI declarations or inline
+assembly elsewhere in this crate. The intrusive-list macro/provider and task/MM
+integration still have external safety contracts; this inventory covers explicit
+source boundaries rather than claiming generated/provider code has no unsafe.
 
-## 威胁分析
+## Memory and lifecycle invariants
 
-| 编号 | 威胁描述 | 影响等级 | 触发条件 | 应对措施 |
-|------|----------|----------|----------|----------|
-| T-01 | PID、PGID 或 SID 冲突导致关系图错误 | 中 | 调用者用已存在 ID 创建进程、group 或 session | `create_session` 和 `create_group` 文档要求调用者先做冲突检查；`posix/process` 通过 registry 检查 group |
-| T-02 | 跨 session 移动进程破坏 job-control 隔离 | 中 | 调用 `move_to_group` 时目标 group 属于其他 session | `move_to_group` 比较 `Arc<Session>`，不同 session 返回 `false` |
-| T-03 | init 进程退出导致 reaper 缺失 | 中 | 调用者对 init 进程调用 `exit` | `Process::exit` 对 init 进程直接返回 |
-| T-04 | 未退出进程被提前回收 | 中 | 调用者对运行中进程调用 `free` | `free` 断言进程已经 exited，错误调用触发 panic |
-| T-05 | 控制终端被重复绑定 | 中 | 多个 TTY 尝试设置同一 session terminal | `set_terminal` 返回 `SetTerminalResult::Occupied`；TTY 侧只在短临界区安装已构造 terminal，并在失败时回滚 job-control session |
-| T-06 | 错误终端对象清除当前绑定 | 中 | 调用者传入非当前 terminal 的对象调用 `unset_terminal` | `unset_terminal` 使用 `Arc::ptr_eq` 校验对象一致性 |
-| T-07 | wait 或 procfs 遍历读到过期 group member | 低 | WeakMap 中存在已释放对象的 weak entry | `ProcessGroup::processes` 通过 `WeakMap::values` 返回可升级对象，registry 另有 cleanup 路径 |
-| T-08 | 锁顺序误用导致死锁 | 中 | 外部持有 children、group 或 session 成员锁后调用 group/session mutation API | API 内部统一加锁；新增调用点应避免外层持有 `kprocess` 成员锁 |
-| T-09 | group-exit 退出码被普通线程退出覆盖 | 中 | group exit 后其他线程继续调用 `exit_thread` | `exit_thread` 在 `group_exited` 为 true 时不覆盖 `exit_code` |
-| T-10 | lifecycle 唤醒仍依赖 runtime-state 查找 | 中 | 退出路径先拿到 parent，却还要回查另一层状态对象 | lifecycle 事件已归属 `Process`，退出路径可直接 wake parent；process exit observer 使用 sticky completion 支持 late pidfd waiter |
-| T-12 | 进程 live-state 入口依赖 thread-table 反推 | 中 | PID 可见后仍需通过线程集合和 task table 回查 live state | `Process` 现在直接持有 typed runtime attachment，避免把 task table 当作 live-state 真相 |
-| T-13 | 已退出进程因 runtime 尚未释放而被误判为 live | 中 | 退出尾段里当前线程仍强持有 `ProcessRuntime`，但进程已经进入 exited state | `live` 查询只看 exited state；runtime attachment 仅供内部 capability upgrade |
-| T-14 | 多目录分步发布暴露 task/process 可见性裂缝 | 中 | parent 已观察到新 tid/pidfd，但 task/process/group/session 目录仍未统一可见 | `ProcessPublication` 用单锁事务同时更新可观测目录；`clone` 在 publication 完成后才回写 `PARENT_SETTID` / `PIDFD` |
-| T-15 | staged publication 失败后残留未提交 child | 高 | `clone()` 返回错误，但 child 仍留在 parent.children / thread membership / PID 目录里 | publication handle 默认可回滚；失败时同步撤销目录可见性与未提交 child 关系 |
-| T-21 | prepared sibling 对齐 process cgroup 失败后触发 panic 或被发布到错误 cgroup | 高 | publication 前目标 cgroup 已失效或属于其他 hierarchy | cgroup reconciliation 在目录 reservation 前执行并传播错误；失败 task 保持不可见，由调用者的 clone 回滚路径清理 |
-| T-11 | 中断上下文误用放大关中断区间 | 中 | 在中断上下文中执行进程关系 mutation，或持有 `SpinNoIrq` 后调用长路径逻辑 | `kprocess` API 内部锁区保持短小；新增调用点应限制在 task/syscall 生命周期路径 |
-| T-16 | 凭据转换中途被其它检查观察 | 高 | 原地修改共享 credential，或逐字段发布 | prepare/commit 模型只替换完整 `Arc<Cred>`；读取者先克隆快照 |
-| T-17 | 下层资源 owner 反向读取 current task 造成层级倒置、身份变化或内核任务 panic | 高 | VFS 路径或匿名文件构造隐式调用 `current_cred()` | current helper 只服务明确的用户 task 入口；syscall 将一个 `Arc<Cred>` 显式传入 `kvfs` 和 fd 对象构造函数 |
-| T-18 | 退出进程的大块用户内存释放依赖普通 GC 任务调度 | 高 | fork/exec 风暴中 GC 任务迟迟不运行，已退出进程的地址空间资源堆积 | runtime 持有 `memspace::process_lifetime::MmUserHandle`；最后一个 handle 释放时同步清理 `MmSpace` 的用户映射，普通 `Arc<MmSpace>` observer 或 `MmPin` 不保留映射 |
-| T-19 | 父进程显式忽略 SIGCHLD 后 zombie 泄漏或被 wait 抢先回收 | 中 | 父进程设置 `SIGCHLD` 为 `SIG_IGN` 或 `SA_NOCLDWAIT`，child exit 与 parent wait / signal handler 并发 | child-exit 通知先准备 autoreap/queue 决策；autoreap child 跳过 waitable zombie 状态，先撤销 children/PID 身份，再提交 typed SIGCHLD payload，并在提交时按当前线程 mask 选择唤醒目标 |
-| T-20 | 失效 PID/TID 目录槽位无限保留 | 高 | wait/exit 只 retire slot 却不从 `BTreeMap` 删除，fork 密集工作负载累积数百 MiB RustHeap | `unpublish_task_if_matches`/`unpublish_process_if_matches` 在 retire 前用 `Arc::ptr_eq` 校验发布身份，再删除仍指向同一 cleanable slot 的目录项；复用后的 Reserved/Published 新身份不会被旧退出路径误退休 |
-| T-21 | zombie 或 reaper identity 继续固定 VFS mount | 高 | exited-state 已发布，但 runtime 的 fd table、`FsStruct` 或 `NsProxy` owner 仍存在 | 最后线程先取走 mm/files/fs/ns owner，再发布 exited state；空 owner 的 accessor 返回 `NoSuchProcess` |
-| T-22 | ptrace-style syscall 各自实现不一致的凭据比较 | 高 | syscall 逐字段比较 caller/target，错误处理 set-ID 凭据 | `kprocess::ptrace` 集中线程组、real-credential 和特权策略；字段匹配复用 `kcred` 的非对称谓词 |
-| T-23 | stale cgroup TID 映射到复用后的新 task | 高 | membership 数值仍在，而 registry 已发布同号新 task | membership pin 住 `PidHandle`；`cgroup_member_process_ids()` 用 `Arc::ptr_eq` 验证 lookup identity |
-| T-24 | cgroup 操作使用写入时的 ambient credential 绕过打开时权限 | 高 | descriptor 打开后 credential 改变，adapter 反向查询 current task | VFS DAC 负责 pathname/目录 mutation；command file 使用 `VfsFile::f_cred`，迁移 authorization 在 process cgroup gate 内执行 |
+- A published task must carry the same stable handle as its Thread. Numeric ID
+  equality alone does not protect against reuse; retire/delete paths check object
+  identity and current slot state.
+- Parent link, child list, exit signal and reserved reparent slot form one
+  relation. Mutate them under the domain write lock, never by independent updates.
+- Running → Zombie/Dead and Zombie → Dead consumption are domain transactions.
+  Acquire-load exited flags are advisory for compound decisions.
+- Publication may retain strong Process identity after runnable threads vanish.
+  Runtime availability and lifecycle liveness are separate; do not use Weak
+  upgrade as authorization to target an exited process.
+- `LiveAddressSpace` owns an active mm user. Pins/observers only retain metadata;
+  final-user release clears user mappings. Runtime resource/fs/ns slots are
+  detached before parent-visible exit by the lifecycle caller.
+- Group and session publication must track installed group membership; rollback
+  must retire only transaction-owned identities and not reused slots.
+- Credential values are immutable snapshots. Per-thread commit takes real then
+  subjective locks, verifies no override and replaces both with one new Arc.
 
-影响等级定义：
+## Concurrency and context
 
-- 高：导致 UB、内存破坏、权限提升。
-- 中：导致 panic、服务不可用、权限或 job-control 语义错误。
-- 低：导致统计不准、展示过期、功能降级。
+Publication takes cgroup gate, table write lock, domain write lock, then local
+spin locks. Exit/reap release domain before structural table deletion. Readers
+snapshot table slot references before taking domain read. Never acquire a
+sleepable lock or call signal preparation/destruction under the domain spin lock.
+Cgroup authorization and scheduler validation closures execute under their
+sleepable owner locks; TEE callbacks do likewise. They must not reenter the same
+lock. Current-user helpers are not IRQ/early-boot/kernel-task APIs; initialization
+and allocator/scheduler/clock assumptions are explicit in design.md.
 
-## 故障模式与影响分析
+Per-thread CPU accounting has a mutex; aggregate counters are relaxed atomics.
+Their snapshots are not transactionally tied to every directory/resource field.
+`ExecMetadata` atomically replaces its pair, while separate getters can straddle
+updates. Timer signal dequeue callbacks validate timer sequence through ktimer;
+missing targets are ignored by delivery glue rather than reviving retired tasks.
 
-| 编号 | 故障模式 | 故障原因 | 局部影响 | 系统影响 | 严重度 | 应对措施 |
-|------|----------|----------|----------|----------|--------|----------|
-| F-01 | `init_proc` panic | `INIT_PROC` 尚未初始化 | 查询 init 进程失败 | fork/exit/reparent 路径不可用 | 2 | 启动入口先调用 `Process::new_init`；测试 helper 保证 init 存在 |
-| F-02 | 子进程 reparent 失败 | init 进程未初始化或 children 锁顺序被外部破坏 | orphan child 留在退出父进程下 | wait 和 procfs 关系错误 | 2 | `Process::exit` 使用 `INIT_PROC` 作为统一 reaper，并在内部按固定顺序更新 children 和 parent |
-| F-03 | wait 回收运行中进程 | 调用者绕过 exited-state 检查调用 `free` | 父子关系提前删除 | wait、signal 和 procfs 观察错误 | 2 | `free` 对进程已退出状态做断言 |
-| F-04 | setsid 或 setpgid 语义错误 | 调用者未检查 ID 冲突或 session 约束 | 进程组关系错误 | job-control 行为异常 | 3 | `move_to_group` 内部拒绝跨 session；冲突检查由 syscall 和 registry 执行 |
-| F-05 | terminal slot 永久占用 | TTY drop 或 ioctl 路径未调用 `unset_terminal` | session 无法绑定新 terminal | TTY job-control 失效 | 3 | `set_terminal` 返回三态安装结果；`TIOCNOTTY` 路径同时调用 `unset_terminal` 和 job-control session 清理 |
-| F-06 | WeakMap 残留过期项 | process group 成员释放后索引未清理 | 遍历结果少于表项数量 | 统计或展示短暂不一致 | 4 | `WeakMap::values` 只返回可升级对象；`kprocess` registry 提供 cleanup |
-| F-07 | 线程集合统计不准 | 调用者漏调 `add_thread` 或 `exit_thread` | `threads()`、CPU time 和 rusage 统计错误 | procfs、wait、timer 逻辑受影响 | 3 | clone 和 exit 路径集中调用对应 API |
-| F-08 | 中断上下文执行进程关系修改 | IRQ 路径误调用 `fork`、`exit`、`create_session` 或 group mutation | 关中断持锁时间变长 | 调度延迟上升，严重时影响系统响应 | 2 | 进程关系修改限定在启动、clone、exit、wait 和 syscall job-control 路径 |
-| F-09 | PID/TID publication 目录泄漏 | exit/wait 路径只逻辑失效 slot | RustHeap 随累计 fork 线性增长，buddy 外部碎片 | spawn 类压力测试 OOM | 2 | 热路径按发布身份精确 retire/删除匹配 PID/TID 槽；`cleanup()` 仅作 group/session 兜底 |
+## Threat analysis
 
-严重度定义：
+| ID | Asset / threat | Severity | Trigger | Existing response and residual risk |
+|---|---|---|---|---|
+| T-01 | PID/TID reuse causes wrong-task removal or signal targeting | High | Old exit/rollback races a new numeric ID binding | Stable slots and Arc identity checks gate retirement/deletion; Reserved slots are not deleted as retired. Syscall target authorization remains external. |
+| T-02 | Double reap or inconsistent parent relation | Medium | Multiple waiters, reparent and exit race | Domain write transaction scans, claims Zombie, detaches and retires identity once; callers rescan after failed claim. |
+| T-03 | Intrusive-list removal corrupts memory | High | A foreign or concurrently unlinked slot is removed | Guard token, parent list lock and exact membership check enforce the documented unsafe preconditions. |
+| T-04 | Runtime references retain resources through zombie lifetime | Medium | Parent observes completion before files/fs/ns/mm detach | Lifecycle caller must detach owners first; weak runtime identity avoids owning the runtime. Existing live capabilities can deliberately prolong active-mm lifetime. |
+| T-05 | Credential confusion permits cross-task inspection | High | Caller/target credentials differ or subjective override exists | Ptrace checks real credentials and commit rejects override; UID-zero privilege approximation and absent full capability/dumpability model are residual limitations. |
+| T-06 | Half-published fork becomes runnable | Medium | Parent writeback or cgroup migration fails | Staged publication and commit-before-activation; Drop rolls back. Already-exited/unusual rollback paths retain conservative state rather than deleting another identity. |
+| T-07 | Exit signal exposes state before autoreap commits | Medium | Signal handler/waiter runs while parent contract changes | Prepare outside domain, revalidate parent/exit-signal and retry, commit state before signal queueing/wakeup. Failed notification is logged; UID fallback can reduce payload accuracy. |
+| T-08 | Cgroup movement races child publication | Medium | Migration and clone operate concurrently | Process cgroup gate stabilizes authorization and reconciles unpublished membership; kcgroup owns group charge/migration invariants. |
+| T-09 | Exec failure leaves partially updated runtime | Medium | Close-on-exec cleanup returns error | Error propagates before metadata pair publication; earlier timer/heap/signal changes are not rolled back. Caller must handle exec failure state appropriately. |
 
-- 1：致命，系统崩溃、内存破坏。
-- 2：严重，进程生命周期或 wait 语义不可用。
-- 3：一般，job-control 或统计功能异常。
-- 4：轻微，短暂展示不一致。
+## Failure modes and handling
 
-## 故障管理
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1–4) | Controls |
+|---|---|---|---|---|---|---|
+| F-01 | Runtime/target disappears | Concurrent exit/detach or invalid numeric target | Capability/lookup returns NoSuchProcess | Syscall fails or delivery is skipped | 3 | Typed Result and current-context invariant panics where required. |
+| F-02 | Fork preparation fails | Cgroup, namespace, MM, fd or identity preparation error | No runnable child | Caller sees clone error | 3 | AttachedForkProcess and publication rollback release prepared relations/charges. |
+| F-03 | Parent contract changes during exit | Concurrent parent exit/reparent | Prepared signal is obsolete | Notification must be retried | 3 | Discard retry-safe preparation and resample before commit. |
+| F-04 | Internal task identity or slot assertion fails | Trusted caller or publication invariant violation | Publication stops | Kernel panic | 1 | Assertions report violated trusted-caller invariants rather than accepting inconsistent identity. |
+| F-05 | Signal delivery fails after exit commit | Parent runtime/target becomes unavailable | Notification may be absent | Parent relies on wait-event path | 3 | Log preparation/send failures and finish parent wait wakeup. |
+| F-06 | Deferred slot cleanup remains | Conservative abort or retirement cleanup path | Directory storage persists | Extra retained metadata | 3 | Identity-matched hot cleanup plus explicit directory sweep; no broad PID-only deletion. |
 
-- `move_to_group`、`unset_terminal` 使用 bool 返回调用是否成功；`set_terminal` 使用 `SetTerminalResult` 区分新安装、同对象重入和被其他 terminal 占用。
-- `create_session` 和 `create_group` 在当前进程已经是 leader 时返回 `None`。
-- `init_proc` 在 init 尚未初始化时 panic，调用者需保证启动顺序。
-- `free` 在目标尚未退出时 panic，调用者需先完成 wait 条件判断。
-- cgroup facade 以 `KResult` 返回 lookup、`EPERM` 和 migration error；其他领域 API
-  继续在各自 adapter 边界映射错误。
+Errors from MM/fd/namespace/cgroup/timer providers are propagated or explicitly
+mapped. Timer delivery deliberately tolerates missing recipients. Current-helper,
+initialization and publication assertions are invariant checks, not recoverable
+user-input validation. No crash-recovery mechanism is provided.
 
-## 隐私分析
+## Privacy, limitations and verification
 
-`kprocess` 保存 PID、父子关系、线程 ID、退出码、进程组、session、terminal 绑定，
-每个线程的 credential 引用、exec path/cmdline metadata 和 OOM score adjustment。
-umask 由独立的 `fs_context::FsStruct` 与 root/pwd 一起持有。credential 包含数值
-UID/GID 和补充组，但不包含用户名、用户 payload、
-文件内容或地址空间内容。上述身份和元数据会被 procfs、wait、
-signal、scheduler 和 job-control 路径读取，调用者需要在上层执行可见性和权限控制。
+Executable paths, command lines, IDs, user addresses, credentials and CPU stats
+can be exposed through procfs/signal/pidfd consumers. Those consumers own access
+policy; this crate supplies snapshots and does not redact them. Debug/signal
+logs include process IDs and signal names. Credential and payload memory is not
+explicitly scrubbed on drop here.
 
-## 已知限制
+Root/global PID projection, missing subreaper support, representative-thread
+credentials, simplified ptrace privilege semantics, UID-zero child-exit fallback
+and external syscall authorization are current limits. Resource-object or mm-ID
+availability does not prove a live fd table or active mappings. Optional TEE/TIPC
+paths require feature-specific validation.
 
-- cgroup namespace 创建尚未执行 `CAP_SYS_ADMIN` 等价授权；user namespace capability
-  模型完成前 `CLONE_NEWCGROUP` 保持 `ENOSYS`。
-- PID namespace 尚未贯通 registry、procfs、signal 和 wait 的可见 PID 翻译。
+`src/tests.rs` exercises publication, PID reuse, rollback, parent/wait/exit,
+resource detach and related invariants. Inline tests cover ptrace checks, pidfd
+exit readiness and CPU accounting. Test source existence is not execution proof.
 
-- subreaper 尚未实现，普通退出进程的子进程统一 reparent 到 init。
-- ID 冲突检查不在 `kprocess` 内集中执行，调用者需通过 registry 或 syscall 规则保证唯一性。
-- `Session::terminal` 使用 `ControllingTerminal` trait object，`kprocess` 只管理绑定槽，不了解具体 TTY 类型。
-- `Process::exit` 不主动从 process group 成员表删除进程，成员表依赖 weak entry 释放和 cleanup。
-- 弱 runtime 引用只在 `kprocess` 内部使用，不再作为对外公开的类型擦除桥，也不再作为 `live process` 判据。
-- subjective credential override 尚未实现；当前 `real_cred` 与 `cred` 始终共同提交。
+## Audit checklist
 
-## 审计清单
-
-修改本模块时需验证：
-
-- 新增公开 API 是否有外部调用者，内部 helper 优先保持 `pub(crate)`。
-- cgroup adapter 是否只依赖 `cgroup.rs` facade，且数值 task lookup 后继续验证
-  `PidHandle` 指针 identity。
-- 新增进程关系转换是否保持 parent/children、group/processes、session/process_groups 三组关系一致。
-- 新增锁嵌套是否遵循现有 API 内部加锁方式，避免外部持有成员锁后调用 mutation API。
-- 新增 task publication 或 rollback 是否通过同一事务对象同时处理全局 TID task slot 和进程内 thread member slot。
-- 新增 publication 失败路径是否只 retire 本事务预留的 PID、group、session slot，不撤销既有 published identity，并删除仍可清理的目录 map 项。
-- 新增 fork runtime 构造失败路径是否撤销已经 attach 但尚未 publication 的 child relation。
-- 新增退出路径是否保持最后线程退出、waitable zombie / autoreap、wait/free 顺序，并在 thread exit / process reap 时携带任务/进程身份按 TID/PID 精确删除目录槽，而非仅凭数字 ID retire（尤其禁止对 `Reserved` 槽位 retire）或依赖全表扫描。
-- 新增 child-exit SIGCHLD 行为是否区分默认 ignored、显式 `SIG_IGN` 和 `SA_NOCLDWAIT`，并保持 autoreap 在提交 SIGCHLD pending 和唤醒 parent waiters 前完成。
-- 新增凭据修改是否遵循 prepare/check/commit，且失败时不替换 committed `Arc`。
-- 新增 ptrace-style 跨任务读取是否复用 `kprocess::ptrace`，而不是在 syscall 层重写凭据比较。
-- 需要文件权限的调用是否在 syscall 入口取得一次快照，而不是让下层反向查询 current task。
-- 新增 current-thread 尾段路径是否仍可通过稳定 `Process` 访问所需 runtime capability，且不会把已退出进程重新暴露为 live。
-- 新增退出 capability 是否在 exited-state 发布前取走；files、fs、namespace accessor
-  是否在 owner 已空时拒绝访问，且 owner drop 是否发生在对应 slot 锁外。
-- 新增地址空间退出清理是否只在最后一个 runtime `MmUserHandle` 释放时发生，且不得被普通 `Arc<MmSpace>` observer 或 `MmPin` 阻塞或破坏 `CLONE_VM` 共享方。
-- 新增用户映射访问路径是否走 live address-space 入口；退出后仅需观察 mm 对象的路径是否显式使用 teardown-observation pinned 入口，避免把 `MmPin` 当成 live user capability。
-- 新增 controlling terminal 行为是否保持 set-once 和 pointer-match unset 语义。
+- Check stable-handle identity at task construction/publication and reuse-safe cleanup.
+- Keep every parent/list/state transition inside the process-domain transaction.
+- Match intrusive-list unsafe assumptions to the exact checked list and slot.
+- Preserve cgroup/table/domain lock order and defer callbacks/destructors.
+- Keep resource detach before parent completion; distinguish live from published.
+- Preserve objective/subjective credential lock order and override assertion.
+- Check signal preparation retry safety and commit-before-wakeup ordering.
+- Document and validate optional TEE/TIPC callbacks and architecture MM hooks.

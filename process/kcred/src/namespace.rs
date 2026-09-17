@@ -11,7 +11,7 @@ use klazy::Once;
 
 static INIT_USER_NS: Once<Arc<UserNamespace>> = Once::new();
 
-/// Globally unique namespace identifier.
+/// Kernel namespace identifier allocated from a global counter.
 ///
 /// This is used for namespace identities that are externally rendered as
 /// `/proc/[pid]/ns/*` inode-style identifiers.
@@ -25,7 +25,10 @@ impl Default for NamespaceId {
 }
 
 impl NamespaceId {
-    /// Allocate a new unique namespace ID.
+    /// Allocates the next namespace ID.
+    ///
+    /// The relaxed `u64` counter has no wrap check; uniqueness is limited
+    /// to allocations before counter exhaustion. This is not an authorization token.
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))

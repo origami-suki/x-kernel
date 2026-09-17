@@ -18,28 +18,43 @@ use crate::{
     interval_timer::{ITimer, TimerInstant},
 };
 
+/// Notification configuration requested at `timer_create`.
 #[derive(Clone, Copy)]
 pub enum PosixTimerCreateNotify {
+    /// `SIGEV_NONE`: track expirations without notifying anyone.
     None,
+    /// `SIGEV_SIGNAL` (or `SIGEV_THREAD_ID` when `target_tid` is set).
     Signal {
+        /// Signal number to deliver on expiration.
         signo: Signo,
+        /// Thread-directed target for `SIGEV_THREAD_ID`; process-directed
+        /// when `None`.
         target_tid: Option<Tid>,
+        /// `sigval` payload source.
         value: PosixTimerSigValue,
     },
 }
 
+/// Source of the `sigval` payload carried by POSIX timer signals.
 #[derive(Clone, Copy)]
 pub enum PosixTimerSigValue {
+    /// Use the exact `union sigval` bits provided by the user.
     Explicit(TimerSigValue),
+    /// Use the kernel timer ID as the payload (POSIX default).
     TimerId,
 }
 
+/// Opaque `union sigval` carrier preserving the raw ABI bits.
 #[derive(Clone, Copy)]
 pub struct TimerSigValue {
     raw_bits: usize,
 }
 
 impl TimerSigValue {
+    /// Captures the raw bits of a user-provided `sigval`.
+    ///
+    /// The pointer view is read only to preserve the bit pattern; it is
+    /// never dereferenced (see the `SAFETY` note at the read).
     pub fn from_raw(value: k_sigval) -> Self {
         Self {
             // SAFETY: `k_sigval` is an ABI carrier union. Reading the pointer

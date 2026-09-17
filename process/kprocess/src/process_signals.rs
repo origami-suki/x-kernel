@@ -61,12 +61,23 @@ impl ksignal::CurrentSignalDispatch {
 }
 
 /// Sends a signal to a process identified by PID.
+///
+/// # Errors
+///
+/// Returns `KError::NoSuchProcess` for an unpublished/exited PID or a missing
+/// runtime signal manager. PID zero selects the current user process.
 pub fn send_to_process(pid: Pid, sig: Option<SignalInfo>) -> KResult<()> {
     let proc = lookup::live_process(pid)?;
     send_to_process_ref(&proc, sig)
 }
 
 /// Sends a signal to a specific process object reference.
+///
+/// # Errors
+///
+/// Forwards `Process::signal_manager` errors when the runtime is gone.
+/// A disappearing selected task is tolerated after queuing; this helper does
+/// not itself check signal permissions or reject every exited process reference.
 pub fn send_to_process_ref(proc: &Arc<Process>, sig: Option<SignalInfo>) -> KResult<()> {
     let signal_manager = proc.signal_manager()?;
 
@@ -84,6 +95,11 @@ pub fn send_to_process_ref(proc: &Arc<Process>, sig: Option<SignalInfo>) -> KRes
 }
 
 /// Prepares child-exit `SIGCHLD` notification without publishing it yet.
+///
+/// # Errors
+///
+/// Forwards `Process::signal_manager` errors when the destination runtime is
+/// gone. The returned preparation must be committed after exit-state publication.
 pub fn prepare_child_exit_to_process_ref(
     proc: &Arc<Process>,
     sig: SigchldChildExitSignalInfo,
@@ -97,6 +113,11 @@ pub fn prepare_child_exit_to_process_ref(
 }
 
 /// Sends a signal to a process group.
+///
+/// # Errors
+///
+/// Returns `KError::NoSuchProcess` for an absent group and forwards process
+/// delivery failures. Earlier group members may already have received the signal.
 pub fn send_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> KResult<()> {
     let group = lookup::process_group(pgid)?;
 
@@ -111,6 +132,12 @@ pub fn send_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> KResult<()> 
 }
 
 /// Sends a signal to a thread.
+///
+/// # Errors
+///
+/// Returns `KError::NoSuchProcess` for a missing TID or mismatched supplied
+/// TGID, and `KError::OperationNotPermitted` if the task has no Thread runtime.
+/// TID zero resolves the current task; `None` checks without queuing.
 pub fn send_to_thread(tgid: Option<Pid>, tid: Tid, sig: Option<SignalInfo>) -> KResult<()> {
     let task = lookup::task(tid)?;
     let thread = task.try_as_thread().ok_or(KError::OperationNotPermitted)?;
@@ -127,6 +154,11 @@ pub fn send_to_thread(tgid: Option<Pid>, tid: Tid, sig: Option<SignalInfo>) -> K
 }
 
 /// Interrupts the current task backing the target thread, if present.
+///
+/// # Errors
+///
+/// Returns `KError::NoSuchProcess` when a nonzero TID is not published.
+/// TID zero interrupts the current task.
 pub fn interrupt_thread(tid: Tid) -> KResult<()> {
     lookup::task(tid)?.interrupt();
     Ok(())

@@ -31,6 +31,11 @@ pub fn reap_zombie_process(process: &Arc<Process>) -> bool {
 ///
 /// This is intended for tests and invariant-checked internal paths. Racing
 /// wait paths should use [`reap_zombie_process`] or [`try_reap_zombie_process`].
+///
+/// # Panics
+///
+/// Panics unless this call consumes a waitable zombie still linked to its
+/// parent. A racing waiter may have already consumed it.
 #[cfg(unittest)]
 pub fn assert_reap_zombie_process(process: &Arc<Process>) {
     assert!(

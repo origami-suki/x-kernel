@@ -2,7 +2,21 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Process-owned resource objects.
+//! Process-owned limits and detachable descriptor-table references.
+//!
+//! Start with [`ProcessResources::new`]. Limits remain available after
+//! [`ProcessResources::exit_files`]; the detached files owner cannot be revived.
+//! These APIs require initialized kernel allocation and sleepable locks.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use kresources::ProcessResources;
+//! let resources = ProcessResources::new(512 * 1024);
+//! assert_eq!(resources.max_nofile(), 1024);
+//! resources.exit_files();
+//! assert!(resources.fd_table().is_err());
+//! ```
 
 #![no_std]
 
@@ -31,6 +45,9 @@ pub struct ProcessResources {
 
 impl ProcessResources {
     /// Creates a new process resource set with default limits.
+    ///
+    /// `user_stack_size` is the configured user stack capacity in bytes,
+    /// passed to [`Rlimits::new`]. The attached descriptor table starts empty.
     pub fn new(user_stack_size: usize) -> Arc<Self> {
         Arc::new(Self {
             rlimits: RwLock::new(Rlimits::new(user_stack_size)),
@@ -44,6 +61,10 @@ impl ProcessResources {
     }
 
     /// Returns the current limit for a specific resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` when `resource >= RLIM_NLIMITS`.
     pub fn rlimit(&self, resource: u32) -> KResult<Rlimit> {
         if resource >= RLIM_NLIMITS {
             return Err(KError::InvalidInput);
@@ -53,12 +74,22 @@ impl ProcessResources {
     }
 
     /// Returns the current soft/hard pair for a specific resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` when `resource >= RLIM_NLIMITS`.
     pub fn rlimit_values(&self, resource: u32) -> KResult<(u64, u64)> {
         let limit = self.rlimit(resource)?;
         Ok((limit.current, limit.max))
     }
 
     /// Updates the limit for a specific resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` for an out-of-range resource or soft > hard.
+    /// Returns `KError::OperationNotPermitted` for any hard-limit increase.
+    /// The old pair is unchanged on failure; capability-based increases are not supported.
     pub fn set_rlimit(&self, resource: u32, new_limit: Rlimit) -> KResult {
         if resource >= RLIM_NLIMITS {
             return Err(KError::InvalidInput);
@@ -79,6 +110,12 @@ impl ProcessResources {
     }
 
     /// Updates the soft/hard pair for a specific resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` for an out-of-range resource or soft > hard.
+    /// Returns `KError::OperationNotPermitted` for any hard-limit increase.
+    /// The old pair is unchanged on failure; capability-based increases are not supported.
     pub fn set_rlimit_values(&self, resource: u32, current: u64, max: u64) -> KResult {
         self.set_rlimit(resource, Rlimit::new(current, max))
     }
@@ -109,16 +146,31 @@ impl ProcessResources {
     }
 
     /// Returns the open file stored in the given descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment or
+    /// `KError::BadFileDescriptor` if the descriptor is absent.
     pub fn get_file(&self, fd: c_int) -> kerrno::KResult<Arc<VfsFile>> {
         self.with_fd_table(|fd_table| fd_table.read().get_file(fd))
     }
 
     /// Returns a stable snapshot of the descriptor entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment or
+    /// `KError::BadFileDescriptor` if the descriptor is absent.
     pub fn snapshot_fd(&self, fd: c_int) -> kerrno::KResult<FdSnapshot> {
         self.with_fd_table(|fd_table| fd_table.read().snapshot(fd))
     }
 
     /// Returns typed file-private data attached to the descriptor's open file.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::get_file`] errors and returns `KError::InvalidInput`
+    /// when the file has no private data of type `T`.
     pub fn get_file_private<T>(&self, fd: c_int) -> kerrno::KResult<Arc<T>>
     where
         T: Any + Send + Sync + 'static,
@@ -129,17 +181,36 @@ impl ProcessResources {
     }
 
     /// Adds an open file to the current descriptor table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment, or
+    /// `KError::TooManyOpenFiles` if occupied count reaches the soft cap or the table is full.
     pub fn add_file(&self, file: Arc<VfsFile>, cloexec: bool) -> kerrno::KResult<c_int> {
         self.with_fd_table(|fd_table| fd_table.write().add_file(self.max_nofile(), file, cloexec))
     }
 
     /// Duplicates a descriptor into a newly allocated slot.
+    ///
+    /// # Errors
+    ///
+    /// Propagates source lookup errors from [`Self::get_file`] and insertion errors
+    /// from [`Self::add_file`]. The new slot shares the same open file.
     pub fn duplicate_file(&self, fd: c_int, cloexec: bool) -> kerrno::KResult<c_int> {
         let file = self.get_file(fd)?;
         self.add_file(file, cloexec)
     }
 
     /// Duplicates a descriptor into a fixed slot.
+    ///
+    /// The table capacity is checked, but this method does not apply `RLIMIT_NOFILE`.
+    /// A replaced descriptor is closed after unlocking; its close error is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment. Propagates
+    /// `KError::BadFileDescriptor` from [`FdTable::duplicate_to`] for an absent source
+    /// or invalid target.
     pub fn duplicate_file_to(
         &self,
         old_fd: c_int,
@@ -153,6 +224,12 @@ impl ProcessResources {
     }
 
     /// Closes the given file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment or
+    /// `KError::BadFileDescriptor` for an absent entry. Propagates the removed
+    /// descriptor's VFS close/flush error; the slot stays removed even on that error.
     pub fn close_file(&self, fd: c_int) -> kerrno::KResult {
         let descriptor =
             self.with_fd_table(|fd_table| fd_table.write().file_close_fd_locked(fd))?;
@@ -160,16 +237,31 @@ impl ProcessResources {
     }
 
     /// Returns whether the given descriptor is marked close-on-exec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment or
+    /// `KError::BadFileDescriptor` if the descriptor is absent.
     pub fn cloexec(&self, fd: c_int) -> kerrno::KResult<bool> {
         self.with_fd_table(|fd_table| fd_table.read().cloexec(fd))
     }
 
     /// Updates the close-on-exec bit for the given descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment or
+    /// `KError::BadFileDescriptor` if the descriptor is absent.
     pub fn set_cloexec(&self, fd: c_int, cloexec: bool) -> kerrno::KResult {
         self.with_fd_table(|fd_table| fd_table.write().set_cloexec(fd, cloexec))
     }
 
     /// Closes all descriptors in the given inclusive range.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment. Missing slots are
+    /// ignored; batch close operations ignore individual descriptor close errors.
     pub fn close_range(&self, first_fd: c_int, last_fd: c_int) -> KResult<()> {
         let descriptors =
             self.with_fd_table(|fd_table| Ok(fd_table.write().remove_range(first_fd, last_fd)))?;
@@ -178,6 +270,11 @@ impl ProcessResources {
     }
 
     /// Marks all descriptors in the given inclusive range close-on-exec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment. Missing slots are
+    /// ignored; batch close operations ignore individual descriptor close errors.
     pub fn set_cloexec_range(&self, first_fd: c_int, last_fd: c_int) -> KResult<()> {
         self.with_fd_table(|fd_table| {
             fd_table.write().set_cloexec_range(first_fd, last_fd);
@@ -186,6 +283,11 @@ impl ProcessResources {
     }
 
     /// Closes all descriptors marked close-on-exec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` after files detachment. Missing slots are
+    /// ignored; batch close operations ignore individual descriptor close errors.
     pub fn close_cloexec_files(&self) -> KResult<()> {
         let descriptors =
             self.with_fd_table(|fd_table| Ok(fd_table.write().remove_cloexec_files()))?;
@@ -207,6 +309,11 @@ impl ProcessResources {
     /// # Errors
     ///
     /// Returns [`KError::NoSuchProcess`] after the files owner is released.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owner disappears after its presence was checked under the same
+    /// write lock; this would indicate a broken internal ownership invariant.
     pub fn unshare_fd_table(&self) -> KResult<()> {
         let old_table = {
             let mut owner = self.fd_table.write();

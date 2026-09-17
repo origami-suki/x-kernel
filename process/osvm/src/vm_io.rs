@@ -33,6 +33,15 @@ impl VmBytes {
     }
 
     /// Moves the buffer cursor backward by `count` bytes.
+    ///
+    /// Used by I/O paths that consumed bytes optimistically and must hand
+    /// them back to the user buffer on partial completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` (`KError::InvalidInput`) when rewinding by `count`
+    /// would overflow the tracked length; the cursor is unchanged in that
+    /// case.
     pub fn rewind_bytes(&mut self, count: usize) -> kio::Result<()> {
         let len = self.len.checked_add(count).ok_or(KError::InvalidInput)?;
         self.ptr = self.ptr.wrapping_sub(count);
@@ -86,6 +95,12 @@ impl VmBytesMut {
     }
 
     /// Moves the buffer cursor backward by `count` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` (`KError::InvalidInput`) when rewinding by `count`
+    /// would overflow the tracked length; the cursor is unchanged in that
+    /// case.
     pub fn rewind_bytes(&mut self, count: usize) -> kio::Result<()> {
         let len = self.len.checked_add(count).ok_or(KError::InvalidInput)?;
         self.ptr = self.ptr.wrapping_sub(count);

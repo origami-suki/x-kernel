@@ -2,11 +2,51 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! Process Management
+//! Process identities, runtime capabilities and lifecycle publication.
+//!
+//! [`Process`] owns stable identity and parent/group/exit state; [`Thread`]
+//! connects it to a task and process runtime. Clone owners start with
+//! [`Thread::prepare_process_fork`] or [`Thread::prepare_thread_clone`], construct
+//! the matching task, then [`publish_user_task`] and commit parent-side setup
+//! before activation. [`process_exit`] and [`wait_reap`] coordinate teardown.
+//! Scheduler/procfs callers use the corresponding semantic query modules.
+//!
+//! ## Staged publication example
+//!
+//! The caller supplies a current thread, validated fork policy and a user-entry
+//! closure that runs the prepared image. After allocator/scheduler/MM setup:
+//!
+//! ```no_run
+//! # fn prepare_child(
+//! #     current: &kprocess::Thread,
+//! #     config: kprocess::ProcessForkConfig,
+//! #     entry: impl FnOnce() + Send + 'static,
+//! # ) -> kerrno::KResult<ktask::KtaskRef> {
+//! let prepared = current.prepare_process_fork(config)?;
+//! let page_table_root = prepared.page_table_root();
+//! let (thread, identity) = prepared.into_parts();
+//! let mut task = ktask::TaskInner::new_user(entry, "child".into(), identity, thread);
+//! task.ctx_mut().set_page_table_root(page_table_root);
+//! let published = kprocess::publish_user_task(task)?;
+//! // Perform fallible parent-side writeback in this closure before activation.
+//! let runnable = published.commit(|_task| Ok(()))?;
+//! # Ok(runnable)
+//! # }
+//! ```
+//!
+//! ## Scheduler values
+//!
+//! A pure value example needs no initialized process runtime:
+//!
+//! ```
+//! use kprocess::NiceValue;
+//! let nice = NiceValue::new_clamped(-50);
+//! assert_eq!(nice.as_i32(), -20);
+//! assert_eq!(nice.proc_stat_priority(), 0);
+//! ```
 
 #![no_std]
 #![warn(missing_docs)]
-#![allow(rustdoc::broken_intra_doc_links)]
 
 extern crate alloc;
 
@@ -95,6 +135,11 @@ pub enum UserThreadRuntimeAction {
 }
 
 /// Returns the current process-owned resources.
+///
+/// # Panics
+///
+/// Panics outside a current user-thread runtime or when its process runtime
+/// is no longer reachable.
 pub fn current_resources() -> alloc::sync::Arc<kresources::ProcessResources> {
     current_user_process()
         .resources()
@@ -102,6 +147,11 @@ pub fn current_resources() -> alloc::sync::Arc<kresources::ProcessResources> {
 }
 
 /// Returns the current process umask.
+///
+/// # Panics
+///
+/// Panics outside a current user-thread runtime or after its filesystem
+/// context/runtime has been detached.
 pub fn current_umask() -> u32 {
     current_user_process()
         .umask()
@@ -111,6 +161,11 @@ pub fn current_umask() -> u32 {
 /// Publishes and activates a fully constructed user task.
 ///
 /// Publication completes before the task becomes runnable.
+///
+/// # Panics
+///
+/// Panics if publication fails or its task identity/runtime invariants do
+/// not hold. Use `publish_user_task` to handle fallible publication.
 pub fn start_user_task(task: ktask::TaskInner) -> ktask::KtaskRef {
     publish_user_task(task)
         .expect("user task publication must succeed")
@@ -127,6 +182,11 @@ pub fn start_user_task(task: ktask::TaskInner) -> ktask::KtaskRef {
 ///
 /// Returns an error when a prepared thread cannot be reconciled with its
 /// process's current cgroup before publication.
+///
+/// # Panics
+///
+/// Panics if the task lacks a matching Thread/PidHandle identity or violates
+/// publication-slot or unpublished-cgroup membership invariants.
 pub fn publish_user_task(task: ktask::TaskInner) -> kerrno::KResult<PublishedUserTask> {
     publication::prepare_user_task(task).publish()
 }

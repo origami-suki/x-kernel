@@ -3,7 +3,18 @@
 // See LICENSES for license details.
 
 //! Linux-compatible futex keys, waiters, and ordering buckets.
-
+//!
+//! Entry point is [`global_table()`], returning the zero-sized
+//! `GlobalFutexTable` handle with the `wait`/`wake`/`wake_op`/`requeue`
+//! operations. Keys are
+//! built from [`FutexKey::resolve`] (VMA-aware) or
+//! [`FutexKey::resolve_private`] (`FUTEX_PRIVATE_FLAG` fast path), and
+//! `FUTEX_WAKE_OP` operands decode through [`FutexWakeOp::decode`].
+//!
+//! The crate owns only the concurrency core: syscall ABI decoding, count
+//! clamping, timeouts, and robust-list processing belong to `ksyscall` and
+//! the posix process layer. See `docs/design.md` for the bucket, waiter,
+//! and lock-ordering model.
 #![no_std]
 
 extern crate alloc;

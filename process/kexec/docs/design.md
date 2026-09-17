@@ -1,205 +1,106 @@
-# kexec — 设计文档
+# kexec design
 
-## 定位
+## Purpose and background
 
-`process/kexec` 负责用户程序镜像装载和 exec 初始地址空间布置。
+`kexec` loads user executables and prepares their address-space layout. It is an
+MM client: `filemap` creates private file VMA/runtime pairs, `memspace::MmSpace`
+installs mappings and coordinates page tables, and underlying MM owners manage
+page cache and anonymous/COW pages. Syscall ABI copying, process publication,
+credential commit, and post-exec policy belong to callers.
 
-它是内存管理子系统的 client，而不是 memory-management owner。它解析 ELF，
-决定需要哪些用户映射，然后通过 `mm/memspace` 和 `mm/filemap` 的正式
-接口安装这些映射。
+## Source scope and architecture
 
-## 背景
-
-ELF `PT_LOAD` 段需要保留 Linux 风格的 file-private mapping 语义：
-
-- VMA 起点和 file offset 都按页向下对齐；
-- 首次缺页从可执行文件内容读取；
-- 写入私有映射后进入 anonymous COW 结果页；
-- BSS / `memsz > filesz` 的尾部按映射规则零填充；
-- loader 不应自己维护 file object identity、COW page owner 或 VMA runtime。
-
-这些职责已经归属到 MM 组件：
-
-- `mm/memspace` 拥有 `MmSpace`、VMA 集合、页表协调和映射安装；
-- `mm/filemap` 是 file-backed VMA/runtime 装配 adapter；
-- `mm/pagecache` 拥有 file-backed cached content；
-- `mm/anon` 拥有 private anonymous / COW result pages。
-
-## 范围
-
-相关源码：
+`src/lib.rs` re-exports `ExecSource`, `ExecRequest`, `BinPrm`,
+`load_user_app_request`, and `clear_elf_cache`. `src/loader.rs` contains loading,
+request preparation, the global `ElfLoader`, and `ElfCacheEntry`.
+`src/lru_cache.rs` is a private capacity-bounded cache using vector storage and
+indexed MRU/LRU links; its production capacity is 32.
 
 ```text
-process/kexec/src/lib.rs
-process/kexec/src/loader.rs
-process/kexec/src/lru_cache.rs
+ExecRequest -> prepare -> BinPrm (owned args/env/cred + pinned VfsFile/Path)
+    -> ELF cache / script redirects / PT_INTERP resolution
+    -> PreparedExecImage
+    -> MmSpace::clear -> signal trampoline -> main/interpreter PT_LOAD
+    -> anonymous stack -> stack population/write -> anonymous heap
+    -> (entry point, stack pointer)
 ```
 
-本 crate 不包含：
+## Execution context
 
-- VMA tree；
-- page table mutation；
-- file-backed object identity；
-- private COW page ownership；
-- syscall ABI validation。
+Loading needs task context, allocator, VFS, MM, and scheduler/lock services.
+String paths, scripts, and dynamic interpreters consult the current process
+filesystem context; its root/pwd must be initialized. Resolved requests retain a
+`kvfs::Path` and optionally a display path, but still check execute permission
+against the supplied credential. Operations can block on filesystem reads and
+sleepable locks and are unsuitable for interrupt context. Initial-process
+loading may run from a kernel bootstrap task: `kprocess::current_fs_context`
+then uses the initialized global `INIT_FS`, so no user Thread is required. A
+user-task caller instead needs its process filesystem context still attached.
+The caller supplies exclusive `&mut MmSpace` and owns execution handoff.
 
-## 架构
+## Request preparation and image algorithms
 
-```text
-ExecRequest
-  -> ExecSource::Path | ExecSource::Resolved
-  -> ExecRequest::prepare()
-       -> resolve executable Location through kvfs::namei LookupIntent::Exec
-       -> open and pin executable kvfs::VfsFile
-       -> build BinPrm
+`ExecRequest` owns arguments, environment, source, and a credential snapshot.
+`prepare` resolves a string via `LookupIntent::Exec`, or reuses the resolved
+`Path`, checks `MAY_EXEC`, obtains a display path when absent, and pins an opened
+`VfsFile`. It does not receive or modify the target address space. Display paths
+are used for script argument reconstruction, not as a replacement authority for
+an already resolved object.
 
-load_user_app_request()
-  -> caller-provided ExecRequest
-       ExecSource::Path    — resolve from a path string (used by PID 1 init)
-       ExecSource::Resolved — reuse an already-resolved Location (used by execve)
-  -> ExecRequest::prepare()
-  -> ElfLoader::prepare_binprm()
-       -> load/cache ELF headers and program headers
-       -> resolve shebang recursion if needed
-       -> resolve and pin optional PT_INTERP object
-  -> ElfLoader::commit_prepared_binprm()
-       -> MmSpace::clear()
-       -> ksignal::map_signal_trampoline()
-       -> map_elf() for executable and optional interpreter
-            -> filemap::new_file_private_vma()
-            -> MmSpace::map_runtime_vma()
-       -> build aux vector
-```
+`ElfCacheEntry::load_file` reads up to 4096 bytes, parses ELF/program headers,
+and reads an additional program-header range when necessary. `ouroboros`
+encapsulates a self-referential header view over owned data. Under `tee_ta_sign`,
+TA verification is requested before accepting an entry; failure maps to
+`PermissionDenied`. Entries are keyed by `Path::ptr_eq`, not file content version.
 
-`ExecRequest::prepare()` is the pre-replacement phase. It may fail without
-modifying the old address space because it only resolves/pins the executable
-and owns argv/env strings. `ElfLoader::prepare_binprm()` extends that
-pre-commit phase by validating the executable shape, handling shebang
-redirection, and pinning the optional interpreter object. `ElfLoader::commit_prepared_binprm()`
-is the address-space replacement phase: after `MmSpace::clear()` succeeds,
-callers must not run fallible metadata work that would return control to the
-old user image.
+A non-ELF head beginning with `#!` is parsed from at most the first 256 bytes.
+The interpreter and optional argument prefix are followed by the script display
+path and original argument tail. At most four redirects are permitted.
+For PT_INTERP, the loader reads the specified bytes, requires a complete read and
+NUL-terminated UTF-8 path, resolves it using the same credentials, and caches the
+interpreter before replacing the address space.
 
-The component boundary is:
+Commit clears the address space, maps the signal trampoline, and maps PT_LOAD
+segments for the main executable and optional dynamic interpreter. Segment
+virtual/file starts are aligned down to 4 KiB; matching page offsets are asserted.
+`new_file_private_vma` receives file offset and `p_offset + p_filesz` as the
+file-data boundary, preserving prefix, zero-tail, and private-mapping semantics
+through MM rather than implementing a second loader-specific memory owner.
+Auxiliary entries describe the main image and interpreter base; the interpreter
+entry is selected when present.
 
-```text
-process/kexec
-  parses image and creates mapping requests
-      |
-      v
-mm/filemap
-  builds file-private VMA metadata and runtime
-      |
-      v
-mm/memspace
-  owns insertion into the address space and page-table coordination
-```
+The outer flow maps an anonymous stack, builds argc/argv/env/aux data with
+`app_stack_region`, checks its configured stack capacity, populates/writes pages,
+and maps an anonymous heap. The returned tuple is entry address and user SP.
 
-## 调用约束 / 执行上下文
+## Commit boundary and error handling
 
-- 运行在有 current process / current filesystem context 的普通进程上下文。
-- 可能读取文件、分配内存、清空并重建用户地址空间，因此允许睡眠。
-- 不适用于中断上下文。
-- 装载过程中持有的 `MmSpace` 是即将执行的新用户地址空间。
+Preparation failures leave the previous image intact. `MmSpace::clear` is the
+point after which the old image is gone. Mapping, initial-stack construction,
+population, and writes still return errors after that point. The public result
+does not distinguish pre-clear and post-clear failures and provides no rollback;
+callers must not assume an arbitrary `Err` permits resuming the previous image.
+Do not describe this as a fully transactional exec implementation.
 
-## 算法流程
+## Concurrency and cache lifecycle
 
-### exec request / binprm
+The global sleepable `ELF_LOADER` mutex serializes each cache/prepare or commit
+operation, including associated VFS work. It is released between preparation
+and commit. `PreparedExecImage` pins files but does not itself pin cache entries;
+other loads or `clear_elf_cache` can invalidate the later cache `expect`
+assumption. There is no single transaction lock spanning the full public load.
+The address space is independently protected by the caller's exclusive borrow.
 
-`ExecRequest` 是 exec 调用进入 loader 前的 owned request：
+Cache eviction/flush releases header buffers and file references. VMAs retain
+mapped files through MM runtime ownership, so clearing the header cache does not
+unmap an executable. `clear_elf_cache` also clears the TA header cache when the
+signing feature is active. No file-change invalidation is integrated.
 
-- `ExecSource::Path(String)` 表示由当前进程文件系统上下文解析路径；
-- `ExecSource::Resolved { location, display_path }` 表示调用方已经通过
-  VFS/namei 得到可执行节点，例如 `/proc/self/fd/N` magic link 的目标，并保留
-  Linux `bprm->filename` 风格的用户显示路径；
-- `args` 和 `envs` 在 request 内部拥有，避免依赖用户缓冲区生命周期。
+## Decisions and limitations
 
-`ExecRequest::prepare()` 只做 executable resolution 和 executable `File` pinning，
-生成 `BinPrm`：
-
-- `BinPrm::location()` 是已固定的可执行 VFS location；
-- `BinPrm::executable()` 是对应已打开 executable file；
-- `BinPrm::display_path()` 用于 argv/script reconstruction；
-- `BinPrm::args()` / `envs()` 是 owned exec 参数。
-
-该阶段不清空或修改目标 `MmSpace`。
-
-`load_user_app_request()` 是唯一的装载入口，exec 与 PID 1 初始化路径共用。
-通过 `ExecSource` 区分两种来源：`ExecSource::Path` 由路径字符串经
-`LookupIntent::Exec` 自行解析（PID 1 init 使用），`ExecSource::Resolved`
-复用调用方已完成 namei 的 `Location`，适用于 syscall 层已解析入口，包括
-procfd magic-link、后续 `fexecve`/`AT_EMPTY_PATH` 以及其它 open-executable
-来源。PID 1 在装载前先 `prepare()` 取得 `BinPrm` 元数据，再以
-`ExecSource::Resolved` 喂回 loader，避免二次解析。
-
-对于 `ExecSource::Resolved`，调用方必须同时传入用户显示路径；loader 不重新解释
-procfs 路径字符串，也不单独实现 magic-link 修正。
-
-### ELF 头缓存
-
-1. `BinPrm` 提供已固定 executable `File`。
-2. 读取 ELF header 和 program header。
-3. 使用小型 LRU 避免重复解析最近装载的镜像。
-
-### `PT_LOAD` 映射
-
-1. 遍历 ELF `PT_LOAD` program header。
-2. 计算用户虚拟地址、页内偏移、页对齐 VMA 起点和页对齐 file offset。
-3. 将 ELF flags 转成 `MappingFlags`。
-4. 调用 `filemap::new_file_private_vma()` 构造 file-private VMA
-   metadata 与 runtime。
-5. 调用 `MmSpace::map_runtime_vma()` 安装到地址空间。
-
-这里 `process/kexec` 不直接构造 `VmArea` 的 file metadata，也不直接持有
-`VmRuntimeRef` 的内部实现。
-
-### 动态链接器
-
-如果 ELF 带 `PT_INTERP`：
-
-1. 从主可执行文件读取 interpreter 路径；
-2. 以 `LookupIntent::Exec` 解析并缓存动态链接器 ELF；
-3. 在 `USER_INTERP_BASE` 处通过同一套 `map_elf()` 路径映射。
-
-### 脚本解释器
-
-如果 executable 不是 ELF 且文件头以 `#!` 开始：
-
-1. 读取首行 shebang；
-2. 将解释器路径和可选解释器参数放到新 argv 前缀；
-3. 将脚本显示路径作为解释器 argv 的下一个参数；
-4. 保留原 argv 中除 `argv[0]` 以外的 tail；
-5. 递归进入同一套 `ExecRequest` / `BinPrm` / loader 流程。
-
-脚本递归深度由固定上限控制，超过上限返回 loop 类错误。
-
-## 并发模型
-
-- `ElfLoader` 内部的 LRU cache 由外部静态 `Mutex` 序列化。
-- 单次 `load_user_app_request()` 对传入 `MmSpace` 做独占修改。
-- 本 crate 不维护跨进程共享的 VMA 或 page-table 状态。
-
-## 设计决策
-
-1. `process/kexec` 只作为 MM client。
-   原因：ELF loader 需要知道 image layout，但不应拥有 VMA/object/page-table
-   生命周期。
-
-2. file-private `PT_LOAD` 映射统一走 `filemap` adapter。
-   原因：file-backed VMA 的 `vm_pgoff`、file object identity、EOF/BSS 语义和
-   COW 目的对象必须和 `mmap(MAP_PRIVATE)` 使用同一组 MM 组件边界。
-
-3. stack/heap 不在 kexec 内部形成独立 memory subsystem。
-   原因：它们应通过 `mm/memspace` 的 anonymous-private 映射接口进入普通 VMA
-   与 page-fault 主线。
-
-4. exec 后处理不在 point-of-no-return 之后返回普通错误。
-   原因：`MmSpace::clear()` 已销毁旧用户镜像；装载成功后的 task name、exe path、
-   TEE metadata 和 fd cleanup 必须使用预先解析的数据或 best-effort 更新，不能再
-   把错误返回到旧用户态。
-
-## Drop / 资源释放
-
-- ELF header/cache 数据跟随 `ElfCacheEntry` 和 LRU cache 生命周期释放。
-- 用户地址空间资源由 `MmSpace` 拥有，`process/kexec` 不在 drop 路径中释放
-  VMA、page table 或 anonymous/file-backed object。
+Common file-private VMA construction keeps ELF mappings aligned with mmap/COW
+ownership. Stack and heap use normal anonymous MM APIs. Metadata work is prepared
+before destructive commit where implemented; fallible MM and stack operations
+remain after it. Known constraints include stale cache contents, cache-entry
+lifetime assumptions across the lock gap, alignment/short-read assertions, and
+no complete exec credential/namespace transaction within this crate.

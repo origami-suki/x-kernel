@@ -1,164 +1,83 @@
-# kcred - 设计文档
+# kcred design
 
-## 定位
+## Purpose and background
 
-`kcred` 是 x-kernel 的 Linux/POSIX 凭据数据与转换策略 crate。它定义 `Cred`，维护
-real、effective、saved 和 filesystem UID/GID、补充组以及当前支持的 securebits 状态，
-并实现 set-ID 与 exec 相关的状态转换。
+`kcred` owns Linux/POSIX credential values and set-ID transition policy. `Cred`
+contains real, effective, saved, and filesystem UID/GID values, supplementary
+groups, and supported securebits. `kprocess` owns current-task lookup and
+credential publication; `kvfs` consumes explicit credentials for access checks.
+The namespace types model identity and parentage, not UID/GID mappings.
 
-`kcred` 不知道“当前线程”，也不保存进程或线程对象。当前任务的凭据指针由上层
-`kprocess::Thread` 持有；下层 `kvfs` 只依赖 `kcred`，通过显式 `&Cred` 参数执行 DAC。
-这保持了依赖方向：
+## Source scope and architecture
 
-```text
-kprocess  --->  kcred  <---  kvfs
-   |                         ^
-   +-- syscall snapshots ----+
-```
-
-## 范围
+`src/lib.rs` re-exports `Cred`, `Uid`, `Gid`, `NamespaceId`, `UserNamespace`, and
+the initial user namespace accessor, and publishes `initial_cred`.
+`src/credentials/{mod,model,user,group,securebits}.rs` contains credential types
+and transitions; `src/namespace.rs` owns namespace identity; `src/tests.rs` and
+inline namespace tests cover these values.
 
 ```text
-process/kcred/
-├── src/
-│   ├── lib.rs                  # 公开类型、initial_cred
-│   ├── credentials/
-│   │   ├── mod.rs
-│   │   ├── model.rs            # Cred 与状态转换
-│   │   ├── user.rs             # Uid
-│   │   └── group.rs            # Gid
-│   ├── namespace.rs            # user namespace 身份类型
-│   └── tests.rs
-└── docs/
-    ├── design.md
-    └── security.md
+kprocess: prepare private Cred -> checked transition -> publish Arc<Cred>
+                                                       |
+kvfs <--------------------------- explicit stable snapshot
 ```
 
-## 对象模型
+The committed object is immutable through `Arc`. `prepare` clones scalar fields
+and shares the immutable `Arc<[Gid]>`. Successful callers publish the prepared
+copy once; old readers keep their original snapshot. This crate does not perform
+that publication or synchronize the current task's credential pointers.
 
-```text
-Thread
-  real_cred: RwLock<Arc<Cred>>   objective credential
-  cred:      RwLock<Arc<Cred>>   subjective credential
-                         |
-                         | Arc snapshot
-                         v
-Cred
-  ruid/euid/suid/fsuid
-  rgid/egid/sgid/fsgid
-  supplementary_groups: Arc<[Gid]>
-  securebits: KEEP_CAPS / KEEP_CAPS_LOCKED
-```
+## Execution context and concurrency
 
-已提交的凭据始终以 `Arc<Cred>` 存在，并按不可变对象使用。修改遵循 Linux
-`prepare_creds()` / `commit_creds()` 的两阶段模型：
+Pure ID getters and comparisons require only a valid credential borrow and do
+not sleep. Creation, initial globals, and supplementary-group replacement need
+allocation. There is no current-process, CPU-local, device-mapping, or scheduler
+dependency here; early initialization is possible after the heap is available.
+Do not assume allocation is safe in interrupt context. Shared publication locks
+belong to `kprocess`; local changes require `&mut Cred`. `Once` protects global
+initial values and `AtomicU64` with Relaxed ordering allocates namespace IDs;
+those IDs do not publish other data and have no overflow check.
 
-1. `CurrentThread::prepare_creds()` 从当前 subjective credential 克隆出普通 `Cred`。
-2. 调用者在未发布副本上执行完整转换与校验。
-3. 成功后 `CurrentThread::commit_creds()` 创建新的 `Arc<Cred>`，同时替换当前
-   `real_cred` 和 `cred`。
-4. 已持有旧 `Arc<Cred>` 的并发操作继续看到稳定旧快照，不会观察到半更新字段。
+## Credential flows
 
-当前尚未实现临时 override credential，因此 `real_cred` 与 `cred` 在提交前必须指向
-同一对象；分开保存这两个 Linux 语义角色，是支持 objective/subjective 查询所必需，
-不是 VFS 的附加状态。
+Ordinary VFS checks use `fsuid`, `fsgid`, and sorted supplementary groups.
+`for_access` creates a copy using real IDs for filesystem checks. A caller
+implementing `AT_EACCESS` can use its existing committed credential instead;
+`for_access` never changes the original object. `matches_real_credential_ids`
+compares a caller's real UID/GID against all of the target's real/effective/saved
+IDs, excluding filesystem IDs and supplementary groups. It is a predicate, not
+a complete ptrace authorization policy.
 
-## 文件访问凭据
+Checked UID/GID operations use `euid == 0` as the current privilege approximation.
+`set_uid`/`set_gid` allow privileged replacement of all four IDs; otherwise the
+new effective/filesystem ID must match real or saved ID. The re-ID and res-ID
+methods validate all requested changes before mutation. `None` means unchanged.
+Re-ID updates saved IDs when real ID is supplied or a supplied effective ID
+differs from the old real ID, and synchronizes filesystem ID even for a no-op
+request. Res-ID preserves a true no-op, including its existing filesystem ID.
 
-普通文件访问直接使用 committed `Cred` 的 `fsuid/fsgid` 和补充组。
-`access(2)` 的身份选择仍复用同一种对象表达：
+`set_fsuid`/`set_fsgid` always return the old ID, leaving state unchanged on a
+rejected request. `set_supplementary_groups` sorts before publishing a new array
+and preserves duplicates; `in_group` checks fsgid then uses binary search.
+The caller limits group count and authorizes replacing groups.
 
-- `Cred::for_access()`：把副本的 filesystem IDs 设为 real IDs；
-- `AT_EACCESS`：直接使用当前 committed credential，不改写 filesystem IDs；
-- 普通 open、namei 和元数据变更：使用当前 committed credential 的 filesystem IDs。
+`apply_exec` synchronizes saved/filesystem IDs to effective IDs and clears
+KEEP_CAPS. KEEP_CAPS enable/disable rejects the locked flag, but there is no
+capability set to preserve yet. Set-ID executable and file-capability effects
+are not implemented by this transition.
 
-Linux 的 VFS 始终以 `fsuid/fsgid` 做 DAC；`AT_EACCESS` 只是取消 `access(2)` 默认的
-real-ID override。因此显式 `setfsuid/setfsgid` 后，`AT_EACCESS` 仍使用修改后的
-filesystem IDs，不创建一份 effective-ID credential。
+## Decisions and resource lifecycle
 
-没有单独的 `AccessCredentials`，也不在 `Nameidata` 中增加 credential 字段。syscall
-入口取得一次 `Arc<Cred>`，再把 `&Cred` 沿该次完整路径解析和权限检查逐层传递。
-这样既让一次操作使用一致快照，也避免 `kvfs` 反向依赖 `kprocess::current_cred()`。
+Credentials are explicit VFS inputs to avoid reverse dependencies on task state.
+Immutable snapshots keep one permission operation internally consistent without
+holding process locks through pathname traversal. `KError` reports policy
+failures directly. `initial_cred` and `initial_user_namespace` publish shared
+root objects through `Once`. Other `Cred`/group arrays are freed when their last
+owner releases them; no custom drop or secret erasure is implemented.
 
-打开文件时，`VfsFile` 保存该 `Arc<Cred>`，对应 Linux `file::f_cred`。descriptor-based
-操作首先依赖 open file 的访问模式；pathname-based 操作继续显式接收调用时凭据。
+## Known limitations
 
-## 跨任务身份匹配
-
-`Cred::matches_real_credential_ids()` 提供不依赖 task/current context 的纯凭据谓词：
-调用者的 real UID/GID 必须分别匹配目标凭据的 real、effective 和 saved UID/GID。
-该谓词不比较 filesystem IDs 或补充组，也不决定线程组豁免、capability 或其他
-跨任务访问策略；这些策略由持有 `Thread` 身份的 `kprocess` 组合。
-
-## 状态转换
-
-### UID/GID
-
-- 当前简化特权判定为 `euid == 0`，代替尚未实现的 `CAP_SETUID/CAP_SETGID`。
-- 特权 `setuid/setgid` 可同时更新 real、effective、saved 和 filesystem ID。
-- 非特权 `setuid/setgid` 只能把 effective/filesystem ID 设为当前 real 或 saved ID；
-  当前 effective ID 本身不是额外的合法目标。
-- `setreuid/setregid` 和 `setresuid/setresgid` 按各自的 Linux 规则更新 saved ID。
-  `setreuid/setregid` 每次成功都让 filesystem ID 跟随最终 effective ID，包括两个参数
-  都为 `-1` 的调用。
-- 被拒绝的 checked 转换返回 `KError::OperationNotPermitted`，且不发布副本。
-- `setfsuid/setfsgid` 始终返回旧值；目标不允许时保持状态不变。
-- `apply_exec()` 令 saved IDs 跟随 effective IDs。
-- `Cred` 保存 `SECBIT_KEEP_CAPS` 和 `SECBIT_KEEP_CAPS_LOCKED`（`SecureBits` bitflags）。
-  `keep_caps_enable()` / `keep_caps_disable()` 在锁定位置位时拒绝修改，`apply_exec()`
-  清除 `SECBIT_KEEP_CAPS`。
-- 当前凭据模型尚未保存 capability 集合，完整的 set-ID capability fixup 留待 capability
-  状态接入时统一实现。
-
-### 补充组
-
-`set_supplementary_groups` 在替换前执行排序，并保存为 `Arc<[Gid]>`。
-`Cred::in_group()` 先比较 `fsgid`，再对补充组执行二分查找。副本共享不可变数组，
-只有真正替换补充组时才分配新数组。
-
-### 初始凭据
-
-`initial_cred()` 通过 `Once<Arc<Cred>>` 发布全局 root credential，供初始任务和内核创建
-的 VFS 对象共享。普通用户任务的当前身份仍只从其 `Thread` 读取。
-
-## 并发模型
-
-`kcred` 内部没有锁。`Cred` 的已提交实例不可变，发布和替换由 `kprocess` 的
-`RwLock<Arc<Cred>>` 串行化。读取者只克隆 `Arc`，无需在路径遍历期间持有线程锁。
-
-补充组数组也是不可变 `Arc`；因此 prepare 阶段修改普通 `Cred` 不会影响任何已提交
-快照。一次 namei、exec 或 access 操作应在入口只获取一次 credential snapshot。
-
-## 设计决策
-
-- 凭据数据和转换策略属于 `kcred`，当前任务定位属于 `kprocess`。
-- real-credential 字段匹配属于 `kcred`；线程组和特权绕过等跨任务策略属于 `kprocess`。
-- VFS 显式接收 `&Cred`，不引入全局 current hook 或向上依赖。
-- access 身份选择复用 `Cred`，不增加只为搬运相同字段的结构体。
-- `Nameidata` 只保存路径解析状态；调用上下文由方法参数表达。
-- 错误直接使用内核统一 `KError`，不增加只做一对一映射的错误枚举。
-
-## Drop / 资源释放
-
-`Cred` 没有自定义 `Drop`。线程替换凭据后，旧对象在最后一个任务、打开文件或正在
-执行的操作释放其 `Arc` 时自动销毁；补充组数组同样按最后一个引用释放。
-
-## 已知限制
-
-1. 尚无完整 capability 集合、LSM 或 file capability；securebits 目前只实现
-   `KEEP_CAPS` 及其锁定位，特权转换使用 `euid == 0` 近似。
-2. user namespace 类型已经存在，但 UID/GID 转换与 VFS idmapping 尚未接入。
-3. 尚无临时 subjective credential override。
-4. 尚未实现 setuid/setgid executable 和 file capability。
-5. `NGROUPS_MAX` 输入上限由 syscall 层负责。
-
-## 审计清单
-
-- set-ID 改动是否保持 real/effective/saved/filesystem ID 关系。
-- 所有失败转换是否发生在 `commit_creds()` 之前。
-- 新的多步安全操作是否只取得一次 `Arc<Cred>` 快照。
-- 补充组替换是否继续保持排序不变量。
-- VFS 入口是否显式接收 `&Cred`，且没有依赖 `kprocess`。
-- capability、namespace 或 override credential 接入时是否同时更新两类凭据角色。
-- capability 集合接入时是否在完整的 set-ID fixup 中同步维护 capability 状态，并保持 exec
-  清除 `KEEP_CAPS` 的行为。
+There is no full capability set, LSM, user namespace ID mapping, subjective
+credential override, or set-ID executable policy. `NGROUPS_MAX` enforcement is
+external. Namespace IDs wrap at `u64` exhaustion. The group-array allocation
+path is not recoverably fallible.

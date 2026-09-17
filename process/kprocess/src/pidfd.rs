@@ -31,6 +31,11 @@ impl PidFd {
     /// Create the anonymous-inode file used by `pidfd_open`.
     ///
     /// `cred` is captured as the new file's immutable open credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::InvalidInput` for unknown open-flag bits; forwards
+    /// anonymous-inode file construction errors.
     pub fn new_file(
         process: &Arc<Process>,
         open_flags: u32,
@@ -48,6 +53,10 @@ impl PidFd {
     }
 
     /// Returns the pidfd object attached to a pidfd file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` if the file has no PidFd private data.
     pub fn from_file(file: &VfsFile) -> KResult<Arc<Self>> {
         file.private_data_get::<Self>()
             .ok_or(KError::BadFileDescriptor)
@@ -59,6 +68,10 @@ impl PidFd {
     }
 
     /// Returns the referenced process only while it is still live.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` once the referenced process has exited.
     pub fn live_process(&self) -> KResult<&Arc<Process>> {
         if self.process.is_exited() {
             return Err(kerrno::KError::NoSuchProcess);
@@ -68,11 +81,21 @@ impl PidFd {
 }
 
 /// Resolves the process referenced by `pidfd_open`.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when the PID is unpublished.
+/// Published zombie identities remain valid; PID zero selects the current process.
 pub fn open_target_process(pid: Pid) -> KResult<Arc<Process>> {
     lookup::published_process(pid)
 }
 
 /// Resolves the task referenced by robust futex list syscalls.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when a nonzero TID has no live
+/// published task. TID zero selects the current task.
 pub fn robust_list_task(tid: Tid) -> KResult<KtaskRef> {
     lookup::task(tid)
 }

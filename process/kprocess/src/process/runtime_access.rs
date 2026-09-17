@@ -46,6 +46,21 @@ impl LiveAddressSpace {
     }
 
     /// Runs a mapping operation while holding the live mm user capability.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn inspect(process: &kprocess::Process) -> kerrno::KResult<()> {
+    /// let address_space = process.address_space()?;
+    /// address_space.with_mapping_owner(|mapping| {
+    ///     let _identity = mapping.aspace().mm_id();
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The supplied process must still own its address space. The callback runs
+    /// with the address-space mutex held and must not lock it recursively.
     pub fn with_mapping_owner<R>(
         &self,
         f: impl FnOnce(LiveAddressSpaceMappingGuard<'_>) -> R,
@@ -84,6 +99,12 @@ impl LiveAddressSpaceMappingGuard<'_> {
     }
 
     /// Installs a relocated mapping snapshot using this live owner.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the validation/allocation errors of
+    /// `memspace::MmSpace::map_relocated_snapshot` for the supplied mapping snapshot,
+    /// address, byte size and permissions.
     pub fn map_relocated_snapshot(
         &mut self,
         snapshot: &MremapSource,
@@ -141,6 +162,11 @@ impl Process {
     }
 
     /// Returns the process-owned resource table while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn resources(&self) -> KResult<Arc<kresources::ProcessResources>> {
         self.runtime().map(|runtime| runtime.resources().clone())
     }
@@ -179,6 +205,11 @@ impl Process {
     }
 
     /// Returns the process cgroup namespace while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the runtime or the required namespace/mm
+    /// owner has been detached.
     pub fn cgroup_ns(&self) -> KResult<Arc<kns::CgroupNamespace>> {
         self.runtime()?
             .nsproxy()
@@ -187,6 +218,11 @@ impl Process {
     }
 
     /// Returns a live address-space capability while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the runtime or the required namespace/mm
+    /// owner has been detached.
     pub fn address_space(&self) -> KResult<LiveAddressSpace> {
         self.runtime()
             .and_then(|runtime| runtime.address_space().ok_or(KError::NoSuchProcess))
@@ -205,6 +241,11 @@ impl Process {
     }
 
     /// Returns the immutable address-space identity while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn mm_id(&self) -> KResult<u64> {
         self.runtime().map(|runtime| runtime.mm_id())
     }
@@ -223,17 +264,32 @@ impl Process {
     }
 
     /// Returns the signal manager while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn signal_manager(&self) -> KResult<Arc<ProcessSignalManager>> {
         self.runtime()
             .map(|runtime| runtime.signal_manager().clone())
     }
 
     /// Returns the shared signal actions while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn signal_actions(&self) -> KResult<Arc<KSyncSpinNoIrq<SignalActions>>> {
         self.signal_manager().map(|signal| signal.actions.clone())
     }
 
     /// Returns a stable objective credential snapshot for one published thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the process has no published thread
+    /// from which to take an objective credential snapshot.
     pub fn credentials_snapshot(&self) -> KResult<Arc<Cred>> {
         self.thread_tasks()
             .into_iter()
@@ -243,16 +299,31 @@ impl Process {
     }
 
     /// Returns the current executable path while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn exe_path(&self) -> KResult<String> {
         self.runtime().map(|runtime| runtime.exe_path())
     }
 
     /// Returns the current command line while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn cmdline(&self) -> KResult<Arc<Vec<String>>> {
         self.runtime().map(|runtime| runtime.cmdline())
     }
 
     /// Returns the current process umask while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the runtime or filesystem context
+    /// owner has been detached.
     pub fn umask(&self) -> KResult<u32> {
         let fs_context = self.fs_context()?;
         let umask = fs_context.lock().umask();
@@ -260,6 +331,11 @@ impl Process {
     }
 
     /// Replaces the current process umask and returns the previous value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the runtime or filesystem context
+    /// owner has been detached.
     pub fn replace_umask(&self, umask: u32) -> KResult<u32> {
         let fs_context = self.fs_context()?;
         let old_umask = fs_context.lock().replace_umask(umask);
@@ -267,21 +343,41 @@ impl Process {
     }
 
     /// Returns the current process heap top while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn heap_top(&self) -> KResult<usize> {
         self.runtime().map(|runtime| runtime.heap_top())
     }
 
     /// Returns a shared handle to the heap top (live while the process runs).
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn heap_top_handle(&self) -> KResult<Arc<AtomicUsize>> {
         self.runtime().map(|runtime| runtime.heap_top_handle())
     }
 
     /// Sets the current process heap top.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn set_heap_top(&self, top: usize) -> KResult<()> {
         self.runtime().map(|runtime| runtime.set_heap_top(top))
     }
 
     /// Creates a POSIX timer while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when runtime is gone and forwards the
+    /// matching `ktimer::ProcessTimerManager::create_posix_timer` error contract.
     pub fn create_posix_timer(
         &self,
         clock_id: i32,
@@ -296,6 +392,11 @@ impl Process {
     }
 
     /// Returns the current POSIX timer state while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when runtime is gone and forwards the
+    /// matching `ktimer::ProcessTimerManager::get_posix_timer` error contract.
     pub fn get_posix_timer(&self, timer_id: i32) -> KResult<(TimeSpan, TimeSpan)> {
         let (process_utime, process_stime) = self.process_cpu_times();
         self.runtime().and_then(|runtime| {
@@ -307,6 +408,11 @@ impl Process {
     }
 
     /// Sets a POSIX timer and returns its previous state and immediate delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when runtime is gone and forwards the
+    /// matching `ktimer::ProcessTimerManager::set_posix_timer` error contract.
     pub fn set_posix_timer(
         &self,
         timer_id: i32,
@@ -328,12 +434,22 @@ impl Process {
     }
 
     /// Deletes a POSIX timer while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when runtime is gone and forwards the
+    /// matching `ktimer::ProcessTimerManager::delete_posix_timer` error contract.
     pub fn delete_posix_timer(&self, timer_id: i32) -> KResult<()> {
         self.runtime()
             .and_then(|runtime| runtime.timer_manager().lock().delete_posix_timer(timer_id))
     }
 
     /// Returns the POSIX timer overrun count while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when runtime is gone and forwards the
+    /// matching `ktimer::ProcessTimerManager::get_posix_timer_overrun` error contract.
     pub fn get_posix_timer_overrun(&self, timer_id: i32) -> KResult<i32> {
         self.runtime().and_then(|runtime| {
             runtime
@@ -344,6 +460,11 @@ impl Process {
     }
 
     /// Returns the current interval timer state while runtime remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn get_itimer(&self, timer_type: ITimerType) -> KResult<(TimeSpan, TimeSpan)> {
         let (process_utime, process_stime) = self.process_cpu_times();
         self.runtime().map(|runtime| {
@@ -355,6 +476,11 @@ impl Process {
     }
 
     /// Sets an interval timer and returns its previous state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn set_itimer(
         &self,
         timer_type: ITimerType,
@@ -412,6 +538,13 @@ impl Process {
     }
 
     /// Applies the process-shared post-exec state transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` for an unreachable runtime and forwards
+    /// `kresources::ProcessResources::close_cloexec_files` errors. Earlier heap,
+    /// signal and timer updates are not rolled back on that error; executable
+    /// metadata is published only after cleanup succeeds.
     pub fn apply_exec_update(&self, update: ProcessExecUpdate) -> KResult<()> {
         let runtime = self.runtime()?;
 
@@ -432,11 +565,21 @@ impl Process {
     }
 
     /// Resets process-wide signal actions to defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn reset_signal_actions(&self) -> KResult<()> {
         self.runtime().map(|runtime| runtime.reset_signal_actions())
     }
 
     /// Clears all process POSIX timers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     pub fn clear_posix_timers(&self) -> KResult<()> {
         self.runtime().map(|runtime| runtime.clear_posix_timers())
     }
@@ -475,6 +618,11 @@ impl Process {
     }
 
     /// Closes all process file descriptors marked `FD_CLOEXEC`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` for an unreachable runtime and forwards
+    /// `kresources::ProcessResources::close_cloexec_files` errors.
     pub fn close_cloexec_files(&self) -> KResult<()> {
         self.runtime()?.resources().close_cloexec_files()
     }
@@ -483,6 +631,11 @@ impl Process {
     ///
     /// TIPC handles are process-local capabilities, separate from the POSIX
     /// file descriptor table, and therefore are not covered by `FD_CLOEXEC`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     #[cfg(feature = "tipc")]
     pub fn close_all_tipc_handles(&self) -> KResult<()> {
         self.runtime().map(|runtime| {
@@ -491,6 +644,11 @@ impl Process {
     }
 
     /// Clears process-local TEE runtime private state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     #[cfg(feature = "tee")]
     pub fn clear_tee_runtime_private(&self) -> KResult<()> {
         self.runtime()
@@ -498,12 +656,22 @@ impl Process {
     }
 
     /// Runs a closure with immutable access to the process-shared TEE TA context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     #[cfg(feature = "tee")]
     pub fn with_tee_ta_ctx<R>(&self, f: impl FnOnce(&tee_task_iface::TeeTaCtx) -> R) -> KResult<R> {
         self.runtime().map(|runtime| runtime.with_tee_ta_ctx(f))
     }
 
     /// Runs a closure with mutable access to the process-shared TEE TA context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     #[cfg(feature = "tee")]
     pub fn with_tee_ta_ctx_mut<R>(
         &self,
@@ -513,6 +681,11 @@ impl Process {
     }
 
     /// Runs a closure with access to the process-local Trusty IPC handle table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::NoSuchProcess` when the weak process runtime can no longer
+    /// be upgraded.
     #[cfg(feature = "tipc")]
     pub fn with_tipc_handles<R>(
         &self,

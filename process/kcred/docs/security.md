@@ -1,112 +1,72 @@
-# kcred - 安全与可靠性分析
+# kcred security and reliability
 
-## 概述
+## Scope, assets, and trust boundaries
 
-`kcred` 没有 Rust `unsafe` 代码。主要风险来自凭据转换规则错误、已提交对象被原地
-修改、一次权限操作混用多个身份快照、securebits 锁定位处理错误，以及补充组不变量
-被破坏。
+All credential and namespace source modules are covered. Assets are real,
+effective, saved, filesystem IDs, supplementary groups, securebits, and namespace
+identity. Syscall adapters copy user data, decode sentinel IDs, validate prctl
+arguments, authorize group updates, and cap group count. `kcred` checks local
+set-ID rules; `kprocess` publishes complete credential snapshots; KVFS performs
+DAC using explicit credentials and filesystem metadata.
 
-## 信任边界
+No direct user pointer, file-content input, MMIO, DMA, device, firmware, FFI, or
+assembly is consumed. Incoming IDs and group lists can represent user requests,
+but arrive as owned/borrowed Rust values after the syscall boundary.
 
-```text
-untrusted syscall IDs
-        |
-        v
-kprocess: prepare Cred -> checked transition -> commit Arc<Cred>
-        |                                      |
-        | stable snapshot                      +--> task identity queries
-        v
-kvfs: explicit &Cred -> generic DAC / filesystem callbacks
-```
+## Unsafe inventory and invariants
 
-- syscall 层负责把 ABI 参数转换为 `Uid`、`Gid` 或 `None`，并限制补充组数量。
-- `prctl(PR_SET_KEEPCAPS)` 的 ABI 参数校验由 syscall 层完成，锁定位和 securebits 状态
-  转换由 `kcred` 完成。
-- `kcred` 负责 set-ID 规则和凭据内部不变量。
-- `kprocess` 负责当前任务定位、发布和替换 committed credential。
-- `kvfs` 负责基于 `fsuid/fsgid`、补充组和 inode 元数据执行 DAC。
+There is no unsafe code. Mutable operations require exclusive access to a
+prepared `Cred`; committed `Arc<Cred>` snapshots remain unchanged. All checked
+set-ID rejection branches precede mutation. Supplementary groups remain sorted,
+and exec synchronizes saved/filesystem IDs and clears KEEP_CAPS. These semantic
+invariants complement Rust memory safety; Rust alone does not validate policy.
 
-## unsafe 代码清单
+## Thread safety
 
-本 crate 没有 `unsafe` 块、`unsafe fn`、`unsafe impl` 或裸指针操作。
+`Cred` and group arrays are immutable when shared. Thread-owner locks and
+publication of `Arc<Cred>` are external. One access/namei operation should use
+one snapshot throughout rather than resampling current credentials.
+Initial objects use `Once`; namespace IDs use Relaxed atomic increments only
+for number allocation, not inter-object ordering.
 
-## 安全不变量
+## Threat analysis
 
-1. **已提交对象不可变**：公开写操作只接受 `&mut Cred`；调用者只能修改未提交副本。
-2. **原子发布**：字段转换全部成功后才由 `kprocess` 替换 `Arc<Cred>`。
-3. **快照一致**：一次 namei、exec 或 access 操作使用入口取得的同一个快照。
-4. **补充组有序**：唯一替换入口排序后整体替换 `Arc<[Gid]>`，`in_group()` 才可安全
-   使用二分查找。
-5. **失败不发布**：checked set-ID 返回 `KError::OperationNotPermitted` 时，当前线程仍
-   指向旧 committed credential。
-6. **filesystem IDs 同步**：需要改变 effective ID 的转换按 Linux 规则同步 fs ID；
-   明确的 `setfsuid/setfsgid` 除外。
-7. **access 不修改当前身份**：默认 access 只通过 `for_access()` 修改临时副本；
-   `AT_EACCESS` 直接借用当前不可变快照并保留显式设置的 `fsuid/fsgid`。
-8. **securebits 状态受锁定位保护**：`SECBIT_KEEP_CAPS_LOCKED` 置位后，
-   `keep_caps_enable()` / `keep_caps_disable()` 返回 `OperationNotPermitted`，失败的
-   prepared credential 不会发布。
-9. **exec 清除 keep-capabilities**：`apply_exec()` 在提交 exec 凭据前清除
-   `SECBIT_KEEP_CAPS`。
-10. **real-credential 匹配非对称**：跨任务 real-credential 检查只使用调用者的 real
-    UID/GID，并要求它们分别匹配目标的 real、effective 和 saved UID/GID；不能逐字段
-    比较两份完整凭据。
+| ID | Threat and asset | Severity | Trigger | Response and residual risk |
+|---|---|---|---|---|
+| T-01 | Unauthorized UID/GID transition | High | Nonprivileged request selects an ID outside the permitted old-ID set | Checked setters reject with `OperationNotPermitted` before mutation. Privilege still uses effective UID zero rather than capabilities. |
+| T-02 | Mixed-identity access decision | High | A multi-step operation reads credentials again after a concurrent commit | Caller must retain one `Arc<Cred>`; immutable snapshots and explicit VFS inputs enable this but cannot force all consumers to do so. |
+| T-03 | Incorrect group membership | High | An update bypasses sorted-group construction or is not authorized | Private storage and `set_supplementary_groups` preserve ordering; group-count and permission checks remain in the syscall layer. |
+| T-04 | Locked securebit bypass | High | Request changes KEEP_CAPS after lock | Enable/disable check the lock and return `OperationNotPermitted`; exec clears KEEP_CAPS as its defined transition. Capability-set semantics remain unsupported. |
+| T-05 | Wrong access/ptrace identity policy | High | Caller confuses real/effective/filesystem roles | `for_access` and asymmetric `matches_real_credential_ids` expose specific predicates; the caller must combine them with its complete policy. |
+| T-06 | Global root object altered | High | Caller attempts to mutate the committed initial object | Shared `Arc<Cred>` plus private fields require an unpublished mutable copy; publishing altered credentials remains an authorized kernel-owner operation. |
+| T-07 | Namespace ID collision | Medium | Relaxed `AtomicU64` allocation wraps | No wrap prevention is implemented. Consumers must not treat these IDs alone as an unbounded authorization capability. |
 
-## 线程安全
+## Failure modes and effects (FMEA)
 
-| 对象 | 并发语义 |
-|------|----------|
-| `Arc<Cred>` | 不可变 committed snapshot，可跨线程共享 |
-| prepared `Cred` | 发布前由单个调用者独占修改 |
-| `Arc<[Gid]>` | 不可变且有序，可被多个凭据副本共享 |
-| `initial_cred()` | 由 `Once` 初始化并返回共享 `Arc` |
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1-4) | Handling |
+|---|---|---|---|---|---|---|
+| F-01 | Checked ID/securebit rejected | Policy disallows change | `OperationNotPermitted`, old object intact | Syscall fails | 3 | Propagate error and do not publish the copy. |
+| F-02 | Filesystem ID rejected | Target not in allowed set | No mutation, old ID returned | Caller sees Linux-style old value | 4 | Do not reinterpret the scalar return as unconditional success. |
+| F-03 | Group-array allocation fails | Memory pressure | Replacement cannot complete | Task operation unavailable | 2 | Global allocator policy; no local allocation error result. |
+| F-04 | Bad snapshot publication | Upper layer publishes partial/inconsistent state | Wrong credential view | Authorization failure | 1 | Complete transitions before process-owner commit. |
 
-`kcred` 不提供全局“当前凭据”。线程锁与 current-task 访问由 `kprocess` 提供，避免把
-调度上下文引入文件系统底层。
+## Failure management, privacy, and limitations
 
-## 威胁分析
+The crate uses `KResult` for checked policy failures and returns old IDs for
+filesystem-ID setters. It does not log credential data or automatically retry.
+IDs and group lists are sensitive process metadata; consumers decide how to
+expose them. Final drop frees storage without explicit zeroization.
 
-| 编号 | 威胁描述 | 影响 | 应对措施 |
-|------|----------|------|----------|
-| T-01 | 非特权任务切换到任意 UID/GID | 权限提升 | checked set-ID API 限制目标集合并返回 `OperationNotPermitted` |
-| T-02 | 转换中途被权限检查观察 | 身份混合、越权 | prepare/commit 与不可变 `Arc<Cred>` 原子发布 |
-| T-03 | 一个路径操作中途读取新 current cred | 分段使用不同身份 | syscall 入口只 snapshot 一次并显式逐层传递 |
-| T-04 | 补充组无序导致漏判或误判 | DAC 结果错误 | 字段私有，替换入口排序，单元测试覆盖 |
-| T-05 | `access(2)` 错用 fs/effective IDs | 探测结果错误 | 默认检查使用 `for_access()` 映射到 real IDs；`AT_EACCESS` 不 override 当前 filesystem IDs |
-| T-06 | root 近似被误认为完整 capability 模型 | 权限边界过宽 | 文档明确限制；后续在策略边界接入 capability |
-| T-07 | exec 忘记固定 saved IDs | 特权恢复语义错误 | exec credential 副本调用 `apply_exec()` 后再提交 |
-| T-08 | 初始 root credential 被原地修改 | 全局权限破坏 | `initial_cred()` 只发布 `Arc<Cred>`，变更必须 prepare 新对象 |
-| T-09 | 锁定的 keep-capabilities 状态被修改 | 后续 exec 或 UID 转换的权限边界失效 | `keep_caps_enable()` / `keep_caps_disable()` 先检查 `SECBIT_KEEP_CAPS_LOCKED`，失败路径不提交凭据 |
-| T-10 | real-credential 检查逐字段比较 caller/target | 错误放行 set-ID 目标或拒绝合法调用者 | `matches_real_credential_ids()` 固定使用 caller real UID/GID 与 target real/effective/saved IDs 比较，非对称测试覆盖两类反例 |
+Effective-UID-zero checks are not full capability authorization. User namespace
+mapping, file capabilities, and subjective override remain unsupported. Direct
+construction and supplementary replacement assume trusted caller authorization;
+no namespace or privilege model should be inferred from a numeric ID alone.
 
-## 故障模式与处理
+## Audit checklist
 
-| 故障 | 局部结果 | 处理 |
-|------|----------|------|
-| checked set-ID 被拒绝 | prepared 副本不提交 | 传播 `KError::OperationNotPermitted` |
-| `setfsuid/setfsgid` 目标不允许 | 字段不变 | 返回旧 ID，遵循 Linux ABI |
-| `PR_SET_KEEPCAPS` 参数非法或 securebits 已锁定 | prepared 副本不提交 | 分别返回 `InvalidInput` 或 `OperationNotPermitted` |
-| 补充组分配失败 | 内存压力下操作不能完成 | 当前分配器策略生效；未来可在可失败分配边界映射 `ENOMEM` |
-| override 状态下普通 commit | objective/subjective 语义可能被覆盖 | `kprocess` 当前以断言拒绝该未支持状态 |
-
-本 crate 不记录凭据日志，避免在权限热路径泄露跨任务身份关系。
-
-## 已知限制
-
-1. 无完整 capability 集合、LSM 或 file capability；securebits 仅覆盖
-   `KEEP_CAPS` 及其锁定位。
-2. 无 user namespace ID 映射和 idmapped mount DAC。
-3. 无临时 subjective credential override。
-4. setuid/setgid executable 尚未接入。
-5. 补充组分配仍依赖全局不可恢复分配策略。
-
-## 审计清单
-
-- 新转换是否只修改 prepared `Cred`，并在成功后一次提交。
-- UID/GID 检查是否使用正确的 real/effective/saved 集合。
-- real-credential 匹配是否保持 caller-real 对 target 三类 ID 的非对称语义。
-- keep-capabilities 锁定位是否阻止后续修改，exec 是否清除 `KEEP_CAPS`。
-- `fsuid/fsgid` 与补充组是否保持 DAC 所需不变量。
-- 多步检查是否复用同一个 `Arc<Cred>`。
-- 是否避免新增 current-task 全局依赖或冗余 access 快照类型。
-- 新增 `unsafe` 时是否逐项记录安全前提和 `SAFETY:` 注释。
+- Keep every rejected checked transition before mutation and publication.
+- Preserve real/effective/saved/filesystem distinctions and res-ID no-op behavior.
+- Keep group sorting, duplicates, and external size/permission checks aligned.
+- Use one committed snapshot per multi-step permission operation.
+- Reaudit KEEP_CAPS and exec together when adding capability sets.
+- Do not turn namespace IDs into unchecked authorization tokens.

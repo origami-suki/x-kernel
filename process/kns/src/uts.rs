@@ -23,24 +23,23 @@ fn zero_uts_buf() -> [c_char; UTS_LEN] {
 /// Reinterprets a `c_char` slice as a `u8` slice up to the first NUL byte.
 ///
 /// `c_char` is `i8` on some targets and `u8` on others, but it always has the
-/// same size and alignment as `u8`, and the values we store are 7-bit ASCII
-/// hostnames/domainnames, so a byte-level view is well-defined.
+/// same size and alignment as `u8`. All byte patterns are valid for both
+/// types, so no ASCII restriction is needed.
 fn bytes_from_uts(buf: &[c_char]) -> &[u8] {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(UTS_LEN);
     // SAFETY: `c_char` is either `i8` or `u8` depending on the target, but in
     // both cases it is one byte with the same alignment as `u8`. `buf` is a
-    // valid borrowed slice, and `len` is bounded by `buf.len()` (UTS_LEN), so
-    // the resulting slice stays within the original allocation. The stored
-    // values are ASCII bytes, which are representable in both signed and
-    // unsigned `c_char`.
+    // valid borrowed slice of one of UtsInner's UTS_LEN-element arrays.
+    // `len` is the first NUL index or UTS_LEN, so it stays in that allocation.
+    // All byte patterns are valid u8 values. The shared result borrows the
+    // same immutable storage and cannot outlive `buf`.
     unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) }
 }
 
 /// Copies `src` bytes into a `c_char` destination, element by element.
 ///
-/// This avoids `transmute`, which would be UB on targets where `c_char` is
-/// `i8` (it changes signedness and violates strict aliasing). ASCII bytes are
-/// representable in both signed and unsigned `c_char`.
+/// Integer casts preserve each byte's bit pattern on signed and unsigned
+/// `c_char` targets. Setters bound the input and zero-fill the remaining buffer.
 fn copy_bytes_to_uts(dst: &mut [c_char], src: &[u8]) {
     for (slot, &byte) in dst.iter_mut().zip(src.iter()) {
         *slot = byte as c_char;
@@ -76,7 +75,10 @@ impl UtsInner {
 
     /// Sets the nodename (hostname) from a byte slice.
     ///
-    /// Returns an error if the name exceeds 64 bytes.
+    /// # Errors
+    ///
+    /// Returns `UtsError::NameTooLong` if the name exceeds 64 bytes.
+    /// Arbitrary bytes are accepted; readers stop at the first NUL.
     pub fn set_nodename(&mut self, name: &[u8]) -> Result<(), UtsError> {
         if name.len() >= UTS_LEN {
             return Err(UtsError::NameTooLong);
@@ -93,7 +95,10 @@ impl UtsInner {
 
     /// Sets the domainname from a byte slice.
     ///
-    /// Returns an error if the name exceeds 64 bytes.
+    /// # Errors
+    ///
+    /// Returns `UtsError::NameTooLong` if the name exceeds 64 bytes.
+    /// Arbitrary bytes are accepted; readers stop at the first NUL.
     pub fn set_domainname(&mut self, name: &[u8]) -> Result<(), UtsError> {
         if name.len() >= UTS_LEN {
             return Err(UtsError::NameTooLong);
@@ -172,11 +177,21 @@ impl UtsNamespace {
     }
 
     /// Sets the nodename (hostname).
+    ///
+    /// # Errors
+    ///
+    /// Returns `UtsError::NameTooLong` if `name` exceeds 64 bytes.
+    /// No ASCII/UTF-8 validation is performed; reads stop at the first NUL.
     pub fn set_nodename(&self, name: &[u8]) -> Result<(), UtsError> {
         self.inner.write().set_nodename(name)
     }
 
     /// Sets the domainname.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UtsError::NameTooLong` if `name` exceeds 64 bytes.
+    /// No ASCII/UTF-8 validation is performed; reads stop at the first NUL.
     pub fn set_domainname(&self, name: &[u8]) -> Result<(), UtsError> {
         self.inner.write().set_domainname(name)
     }

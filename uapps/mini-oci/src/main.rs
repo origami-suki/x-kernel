@@ -2,6 +2,20 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
+//! Minimal guest launcher for a subset of OCI-like bundle configuration.
+//!
+//! Invoke `mini-oci run ID BUNDLE` with a trusted bundle containing `config.json`
+//! and a prepared rootfs. The single-threaded launcher creates mount/UTS/IPC
+//! namespaces, moves the child to a cgroup, configures its root and IDs, and execs
+//! its program. It waits and removes the group on the normal exit path.
+//! This is an integration utility: unknown fields, incomplete isolation, and
+//! failure-path resources prevent treating it as a hardened OCI runtime.
+//!
+//! For a smoke run, place `oci-test-init` in the bundle root at
+//! `/bin/oci-test-init`, configure args `["/bin/oci-test-init"]`, cwd `/`,
+//! and env `["OCI_SMOKE=1"]`, and provide procfs inside that root.
+//! `mini-oci run smoke /path/to/bundle` should produce `OCI_SMOKE_PASS`.
+
 use std::{
     env,
     ffi::{CString, OsStr},

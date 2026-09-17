@@ -30,6 +30,11 @@ struct SignalFrame {
 }
 
 /// Thread-level signal manager.
+///
+/// Owns the per-thread pending queue, blocked set, saved sigmask, and
+/// alternate stack. Handler-frame construction happens here on the
+/// user-return path; queueing decisions consult the owning
+/// [`ProcessSignalManager`] for shared actions.
 pub struct ThreadSignalManager {
     /// The process-level signal manager
     proc: Arc<ProcessSignalManager>,
@@ -101,7 +106,20 @@ impl ThreadSignalManager {
         self.stack.lock().contains_sp(sp)
     }
 
-    /// Dispatch a signal, building a user stack frame if needed.
+    /// Dispatch one dequeued signal on the user-return path.
+    ///
+    /// Default and ignored dispositions only report the OS action; a caught
+    /// signal rewrites `uctx` to enter the user handler on a freshly built
+    /// signal frame (`ucontext` + `siginfo` + restorable state) written to
+    /// user memory, applies the handler mask and
+    /// `SA_RESETHAND`, and returns [`SignalOSAction::Handler`].
+    ///
+    /// # Returns
+    ///
+    /// `None` when the signal needs no OS action (ignored or default-ignore),
+    /// otherwise the action the caller must perform. A user-memory write
+    /// failure is reported as [`SignalOSAction::CoreDump`] instead of an
+    /// error so the fatal path stays uniform.
     pub fn dispatch_irq_signal(
         &self,
         uctx: &mut UserContext,
@@ -205,10 +223,16 @@ impl ThreadSignalManager {
         }
     }
 
-    /// Checks pending signals and dispatch_irq them.
+    /// Checks pending signals and dispatches at most one.
     ///
-    /// Returns the signal number and the action the OS should take, if any.
-    /// Checks pending signals and dispatches one if available.
+    /// Uses the `possibly_has_signal`/process `has_pending` fast-path flags
+    /// before taking any lock; on the slow path it dequeues the first
+    /// unblocked signal, consults dequeue observers, and installs its frame.
+    ///
+    /// # Returns
+    ///
+    /// The dequeued signal and the OS action to take, or `None` when no
+    /// deliverable signal is pending.
     pub fn check_signals(
         &self,
         uctx: &mut UserContext,
@@ -223,8 +247,16 @@ impl ThreadSignalManager {
         self.check_signals_slow(uctx, restore_blocked)
     }
 
-    /// Restores the signal frame. Called by `sigreturn`.
-    /// Restore user context from the signal frame during `sigreturn`.
+    /// Restores user context from the signal frame during `sigreturn`.
+    ///
+    /// The frame is read back directly from the user stack at `uctx.sp()`;
+    /// this trusts that the stack still maps the frame previously written by
+    /// [`Self::dispatch_irq_signal`]. A user thread that corrupts that stack
+    /// before `rt_sigreturn` causes the kernel-side access to fault through
+    /// the normal kernel fault path.
+    ///
+    /// Restoring also re-arms the pending check so a signal queued while the
+    /// handler ran is noticed before returning to user mode.
     pub fn restore(&self, uctx: &mut UserContext) {
         let frame_ptr = uctx.sp() as *const SignalFrame;
         // SAFETY: pointer is valid
@@ -270,14 +302,16 @@ impl ThreadSignalManager {
         !is_blocked
     }
 
-    /// Gets the blocked signals.
     /// Returns the current blocked signal set.
     pub fn blocked(&self) -> SignalSet {
         *self.blocked.lock()
     }
 
-    /// Sets the blocked signals. Return the old value.
-    /// Replace the blocked set, returning the previous one.
+    /// Replaces the blocked set, returning the previous one.
+    ///
+    /// `SIGKILL` and `SIGSTOP` are always cleared from `set` because they
+    /// cannot be blocked. Re-arms the pending check so a signal that became
+    /// deliverable by this change is handled before the next user return.
     pub fn set_blocked(&self, mut set: SignalSet) -> SignalSet {
         set.remove(Signo::SIGKILL);
         set.remove(Signo::SIGSTOP);
@@ -288,15 +322,15 @@ impl ThreadSignalManager {
         old
     }
 
-    /// Checks if a signal is blocked.
-    /// Returns `true` if the signal is currently blocked.
+    /// Checks whether the signal is currently blocked.
     pub fn signal_blocked(&self, signo: Signo) -> bool {
         self.blocked.lock().has(signo)
     }
 
     /// Temporarily replaces the blocked signal set for the duration of `f`,
-    /// then restores the original set.  Used by ppoll/pselect6/epoll_pwait to
-    /// atomically swap the signal mask while waiting.
+    /// then restores the original set — including when `f` returns an error.
+    /// Used by ppoll/pselect6/epoll_pwait to atomically swap the signal mask
+    /// while waiting.
     pub fn with_temp_blocked<R>(
         &self,
         blocked: Option<SignalSet>,
@@ -321,19 +355,16 @@ impl ThreadSignalManager {
         self.saved_sigmask.lock().take()
     }
 
-    /// Gets the signal stack.
     /// Returns the signal handler stack configuration.
     pub fn stack(&self) -> SignalStack {
         self.stack.lock().clone()
     }
 
-    /// Sets the signal stack.
-    /// Sets the signal handler stack configuration.
+    /// Replaces the signal handler stack configuration.
     pub fn set_stack(&self, stack: SignalStack) {
         *self.stack.lock() = stack;
     }
 
-    /// Gets current pending signals.
     /// Returns pending signals for this thread and its process.
     pub fn pending(&self) -> SignalSet {
         self.pending.lock().set | self.proc.pending()

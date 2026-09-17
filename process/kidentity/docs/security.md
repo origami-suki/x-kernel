@@ -1,86 +1,61 @@
-# kidentity — 安全与可靠性分析
+# kidentity security and reliability
 
-## 信任模型
+## Scope, assets, and boundaries
 
-`kidentity` 信任其内核内调用者会在正确的 process-domain 场景中使用
-`PidNamespace` 和 `PidHandle`，
-但不信任调用者会自动满足更高层 publication 顺序语义。
-crate 本身只保证编号分配与 namespace 链表达的一致性。
+The whole crate (`src/lib.rs`) is covered. Assets are stable task identities,
+namespace ancestry, and numeric projections consumed by process registries.
+Trusted callers supply namespace handles and fixed root numbers. There is no
+direct user-pointer, filesystem, network, MMIO, DMA, firmware, FFI, or assembly
+input. `kprocess`/task lifecycle owners are responsible for authorization and
+publication before runnable state.
 
-## 外部边界 / 攻击面
+## Unsafe inventory and invariants
 
-该 crate 不直接接收用户内存、设备输入、DMA、MMIO、文件系统或网络数据。
-外部输入仅包括：
+There is no unsafe code. Every `Upid` owns a live namespace reference. Public
+constructors create an acyclic parent chain and a root projection in every
+handle. `root_nr` relies on that projection. Namespace identity comparison is
+pointer-based except for the documented root fallback. A fixed number is not a
+unique allocation guarantee.
 
-- 调用者传入的 `Arc<PidNamespace>`；
-- 调用者要求固定 root 编号的 `fixed_root(nr)` 参数。
+## Thread safety
 
-## unsafe 代码清单
+`AtomicU32` serializes per-namespace allocation. Immutable `Arc` graphs and
+vectors need no further internal locks. Allocation across several namespaces is
+not an atomic transaction: a failure leaves earlier counter increments consumed.
+`LazyInit` publishes the global root once, independently of task publication.
 
-当前 crate 不包含 `unsafe` 代码。
+## Threat analysis
 
-## 内存安全不变量
-
-- `PidNamespace::parent` 一旦建立后不可变，
-  不得形成可变共享下的层级破坏。
-- `PidHandle::numbers` 中每个 `Upid` 必须绑定有效的 `Arc<PidNamespace>`。
-- `PidHandle` 必须始终持有 root-visible 编号，
-  因而 `root_nr()` 的 `expect` 依赖分配流程保持该不变量。
-
-## 线程安全
-
-- `PidNamespace` 通过 `AtomicU32` 支持并发分配。
-- `PidHandle` 和 `Upid` 在构造后只读，
-  线程安全由其字段类型自然保证。
-- crate 不负责跨 subsystem 的 publication 原子性；
-  该责任在更高层 owner crate。
-
-## 威胁分析
-
-- 编号耗尽：`u32` 空间耗尽会使后续分配失败。
-  影响是新 task/process 无法获得 identity；
-  当前缓解方式是显式返回 `KError::WouldBlock`。
-- 发布顺序错误：如果上层在 identity 稳定前就让 task runnable，
-  可能破坏 PID/TID 可观测一致性。
-  该 crate 通过 ownership 分层把这项责任留给 `kprocess` 等 owner。
-- init 身份分配过晚：如果某个 Linux-visible task 在 PID 1 init 创建前消耗 root
-  PID，则全局 init 无法成为 PID 1。该错误由 init 创建路径的 PID 断言暴露；
-  `kidentity` 不维护 init 专用全局状态。
-- 错误 namespace 查询：调用方若拿非祖先 namespace 调用 `nr_in()`，
-  会得到 `None`，不会伪造编号。
-
-## 故障模式与影响分析（FMEA）
-
-| 故障模式 | 触发条件 | 局部影响 | 系统影响 | 处理方式 |
+| ID | Threat and asset | Severity | Trigger | Response and residual risk |
 |---|---|---|---|---|
-| 编号溢出 | `next_nr` 到达 `u32::MAX` | 当前 identity 分配失败 | 新建任务或进程失败 | 返回 `KError::WouldBlock` |
-| namespace 链为空 root | 构造逻辑被破坏 | `root_nr()` panic | 内核逻辑错误暴露 | 依赖 `allocate_in` / `fixed_root` 保持不变量 |
-| init 身份分配过晚 | Linux-visible task 在 init 前抢先分配 root PID | init PID 1 断言 panic | 启动中止，避免错误 init 身份进入用户态 | boot、idle、late-init 和普通内核 worker 使用 PID-less identity |
-| 使用错误 namespace 查询 | 调用方传入无关 namespace | 返回 `None` | 上层需决定错误处理 | 显式 `Option` 返回 |
+| T-01 | Identity exhaustion | Medium | Repeated allocations reach the counter bound | Checked increment returns `WouldBlock`; no wrap, reuse, rollback, or reclamation exists. |
+| T-02 | Duplicate numeric registration | High | Trusted caller uses `fixed_root` for an already allocated number | Fixed projections are explicitly unchecked; registry owners must enforce uniqueness and stable identity, not rely on this constructor. |
+| T-03 | Wrong namespace visibility decision | High | Caller interprets root fallback as namespace equality | `nr_in` documents fallback for any root; non-root misses return `None`. Authorization must use the actual namespace policy. |
+| T-04 | Unstable visible task identity | Medium | Upper layer makes task runnable before publication | Upper-layer lifecycle must publish first; this allocator does not implement that transaction. |
+| T-05 | Excessive namespace nesting | Medium | Trusted callers repeatedly construct children | No depth cap is enforced; allocation/lookup cost and parent-drop depth increase, and `level + 1` can overflow. Callers must bound nesting. |
 
-## 故障管理
+## Failure modes and effects (FMEA)
 
-- 常规错误通过 `KResult` 返回。
-- `root_nr()` 的 panic 表示内部不变量已经被破坏，
-  不是对外部输入的可恢复错误路径。
-- crate 不做重试、回滚或编号回收。
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1-4) | Handling |
+|---|---|---|---|---|---|---|
+| F-01 | Number exhaustion | Counter at `u32::MAX` | `WouldBlock` | New task creation fails | 3 | Propagate error; consumed descendant numbers are retained. |
+| F-02 | Missing root projection | Broken internal constructor invariant | `root_nr` panics | Kernel service fails | 2 | Constructors always append root or create a root-only handle. |
+| F-03 | Premature root allocation | Linux-visible task created before init | First number consumed | Init's PID-1 check can fail | 2 | Boot lifecycle controls allocation order. |
+| F-04 | Allocation/depth failure | Heap exhaustion or excessive nesting | Allocation failure or overflow behavior | Process creation unavailable | 2 | External resource/depth policy; no local recovery. |
 
-## 隐私分析
+## Failure handling, privacy, and limitations
 
-该 crate 不处理用户隐私数据，
-只管理内核内的进程身份编号。
+Recoverable number failures use `KResult`; namespace misses use `Option`.
+The global-root `unwrap` relies on completed `call_once`. No retry or reclaim
+exists. The crate stores numeric process metadata and namespace relationships,
+not user payload, and writes no logs. Upper layers must authorize exposing that
+metadata. Lack of reuse, linear namespace lookup, unchecked fixed projections,
+and root fallback are deliberate/current constraints, not full isolation claims.
 
-## 已知限制
+## Audit checklist
 
-- 当前不支持 PID reuse。
-- `nr_in()` 是线性扫描。
-- crate 不维护生命周期回收策略，也不负责 publication 事务。
-- 全局 init PID 语义由 boot lifecycle 保证；`kidentity` 只提供普通分配器。
-
-## 审计清单
-
-- 检查每次 `PidHandle` 分配后，上层是否在 runnable 前完成 publication。
-- 检查新引入的 namespace 操作是否保持 root-visible 编号始终存在。
-- 检查任何未来的 PID reuse 设计是否破坏当前只读 `PidHandle` 假设。
-- 检查并发分配路径是否仍只依赖 `AtomicU32`，没有引入额外共享状态竞态。
-- 检查 PID 1/2 task 创建之前是否没有普通 root PID 分配路径（late init 的 kthread 必须落在 PID >= 3）。
+- Keep checked per-namespace increments and root projections.
+- Verify external uniqueness for `fixed_root` callers.
+- Preserve publish-before-runnable ordering in task owners.
+- Do not conflate root fallback with pointer identity or authorization.
+- Reassess retained identities before introducing PID reuse.

@@ -25,7 +25,16 @@ use memspace::PageFaultOutcome;
 use osvm::{VirtMutPtr, VirtPtr};
 use posix_ipc::SHM_MANAGER;
 
-/// Create a new user task that runs in user space and handles traps.
+/// Constructs an unpublished user task whose entry loop dispatches traps.
+///
+/// `task_number` must identify the supplied `thread`; `uctx` must describe its
+/// prepared image. `set_child_tid`, when nonzero, is a userspace TID writeback
+/// address consumed on first execution. Publish and activate the returned task
+/// through `kprocess::publish_user_task` after completing parent-side setup.
+/// `dispatch_syscall` runs in the task's process context after each syscall trap.
+///
+/// See the complete identity, runtime and publication sequence in
+/// [`spawn_init_process`](crate::spawn_init_process).
 pub fn new_user_task(
     name: &str,
     uctx: UserContext,
@@ -300,7 +309,17 @@ fn exit_robust_list(head: *const RobustListHead, tid: Tid) {
     }
 }
 
-/// Exit the current thread or process group and perform cleanup.
+/// Tears down the current user thread and optionally terminates its siblings.
+///
+/// `exit_code` records the thread's status; `group_exit` requests SIGKILL for
+/// surviving siblings. This marks the thread exited and returns to its trap
+/// loop; it does not directly terminate the kernel task. Call only in the
+/// current user thread's sleepable context, without reentering its teardown.
+/// Last-thread resource cleanup precedes parent-visible process completion.
+///
+/// # Panics
+///
+/// The current-thread accessor panics if no user-thread runtime is installed.
 pub fn do_exit(exit_code: i32, group_exit: bool) {
     let curr = current();
     let thr = current_user_thread();
@@ -390,7 +409,18 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     thr.set_exit();
 }
 
-/// Send a fatal signal to the current process.
+/// Queues a fatal signal for the current process or starts group exit.
+///
+/// Runs in current-user-thread context. If no thread accepts the signal or its
+/// target cannot be interrupted, calls [`do_exit`] with the signal number.
+///
+/// # Errors
+///
+/// Forwards `Process::signal_manager` errors when the process runtime is gone.
+///
+/// # Panics
+///
+/// The current-process accessor panics outside a user-thread runtime.
 pub fn raise_signal_fatal(sig: SignalInfo) -> KResult<()> {
     let signo = sig.signo();
     info!("Send fatal signal {signo:?} to the current process");
@@ -405,7 +435,14 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> KResult<()> {
     Ok(())
 }
 
-/// Check for pending signals and execute default handlers if needed.
+/// Handles one pending signal and reports whether one was consumed.
+///
+/// `thr` and `uctx` must belong to the current user thread. `restore_blocked`
+/// supplies the optional mask restoration passed to its signal manager.
+/// Terminate/CoreDump/Stop actions perform group teardown; handlers and continue
+/// actions retain the signal manager's context changes. Stop currently exits
+/// with code 1, and CoreDump exits without generating a core file.
+/// This may block and must not run in interrupt context.
 pub fn check_signals(
     thr: &Thread,
     uctx: &mut UserContext,

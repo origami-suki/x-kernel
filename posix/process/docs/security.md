@@ -1,72 +1,90 @@
-# posix-process — 安全与可靠性分析
+# posix-process — Security and reliability
 
-## 信任模型
+## Scope, trust and assets
 
-- 用户态 trap 原因、robust futex 指针、`clear_child_tid` 地址都不可信。
-- 初始用户进程可执行路径、argv/envp 内容和 rootfs 解析结果都来自外部输入。
-- 本 crate 负责在当前线程/进程语义内消费这些输入，并把失败限制在当前进程生命周期内。
+The analysis covers all three source files and their optional TEE/TIPC paths.
+Protected assets are the current thread's identity, saved user context, address
+space ownership, runtime handles and parent-visible completion. `kprocess`
+provides identity/publication and owner-slot synchronization, `memspace` handles
+faults/mappings, `kuaccess`/`osvm` perform fault-aware user access, and `kfutex`
+resolves futex keys. This crate orders those operations; it does not validate
+executable formats or maintain process registries itself.
 
-## 外部边界 / 攻击面
+## External boundaries and validation
 
-- clone/exit/signal-return 相关 runtime 路径。
-- init 进程启动时的可执行文件解析、TTY 绑定和 stdio 安装路径。
-- 线程退出时读取的 robust futex list。
-- 共享内存回收和父子进程退出通知。
+`spawn_init_process(args, envs, ...)` passes path/argv/envp to `ExecRequest` and
+`load_user_app_request`; filesystem resolution and executable validation belong
+to those providers. Missing argv or bootstrap failures panic.
+`run_user_thread_loop` receives architecture trap results and the saved user
+context. It uses structured MM fault outcomes and signal actions, not raw
+user-supplied exception interpretations.
 
-## unsafe 代码清单
+`exit_robust_list` reads the registered userspace head and linked nodes through
+`read_vm`; failed reads stop the walk. Pointer low-bit tags distinguish PI
+entries, which are skipped. The walk stops at the sentinel or
+`ROBUST_LIST_LIMIT`, then separately handles a nonnull non-PI pending entry.
+`dispatch_irq_futex_death` checks signed address addition/conversion and uses
+fault-aware atomic access. It changes only a word whose owner TID matches; the
+pending unlocked-word case can wake a waiter without changing ownership.
+`do_exit` writes zero to the userspace `clear_child_tid` pointer and wakes only
+if the write and futex-key resolution succeed. These pointers are untrusted;
+registration is not proof that their pages remain accessible.
 
-- `uctx.emulate_unaligned()`：
-  依赖目标架构 `UserContext` 实现的安全前提。
-- `&raw const (*head).list` 和后续 `read_vm()` 遍历：
-  依赖调用方提供的是当前线程登记过的 robust list 头指针，且读取失败时立即停止。
+## Unsafe inventory and memory invariants
 
-## 内存安全不变量
+| Location | Operation and necessary invariant | Guard/provider |
+|---|---|---|
+| `src/runtime.rs`, `run_user_thread_loop` (LoongArch only) | Calls unsafe `UserContext::emulate_unaligned`; the saved context must still describe the faulting misaligned instruction. | Only reached for the `Misaligned` exception returned by that context's `run`; matches its adjacent SAFETY explanation. |
+| `src/runtime.rs`, `exit_robust_list` | Forms a raw address of the embedded list sentinel without loading the field. | The pointer is the registered robust-list head; the address is used only for termination comparison, and actual contents are copied with `read_vm`, as stated by the SAFETY comment. |
 
-- robust futex 地址必须能转换成当前进程 futex key。
-- 初始用户进程（PID 1）的 `Thread` 必须与构造时分配的 `PidHandle` 匹配，并随
-  `new_user(...)` 在 task 构造时一次性装入 `UserRuntimeSlot`，再经
-  `publish_user_task(...).commit(...)` 发布到 process registry 后才激活，不存在
-  runnable 后补装 runtime 的路径。
-- 最后线程必须先取走 mm、fd table、`FsStruct` 和 `NsProxy` owner，再发布进程退出；
-  已退出进程的 capability 查询必须返回 `NoSuchProcess`。
-- `SHM_MANAGER` 清理仅针对已退出进程 PID。
+There is no direct FFI declaration or inline assembly in this crate. Architecture
+and userspace access contracts remain in their providers. The task's PID handle
+and installed `Thread` must agree before publication. Last-thread runtime owners
+must be detached before parent-visible completion so zombie identity cannot keep
+files, mounts or active mm ownership alive.
 
-## 线程安全
+## Thread safety
 
-- 本 crate 不自建额外共享状态，依赖 `kprocess::Process`/`Thread` runtime 内部同步。
-- group-exit 广播和父进程唤醒都基于当前可见线程/进程集合执行。
-- 纯 syscall adapter 已迁到 `ksyscall/task`，不再扩大本 crate 的 ABI 暴露面。
+Current-thread helpers require a user runtime; they are not kernel-task APIs.
+The loop exclusively updates its supplied user context. Shared process state is
+protected by `kprocess`, and atomic futex words may change concurrently in
+userspace. No local lock makes the whole robust list immutable: each read is a
+snapshot and traversal is bounded. Resource destruction and parent notification
+must retain the ordering described in the design document.
 
-## 威胁分析
+## Threats
 
-- 恶意 robust list 构造循环：通过 `ROBUST_LIST_LIMIT` 限界。
-- 无效用户地址：`read_vm()` 失败即停止遍历。
-- `rt_sigreturn` 后重复进入信号处理：`SkipSignalCheckOnce` 显式规避。
-- 向正在用户态运行的任务投递信号：`TaskInner::interrupt()` kick 目标 CPU；
-  返回用户态前若 `is_interrupted()` 则再跑一次 `check_signals`，避免 NOHZ
-  lone runner 永远不 trap。
-- init 可执行文件解析失败：当前实现直接 panic，保留“系统无法启动即失败停止”的语义。
-- file-backed 映射越过 EOF 的 page fault：`MmSpace::handle_page_fault()`
-  返回结构化 `PageFaultOutcome::BusError`，runtime 将其转换为 `SIGBUS`，
-  避免对象级 fault 被误报成普通 `SIGSEGV`。
+| ID | Threat / asset | Severity | Trigger | Existing response and residual risk |
+|---|---|---|---|---|
+| T-01 | Invalid or cyclic robust list consumes kernel work or touches invalid memory. | Medium | An exiting thread supplies malformed nodes or concurrent changes. | Fault-aware reads stop on error and `ROBUST_LIST_LIMIT` bounds traversal; PI entries are skipped and their cleanup is not implemented here. |
+| T-02 | Futex cleanup changes another owner's lock word. | High | A word is reused or ownership changes during exit. | Compare owner TID, then compare-exchange; retry when the observed word changes. Key resolution is delegated to `kfutex`. |
+| T-03 | Faulting file mappings deliver the wrong signal. | Medium | A file-backed access is beyond the backing object's valid extent. | Map `PageFaultOutcome::BusError` to SIGBUS; MM owns the classification. |
+| T-04 | Process completion exposes still-held resources. | Medium | Last-thread teardown notifies a waiter before detach. | Release mm/files/fs/ns and IPC state before `complete_process_exit`; logged cleanup failures remain a diagnostic limitation. |
+| T-05 | Bootstrap input prevents system startup. | Medium | Empty argv or resolution/loading/publication failure. | Fail-stop panic with context; bootstrap recovery is intentionally not provided. |
+| T-06 | Pending work is delayed before userspace reentry. | Medium | A timer/scheduler interrupt arrives after the normal signal check. | Clear old interrupt state before timer polling and check a newly set flag before reentry; CPU kick behavior is provided by the task layer. |
 
-## 故障模式与影响分析（FMEA）
+## Failure-mode analysis
 
-- 退出路径漏放 files owner：会破坏 pipe EOF / wait 语义；当前实现用 `exit_files()`
-  取走本进程 owner，共享 fd table 在最后 owner 释放时关闭。
-- 退出路径漏放 `FsStruct`/`NsProxy`：会让 `Path -> Mount` 跨 zombie 生命周期存活；
-  当前最后线程在父进程可观察退出前完成两者 detach。
-- 父进程通知丢失：通过退出信号和 `child_exit_event()` 双路径通知。
-- group-exit 未广播：会留下残余线程；当前实现遍历线程组发 `SIGKILL`。
-- init 进程启动前缺少 user runtime：会导致用户线程 runtime 前提失效；当前 PID 1 路径在进入用户态前校验 identity、安装 runtime、发布 process/task 可见性，并同步当前页表。
-- init 进程预占 controlling TTY：会阻止 OpenRC getty 建立新 session 并获取 console；初始进程只安装 stdio，控制终端所有权留给 getty 的 `setsid`/TTY ioctl 流程。
+| ID | Failure mode | Cause | Local effect | System effect | Severity (1–4) | Controls |
+|---|---|---|---|---|---|---|
+| F-01 | Robust-list read/update fails | Malformed or concurrently changed user list | Remaining nodes may not be recovered | User waiters may remain blocked | 3 | Stop invalid traversal; process exit still progresses. |
+| F-02 | Resource detach returns an error | Provider cleanup error | Cleanup may be incomplete | Resource lifetime or observer semantics can degrade | 2 | Log per-owner errors and continue the remaining teardown. |
+| F-03 | Init construction fails | Missing bootstrap prerequisites or invalid image | PID 1 never runs | Boot stops | 1 | Explicit assertions/expect messages identify the failed stage. |
+| F-04 | Group-exit signal delivery races thread exit | Concurrent sibling termination | A sibling may disappear | Best-effort group termination continues | 3 | Iterate currently published siblings and tolerate delivery errors. |
 
-## 故障管理
+## Privacy and limitations
 
-- 用户输入错误优先提前返回或终止当前进程。
-- 线程/进程内部不变量破坏时，允许升级为 fatal signal 路径。
+Arguments/environment and robust-list contents are userspace data. Bootstrap
+passes them to loading/runtime metadata; fault logs include executable path,
+PID and instruction/stack/fault addresses, which require trusted log access.
+There is no local redaction or core-file generation. Stop and CoreDump actions
+are simplified, and PI robust-futex cleanup is skipped.
 
-## 已知限制
+## Audit checklist
 
-- `Stop` / `CoreDump` 默认动作仍是简化实现。
-- 多线程 `execve` 仍未完整支持。
+- Keep identity/runtime construction before publication and activation.
+- Preserve robust-list limits, fault-aware accesses and owner-TID atomic checks.
+- Preserve mm/files/fs/ns detach before process completion.
+- Check optional TEE/TIPC teardown in its configured build.
+- Keep the LoongArch context precondition tied to the actual trap result.
+- Verify fault signal mapping and the post-timer interrupt recheck when changing the loop.

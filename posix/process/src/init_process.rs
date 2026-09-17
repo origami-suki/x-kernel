@@ -40,8 +40,8 @@ use crate::runtime::run_user_thread_loop;
 ///
 /// # Panics
 ///
-/// Panics if the allocated PID is not 1, if init process construction,
-/// executable loading, publication, terminal binding, or stdio setup fails, or
+/// Panics if `args` is empty, the allocated PID is not 1, or init process construction,
+/// executable loading, publication, or stdio setup fails, or
 /// if the spawned process does not register as the global init.
 pub fn spawn_init_process(
     args: &[String],

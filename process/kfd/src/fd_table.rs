@@ -86,6 +86,11 @@ impl FdTable {
     }
 
     /// Returns the open file stored in the given descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` if `fd` is negative, outside the table,
+    /// or does not identify an occupied slot.
     pub fn get_file(&self, fd: c_int) -> KResult<Arc<VfsFile>> {
         self.get(fd as usize)
             .map(|descriptor| descriptor.file().clone())
@@ -93,6 +98,11 @@ impl FdTable {
     }
 
     /// Returns a stable snapshot of the descriptor entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` if `fd` is negative, outside the table,
+    /// or does not identify an occupied slot.
     pub fn snapshot(&self, fd: c_int) -> KResult<FdSnapshot> {
         self.get(fd as usize)
             .map(|descriptor| descriptor.snapshot(fd))
@@ -100,6 +110,11 @@ impl FdTable {
     }
 
     /// Adds an open file while enforcing the process soft limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::TooManyOpenFiles` if occupied count is at least `max_nofile`
+    /// or no physical slot is available. The soft check is on count, not the FD number.
     pub fn add_file(
         &mut self,
         max_nofile: u64,
@@ -116,6 +131,11 @@ impl FdTable {
     }
 
     /// Inserts an open file without applying a resource-limit policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the uninserted `FileDescriptor` when the table is full; ownership is
+    /// returned to the caller rather than discarding the open-file reference.
     pub fn insert_file(
         &mut self,
         file: Arc<VfsFile>,
@@ -125,11 +145,21 @@ impl FdTable {
     }
 
     /// Removes a descriptor from the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` if `fd` is negative, outside the table,
+    /// or does not identify an occupied slot.
     pub fn file_close_fd_locked(&mut self, fd: c_int) -> KResult<FileDescriptor> {
         self.remove(fd as usize).ok_or(KError::BadFileDescriptor)
     }
 
     /// Returns the close-on-exec bit for the given descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` if `fd` is negative, outside the table,
+    /// or does not identify an occupied slot.
     pub fn cloexec(&self, fd: c_int) -> KResult<bool> {
         Ok(self
             .get(fd as usize)
@@ -138,6 +168,11 @@ impl FdTable {
     }
 
     /// Updates the close-on-exec bit for the given descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` if `fd` is negative, outside the table,
+    /// or does not identify an occupied slot.
     pub fn set_cloexec(&mut self, fd: c_int, cloexec: bool) -> KResult {
         self.get_mut(fd as usize)
             .ok_or(KError::BadFileDescriptor)?
@@ -146,6 +181,15 @@ impl FdTable {
     }
 
     /// Duplicates one descriptor into a fixed target slot.
+    ///
+    /// Returns the replaced descriptor, if any, for the caller to close after
+    /// releasing the table lock. Equal descriptors leave flags unchanged. This
+    /// method checks physical capacity, not the process soft limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KError::BadFileDescriptor` for a negative/out-of-capacity target, an
+    /// absent source, or failure to insert at the target slot.
     pub fn duplicate_to(
         &mut self,
         old_fd: c_int,

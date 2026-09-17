@@ -52,36 +52,58 @@ pub enum SignalOSAction {
 }
 
 bitflags! {
+    /// `sa_flags` bits carried by a [`SignalAction`].
+    ///
+    /// Values mirror the Linux `SA_*` ABI. Unknown bits received from user
+    /// space are dropped by `from_bits_truncate` during ABI conversion.
     #[derive(Default, Debug, Clone, Copy)]
     pub struct SignalActionFlags: c_ulong {
+        /// Do not raise `SIGCHLD` when children stop (`SA_NOCLDSTOP`).
         const NOCLDSTOP = SA_NOCLDSTOP as _;
+        /// Do not create zombies, request child autoreap (`SA_NOCLDWAIT`).
         const NOCLDWAIT = SA_NOCLDWAIT as _;
+        /// Handler takes the `siginfo` ABI (`SA_SIGINFO`).
         const SIGINFO = SA_SIGINFO as _;
+        /// Do not add the signal itself to the handler mask (`SA_NODEFER`).
         const NODEFER = SA_NODEFER as _;
+        /// Restore the default disposition on handler entry (`SA_RESETHAND`).
         const RESETHAND = SA_RESETHAND as _;
+        /// Restart interrupted syscalls instead of failing with `EINTR` (`SA_RESTART`).
         const RESTART = SA_RESTART as _;
+        /// Invoke the handler on the alternate signal stack (`SA_ONSTACK`).
         const ONSTACK = SA_ONSTACK as _;
+        /// A user-provided `sa_restorer` follows the kernel-only x86 ABI (`SA_RESTORER`).
         const RESTORER = 0x4000000;
     }
 }
 
+/// Disposition configured for one signal.
 #[derive(Debug, Default, Clone)]
 pub enum SignalDisposition {
-    #[default]
     /// Use the default signal action.
+    #[default]
     Default,
-    /// Ignore the signal.
+    /// Ignore the signal (`SIG_IGN`).
     Ignore,
-    /// Custom signal handler.
+    /// Invoke a user handler (`SIG_DFL` replaced by an address).
+    ///
+    /// The handler is an opaque user entry point typed as a C function
+    /// pointer; the kernel calls it only through the constructed user frame,
+    /// never directly from kernel code.
     Handler(unsafe extern "C" fn(i32)),
 }
 
 /// Signal action. Corresponds to `struct sigaction` in libc.
 #[derive(Debug, Clone, Default)]
 pub struct SignalAction {
+    /// `SA_*` behavior flags.
     pub flags: SignalActionFlags,
+    /// Signals blocked while the handler runs.
     pub mask: SignalSet,
+    /// What to do when the signal is delivered.
     pub disposition: SignalDisposition,
+    /// User-space `sigreturn` trampoline entry, present only when the
+    /// architecture ABI requires a restorer (x86) and the user set one.
     pub restorer: __sigrestore_t,
 }
 

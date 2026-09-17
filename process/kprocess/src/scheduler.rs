@@ -10,11 +10,22 @@ use ktask::{KtaskRef, current};
 use crate::{AsThread, Pid, Process, ProcessGroup, Tid, lookup};
 
 /// Moves all currently published threads in `process` to one cgroup.
+///
+/// # Errors
+///
+/// Forwards the errors of `migrate_process_cgroup_with`, including missing
+/// process membership and cgroup migration failures.
 pub fn migrate_process_cgroup(process: &Process, target: &Arc<kcgroup::Cgroup>) -> KResult<()> {
     migrate_process_cgroup_with(process, target, |_, _| Ok(()))
 }
 
 /// Moves a process after authorizing its stable source and destination groups.
+///
+/// # Errors
+///
+/// Returns `KError::NoSuchProcess` when the process has no published tasks or
+/// its representative membership has no source group. Forwards `authorize`
+/// errors and `kcgroup::TaskMembership::migrate_group` failures.
 pub fn migrate_process_cgroup_with(
     process: &Process,
     target: &Arc<kcgroup::Cgroup>,
@@ -40,6 +51,12 @@ pub fn migrate_process_cgroup_with(
 }
 
 /// Resolves the task targeted by scheduler syscalls.
+///
+/// # Errors
+///
+/// Returns `KError::NoSuchProcess` for a negative PID, an unpublished/exited
+/// nonzero process or a process with no representative published task. Zero
+/// selects the current task, including a kernel task.
 pub fn target_task(pid: i32) -> KResult<KtaskRef> {
     if pid < 0 {
         return Err(KError::NoSuchProcess);
@@ -61,6 +78,11 @@ pub fn target_task(pid: i32) -> KResult<KtaskRef> {
 }
 
 /// Resolves a thread task by TID for scheduler attribute updates.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when a nonzero TID has no live
+/// published task. TID zero selects the current task.
 pub fn task_by_tid(tid: Tid) -> KResult<KtaskRef> {
     lookup::task(tid)
 }
@@ -81,11 +103,21 @@ pub fn process_owns_tid(process: &Process, tid: Tid) -> bool {
 }
 
 /// Resolves a representative published task for the selected process.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when the requested published target
+/// is absent or no longer has the required live backing.
 pub fn representative_task(process: &Process) -> KResult<KtaskRef> {
     lookup::representative_task_for_process(process)
 }
 
 /// Resolves the non-exited process targeted by scheduler process-level operations.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when the PID is unpublished or the
+/// process has exited. PID zero selects the current user process.
 pub fn target_process(pid: Pid) -> KResult<Arc<Process>> {
     lookup::live_process(pid)
 }
@@ -96,6 +128,11 @@ pub fn processes() -> alloc::vec::Vec<Arc<Process>> {
 }
 
 /// Resolves the process group targeted by scheduler group scans.
+///
+/// # Errors
+///
+/// Returns `kerrno::KError::NoSuchProcess` when the requested published target
+/// is absent or no longer has the required live backing.
 pub fn target_group(pgid: Pid) -> KResult<Arc<ProcessGroup>> {
     lookup::process_group(pgid)
 }

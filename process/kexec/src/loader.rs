@@ -163,6 +163,12 @@ impl ExecRequest {
 
     /// Resolves the executable and creates a binprm object without mutating
     /// the target address space.
+    ///
+    /// # Errors
+    ///
+    /// Propagates VFS lookup, execute-permission, absolute-path reconstruction, and
+    /// file-open errors. Both resolved and string sources undergo an execute
+    /// permission check using the supplied credential snapshot. No address space is modified.
     pub fn prepare(self) -> KResult<BinPrm> {
         let (location, display_path) = self.source.resolve(&self.cred)?;
         let executable = open_exec_file(&location, self.cred.clone())?;
@@ -471,6 +477,30 @@ pub fn clear_elf_cache() {
 ///
 /// This is the exec-facing entry point when the caller has already resolved
 /// the executable location, for example through a procfs magic link.
+///
+/// Requires task context, an initialized filesystem context for path/interpreter
+/// lookup, and exclusive ownership of `uspace`. It may block on VFS and loader locks.
+///
+/// # Returns
+///
+/// Returns `(entry_point, initial_stack_pointer)` after mapping the executable,
+/// optional interpreter, signal trampoline, stack, and heap.
+///
+/// # Errors
+///
+/// Returns `InvalidExecutable` for a non-ELF/non-script image, `FilesystemLoop`
+/// after four script redirects, `InvalidInput` for invalid interpreter text or
+/// interpreter image, and `ArgumentListTooLong` for an unrepresentable/oversized
+/// initial stack. Propagates VFS, ELF parser (`InvalidData`), MM mapping/population/
+/// write errors, and optional TA-signature rejection (`PermissionDenied`).
+/// Failures after `MmSpace::clear` leave the old image destroyed; this API has
+/// no rollback and the caller must not resume the previous user image.
+///
+/// # Panics
+///
+/// Loader assertions panic on mismatched ELF virtual/file page offsets, a short
+/// PT_INTERP read, or a prepared cache entry missing at commit. Current-context
+/// and filesystem initialization preconditions must also hold.
 pub fn load_user_app_request(
     uspace: &mut MmSpace,
     request: ExecRequest,
