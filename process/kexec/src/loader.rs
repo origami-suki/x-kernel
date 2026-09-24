@@ -14,7 +14,7 @@ use kerrno::{KError, KResult};
 use khal::paging::{MappingFlags, PageSize};
 use ksync::{Mutex, static_lock};
 use kvfs::{Filename, LookupFlags, LookupIntent, Path, Permission, VfsFile, dentry_open};
-use memaddr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+use memaddr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 use memspace::{MmSpace, VmRuntimeRef};
 use ouroboros::self_referencing;
 
@@ -251,7 +251,13 @@ fn map_elf<'a>(
             ph.flags
         );
         let seg_pad = vaddr.align_offset_4k();
-        assert_eq!(seg_pad, ph.offset as usize % PAGE_SIZE_4K);
+        if seg_pad != ph.offset as usize % PAGE_SIZE_4K {
+            warn!(
+                "PT_LOAD page offset mismatch: vaddr={vaddr:#x} p_offset={:#x}",
+                ph.offset
+            );
+            return Err(KError::InvalidExecutable);
+        }
 
         let seg_align_size =
             (ph.mem_size as usize + seg_pad + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
@@ -279,6 +285,86 @@ fn map_elf<'a>(
     Ok(elf_parser)
 }
 
+/// Virtual placement facts of one loadable ELF segment.
+#[derive(Clone, Copy)]
+struct LoadSegment {
+    virtual_addr: usize,
+    mem_size: usize,
+    align: usize,
+}
+
+/// Returns the loadable segments of `entry` with their placement facts.
+fn load_segments(entry: &ElfCacheEntry, base: usize) -> Option<Vec<LoadSegment>> {
+    let parser = ELFParser::new(entry.borrow_elf(), base).ok()?;
+    Some(
+        parser
+            .headers()
+            .ph
+            .iter()
+            .filter(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Load))
+            .map(|ph| LoadSegment {
+                virtual_addr: ph.virtual_addr as usize,
+                mem_size: ph.mem_size as usize,
+                align: ph.align as usize,
+            })
+            .collect(),
+    )
+}
+
+/// Range covered by `segments` when the image is loaded at `base`.
+///
+/// The result uses the same page rounding as `map_elf`, so it describes the
+/// exact span that must stay free before `base` can be used. Returns `None`
+/// when there is no loadable segment or when an end address overflows.
+fn load_range_for_segments(segments: &[LoadSegment], base: usize) -> Option<VirtAddrRange> {
+    let mut start = None;
+    let mut end = 0usize;
+
+    for segment in segments {
+        let vaddr = segment.virtual_addr.checked_add(base)?;
+        let mapped_start = VirtAddr::from_usize(vaddr).align_down_4k().as_usize();
+        let seg_end = mapped_start.checked_add(segment.mem_size)?;
+        let mapped_end = VirtAddr::from_usize(seg_end).align_up_4k().as_usize();
+        start = Some(start.map_or(mapped_start, |current: usize| current.min(mapped_start)));
+        end = end.max(mapped_end);
+    }
+
+    Some(VirtAddrRange::new(
+        VirtAddr::from_usize(start?),
+        VirtAddr::from_usize(end),
+    ))
+}
+
+/// Chooses a free load bias for the dynamic interpreter.
+///
+/// The interpreter is position-independent, so its bias is a placement
+/// decision rather than an ELF-provided constant: the fixed
+/// `USER_INTERP_BASE` hint is only the preferred start. Reusing it
+/// unconditionally collides with any main image whose PT_LOAD pages reach
+/// that address, which used to fail the VMA non-overlap assertion and panic
+/// the kernel.
+///
+/// The search stays inside the documented interpreter window below
+/// `USER_HEAP_BASE`, so the heap and brk keep their fixed placement.
+fn select_interpreter_base(uspace: &MmSpace, entry: &ElfCacheEntry) -> KResult<usize> {
+    let hint = VirtAddr::from_usize(kaddr_layout::USER_INTERP_BASE);
+    let limit = VirtAddrRange::new(hint, VirtAddr::from_usize(kaddr_layout::USER_HEAP_BASE));
+    let segments = load_segments(entry, hint.as_usize()).ok_or(KError::InvalidExecutable)?;
+    let span =
+        load_range_for_segments(&segments, hint.as_usize()).ok_or(KError::InvalidExecutable)?;
+    let align = segments
+        .first()
+        .map_or(PAGE_SIZE_4K, |segment| segment.align.max(PAGE_SIZE_4K));
+    // `find_free_area` only reports a free start address that is itself
+    // `align`-aligned, so the reserved size must cover the same rounding.
+    let size = VirtAddr::from_usize(span.size()).align_up(align).as_usize();
+
+    uspace
+        .find_free_area(hint, size, limit, align)
+        .map(VirtAddr::as_usize)
+        .ok_or(KError::NoMemory)
+}
+
 fn map_elf_error(err: &'static str) -> KError {
     debug!("Failed to parse ELF file: {err}");
     KError::InvalidExecutable
@@ -301,7 +387,7 @@ impl ElfCacheEntry {
         data.truncate(read);
         match ElfCacheEntry::try_new_or_recover::<KError>(file.clone(), data, |data| {
             let builder = ELFHeadersBuilder::new(data).map_err(map_elf_error)?;
-            let range = builder.ph_range();
+            let range = builder.ph_range().map_err(map_elf_error)?;
             if range.end as usize <= data.len() {
                 builder.build(&data[range.start as usize..range.end as usize])
             } else {
@@ -378,7 +464,10 @@ impl ElfLoader {
         let mut data = vec![0; header.file_size as usize];
         let mut pos = header.offset;
         let read = file.read_from(&mut data[..], &mut pos)?;
-        assert_eq!(data.len(), read);
+        if read != data.len() {
+            debug!("Short PT_INTERP read: want={} got={read}", data.len());
+            return Err(KError::InvalidInput);
+        }
 
         let ldso = CStr::from_bytes_with_nul(&data)
             .ok()
@@ -445,7 +534,11 @@ impl ElfLoader {
 
         let elf = map_elf(uspace, kaddr_layout::USER_SPACE_BASE, elf)?;
         let ldso = ldso
-            .map(|elf| map_elf(uspace, kaddr_layout::USER_INTERP_BASE, elf))
+            .map(|entry| {
+                let base = select_interpreter_base(uspace, entry)?;
+                debug!("Mapping interpreter at base {base:#x}");
+                map_elf(uspace, base, entry)
+            })
             .transpose()?;
 
         let entry = VirtAddr::from_usize(
@@ -608,10 +701,14 @@ mod tests {
     use alloc::{borrow::ToOwned, vec};
 
     use khal::paging::MappingFlags;
+    use memaddr::{MemoryAddr, VirtAddr};
     use unittest::def_test;
     use xmas_elf::program::{FLAG_R, FLAG_W, FLAG_X, Flags};
 
-    use super::{ExecRequest, ExecSource, mapping_flags, script_interpreter_args};
+    use super::{
+        ExecRequest, ExecSource, LoadSegment, load_range_for_segments, mapping_flags,
+        script_interpreter_args,
+    };
 
     #[def_test]
     fn test_mapping_flags_sets_user_and_requested_permissions() {
@@ -678,5 +775,63 @@ mod tests {
         assert_eq!(rewritten[2], "/tmp/script.sh");
         assert_eq!(rewritten[3], "arg1");
         assert_eq!(rewritten[4], "arg2");
+    }
+
+    fn load_segment(virtual_addr: usize, mem_size: usize) -> LoadSegment {
+        LoadSegment {
+            virtual_addr,
+            mem_size,
+            align: 0x1000,
+        }
+    }
+
+    #[def_test]
+    fn load_range_covers_every_load_segment() {
+        // Same shape as the shipped musl loader: an RX segment and a far RW one.
+        // The end is page-rounded only; rounding up to the load alignment is
+        // the placement step's job, because `find_free_area` reports an
+        // `align`-aligned start rather than an aligned span end.
+        let segments = [load_segment(0x0, 0xa19f4), load_segment(0xbfb00, 0x3410)];
+        let range = load_range_for_segments(&segments, 0x400_0000).expect("range");
+
+        assert_eq!(range.start.as_usize(), 0x400_0000);
+        assert_eq!(range.end.as_usize(), 0x40c_3000);
+        assert_eq!(range.size(), 0xc_3000);
+        // The placement step reserves an `align`-aligned span, because
+        // `find_free_area` reports an aligned start rather than an aligned end.
+        assert_eq!(
+            VirtAddr::from_usize(range.size())
+                .align_up(0x1_0000usize)
+                .as_usize(),
+            0xd_0000
+        );
+    }
+
+    #[def_test]
+    fn load_range_includes_page_rounding_of_large_bss() {
+        // An 80 MiB BSS in a PIE whose RW segment starts mid-page: the range
+        // must reach past the interpreter hint so placement can detect it.
+        let segments = [load_segment(0x0, 0x974), load_segment(0x10dd0, 0x5000298)];
+        let range = load_range_for_segments(&segments, 0x1000).expect("range");
+
+        assert_eq!(
+            (range.start.as_usize(), range.end.as_usize(), range.size()),
+            (0x1000, 0x501_2000, 0x501_1000)
+        );
+        // The span must cover the fixed interpreter hint that the old loader
+        // used unconditionally.
+        assert!(range.contains(VirtAddr::from_usize(0x400_0000)));
+    }
+
+    #[def_test]
+    fn load_range_rejects_images_without_load_segments() {
+        assert!(load_range_for_segments(&[], 0x400_0000).is_none());
+    }
+
+    #[def_test]
+    fn load_range_rejects_overflowing_segment_end() {
+        let segments = [load_segment(0x0, usize::MAX)];
+
+        assert!(load_range_for_segments(&segments, 0x400_0000).is_none());
     }
 }

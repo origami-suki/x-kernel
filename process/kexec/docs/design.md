@@ -62,12 +62,24 @@ interpreter before replacing the address space.
 
 Commit clears the address space, maps the signal trampoline, and maps PT_LOAD
 segments for the main executable and optional dynamic interpreter. Segment
-virtual/file starts are aligned down to 4 KiB; matching page offsets are asserted.
+virtual/file starts are aligned down to 4 KiB; a mismatching page offset is
+rejected as `InvalidExecutable`.
 `new_file_private_vma` receives file offset and `p_offset + p_filesz` as the
 file-data boundary, preserving prefix, zero-tail, and private-mapping semantics
 through MM rather than implementing a second loader-specific memory owner.
 Auxiliary entries describe the main image and interpreter base; the interpreter
 entry is selected when present.
+
+The main image always loads at `USER_SPACE_BASE`. The interpreter is
+position-independent, so its load bias is a placement decision rather than an
+ELF-provided constant: `load_segments` collects the PT_LOAD placement facts,
+`load_range_for_segments` computes the page-rounded span the image occupies, and
+`select_interpreter_base` asks `MmSpace::find_free_area` for the first free
+start inside `[USER_INTERP_BASE, USER_HEAP_BASE)` that fits, with the reserved
+size rounded up to the first segment's `p_align`. `USER_INTERP_BASE` is
+therefore a preferred hint, not a fixed address; the heap and brk keep their
+fixed placement below and above that window. An image whose pages fill the
+window fails the load with `NoMemory`.
 
 The outer flow maps an anonymous stack, builds argc/argv/env/aux data with
 `app_stack_region`, checks its configured stack capacity, populates/writes pages,
@@ -77,10 +89,17 @@ and maps an anonymous heap. The returned tuple is entry address and user SP.
 
 Preparation failures leave the previous image intact. `MmSpace::clear` is the
 point after which the old image is gone. Mapping, initial-stack construction,
-population, and writes still return errors after that point. The public result
-does not distinguish pre-clear and post-clear failures and provides no rollback;
-callers must not assume an arbitrary `Err` permits resuming the previous image.
-Do not describe this as a fully transactional exec implementation.
+population, writes, and interpreter placement still return errors after that
+point. The public result does not distinguish pre-clear and post-clear failures
+and provides no rollback; callers must not assume an arbitrary `Err` permits
+resuming the previous image. Do not describe this as a fully transactional exec
+implementation.
+
+File-derived ELF metadata reaches no assertion in this crate. A program-header
+table that overflows or declares a zero entry size, a short PT_INTERP read, and a
+PT_LOAD whose page offset disagrees with `p_offset` all become `KError` values.
+Interpreter placement returns `NoMemory` when the interpreter window has no room.
+The remaining panic sites are cache-lifetime `expect` calls, not input handling.
 
 ## Concurrency and cache lifecycle
 
@@ -102,5 +121,6 @@ Common file-private VMA construction keeps ELF mappings aligned with mmap/COW
 ownership. Stack and heap use normal anonymous MM APIs. Metadata work is prepared
 before destructive commit where implemented; fallible MM and stack operations
 remain after it. Known constraints include stale cache contents, cache-entry
-lifetime assumptions across the lock gap, alignment/short-read assertions, and
-no complete exec credential/namespace transaction within this crate.
+lifetime assumptions across the lock gap, an interpreter search window that does
+not fall back above `USER_HEAP_BASE`, and no complete exec credential/namespace
+transaction within this crate.

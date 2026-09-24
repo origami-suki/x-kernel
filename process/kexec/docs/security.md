@@ -18,6 +18,16 @@ headers, PT_LOAD addresses/sizes/flags, PT_INTERP bytes, and script text.
 `SCRIPT_RECURSION_MAX` limits redirect count; interpreter text must be valid
 UTF-8/C-string where applicable. Stack construction checks configured capacity.
 
+ELF-derived placement data is validated rather than trusted. The program-header
+table range is computed with checked arithmetic and a zero entry size is
+rejected, so a hostile `e_phoff`/`e_phentsize` cannot reach a slicing or
+iteration panic. A PT_INTERP short read and a PT_LOAD whose `p_vaddr` page
+offset disagrees with `p_offset` are rejected with `InvalidInput` and
+`InvalidExecutable` respectively. The interpreter load bias is chosen from the
+free address ranges inside the interpreter window instead of a fixed constant,
+so a main image that occupies the preferred address yields `NoMemory` rather
+than a VMA overlap assertion.
+
 There is no direct user-pointer, MMIO, DMA, firmware, FFI call, or assembly here.
 The signing feature delegates TA verification to `tee_task_iface`; MM methods
 own address validation, page population, and safe user-address writes.
@@ -49,8 +59,8 @@ reenter the same lock chain.
 
 | ID | Threat and asset | Severity | Trigger | Response and residual risk |
 |---|---|---|---|---|
-| T-01 | Malformed executable disrupts loading | Medium | Invalid header, script loop, or bad interpreter text | Parser errors become executable/data errors; scripts stop after four redirects and text parsing returns `InvalidInput`. PT_INTERP short-read and page-offset assertions still panic. |
-| T-02 | Excessive file-derived allocation/mapping | Medium | ELF advertises huge ranges or lengths | MM mapping errors propagate and stack payload is size-checked; header/interpreter allocation is not locally quota-bounded and arithmetic/assertion paths remain a denial-of-service risk. |
+| T-01 | Malformed executable disrupts loading | Medium | Invalid header, script loop, or bad interpreter text | Parser errors become executable/data errors; scripts stop after four redirects and text parsing returns `InvalidInput`. Short PT_INTERP reads, page-offset mismatches, a zero program-header entry size, and an overflowing program-header table are rejected with `InvalidInput`/`InvalidExecutable` instead of panicking. |
+| T-02 | Excessive file-derived allocation/mapping | Medium | ELF advertises huge ranges or lengths | MM mapping errors propagate and stack payload is size-checked; header/interpreter allocation is not locally quota-bounded. Placement arithmetic uses checked operations and returns `NoMemory`/`InvalidExecutable`, but a large declared `p_memsz` still consumes real memory once mapped. |
 | T-03 | Resume of a destroyed image | High | Mapping or stack work fails after `MmSpace::clear` | Caller must treat post-clear failure as destructive and cannot resume old user state. The API has no rollback or phase-tagged error. |
 | T-04 | Changed file uses stale metadata | Medium | Executable contents change after caching | Cache keys use path identity and hold files; no content-version invalidation exists. `clear_elf_cache` is explicit, not an automatic coherence protocol. |
 | T-05 | Prepared entry disappears before commit | Medium | Concurrent loads evict it or explicit cache flush runs during lock gap | File references stay valid, but cache lookup uses `expect`; a panic remains possible. No per-request cache-entry pin is implemented. |
@@ -64,8 +74,9 @@ reenter the same lock chain.
 | F-01 | Preparation fails | VFS resolution/open/permission or invalid image | `KResult` error before clear | Old image retained | 3 | Caller reports normal preparation failure. |
 | F-02 | Script recursion exhausted | More than four redirects | `FilesystemLoop` | Exec rejected | 3 | Stop before commit. |
 | F-03 | Post-clear failure | Mapping, population, write, or oversized stack | Partially rebuilt address space | Old image cannot resume | 1 | Caller handles destructive failure; no local rollback. |
-| F-04 | Loader assertion fails | Segment offset mismatch, short PT_INTERP read, missing cache entry | Panic | Kernel service unavailable | 2 | Current assertions expose the assumption; do not claim recoverable validation. |
+| F-04 | Loader assertion fails | Missing cache entry, or a mapped-segment invariant that MM already rejected | Panic | Kernel service unavailable | 2 | File-derived ELF metadata no longer reaches an assertion; the remaining `expect` sites are cache-lifetime assumptions tracked under T-05. |
 | F-05 | Stale cache | File changed without invalidation | Old parsed headers | Wrong load semantics | 2 | Explicit flush only; residual coherence limitation. |
+| F-06 | Interpreter window exhausted | Main image PT_LOAD pages cover the whole `[USER_INTERP_BASE, USER_HEAP_BASE)` window | `NoMemory` after `MmSpace::clear` | Exec rejected; old image cannot resume | 2 | Placement fails as a normal post-clear error; the loader does not fall back to a different region. |
 
 ## Failure management and privacy
 
@@ -82,5 +93,8 @@ not explicitly erase them. The crate does not intentionally log their contents.
 - Keep file-private mappings on the approved MM APIs and align both offsets.
 - Never imply an arbitrary load error leaves the previous address space intact.
 - Reassess cache lifetime across prepare/commit and file-change invalidation.
-- Record all file-derived panic/allocation paths as residual risks.
+- Record all file-derived panic/allocation paths as residual risks. File-derived
+  ELF metadata currently reaches no assertion in this crate; the `expect` calls
+  on cache lookup remain, and `kernel_elf_parser` owns the header-field
+  validation that feeds them.
 - Keep generated self-reference ownership and dependency assumptions visible.

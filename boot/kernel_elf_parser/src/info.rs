@@ -14,8 +14,19 @@ use xmas_elf::{
 
 use crate::auxv::{AuxEntry, AuxType};
 
+/// Incremental builder for [`ELFHeaders`].
+///
+/// The program header table usually lives outside the first block a loader
+/// reads, so the builder is created from the ELF header alone, [`Self::ph_range`]
+/// reports the bytes still needed, and [`Self::build`] parses them.
 pub struct ELFHeadersBuilder<'a>(ELFHeaders<'a>);
 impl<'a> ELFHeadersBuilder<'a> {
+    /// Parses the ELF header at the start of `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parser's message when `input` does not start with a
+    /// supported ELF header.
     pub fn new(input: &'a [u8]) -> Result<Self, &'static str> {
         Ok(Self(ELFHeaders {
             header: xmas_elf::header::parse_header(input)?,
@@ -23,15 +34,47 @@ impl<'a> ELFHeadersBuilder<'a> {
         }))
     }
 
-    pub fn ph_range(&self) -> Range<u64> {
+    /// Byte range of the program header table inside the file.
+    ///
+    /// The range comes from file-derived fields, so it is validated rather than
+    /// trusted: an overflowing or non-representable table is rejected here
+    /// instead of reaching a slicing or iteration panic later. The range is not
+    /// clamped to the file size; the caller decides whether to read more bytes
+    /// or reject the image.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the entry size times the entry count, or that
+    /// product added to the table offset, is not representable in `u64`.
+    pub fn ph_range(&self) -> Result<Range<u64>, &'static str> {
         let start = self.0.header.pt2.ph_offset();
-        let size = self.0.header.pt2.ph_entry_size() as u64 * self.0.header.pt2.ph_count() as u64;
-        start..start + size
+        let entry_size = self.0.header.pt2.ph_entry_size() as u64;
+        let size = entry_size
+            .checked_mul(self.0.header.pt2.ph_count() as u64)
+            .ok_or("program header table size overflow")?;
+        let end = start
+            .checked_add(size)
+            .ok_or("program header table range overflow")?;
+        Ok(start..end)
     }
 
+    /// Parses `ph` as the program header table and finishes the headers.
+    ///
+    /// `ph` must hold at least the range reported by [`Self::ph_range`]. Entries
+    /// past the supplied bytes are dropped by the fixed-size chunking, matching
+    /// a caller that read exactly the requested range.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the header declares a zero program header entry
+    /// size, which cannot be chunked into entries.
     pub fn build(mut self, ph: &[u8]) -> Result<ELFHeaders<'a>, &'static str> {
+        let entry_size = self.0.header.pt2.ph_entry_size() as usize;
+        if entry_size == 0 {
+            return Err("program header entry size is zero");
+        }
         self.0.ph = ph
-            .chunks_exact(self.0.header.pt2.ph_entry_size() as usize)
+            .chunks_exact(entry_size)
             .map(|chunk| match self.0.header.pt1.class() {
                 Class::ThirtyTwo => {
                     let ph: &ProgramHeader32 = zero::read(chunk);

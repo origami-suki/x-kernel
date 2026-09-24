@@ -20,7 +20,9 @@ fn test_elf_parser() {
 
     let builder =
         ELFHeadersBuilder::new(aligned_elf_bytes.as_slice()).expect("Failed to parse ELF header");
-    let range = builder.ph_range();
+    let range = builder
+        .ph_range()
+        .expect("Failed to locate program headers");
     let headers = builder
         .build(&aligned_elf_bytes[range.start as usize..range.end as usize])
         .expect("Failed to parse program headers");
