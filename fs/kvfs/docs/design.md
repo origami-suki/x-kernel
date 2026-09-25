@@ -748,3 +748,11 @@ FIFO 最后一个 open file 关闭时清空 inode pipe slot，`Arc<PipeObject>` 
   `unregister_filesystem()` 生命周期。
 - `FsContext` 只传递一页 opaque mount data；具体 binary/text format 和支持的 option 集合属于
   各 filesystem type。
+
+### Filesystem policy serialization
+
+`VfsInode::lock_data` is also available to filesystem implementations that must
+serialize inode policy changes with generic buffered writes and truncate.
+Memfs uses it when adding seals; write checks execute under the existing generic
+write data lock. Callers run in task context and must not reenter write/truncate
+while holding the guard. Policy storage remains in the filesystem, not KVFS.

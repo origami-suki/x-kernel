@@ -114,3 +114,15 @@
 - setgid 父目录的普通 child GID 和子目录 setgid bit 是否有测试覆盖。
 - filesystem type factory 是否只创建 superblock，而不决定 per-mount flags。
 - sysfs mount 是否始终复用 `new_sysfs(SuperBlockFlags)` 发布的 superblock。
+
+## Seal 约束与并发
+
+seal 位来自用户 fcntl，但限制作用于共享 inode。普通 write/pwrite 的 WRITE、
+FUTURE_WRITE、GROW 检查必须在 KVFS 持有 inode data lock 的回调中完成；truncate
+的 SHRINK/GROW 检查在实际 set_len 修改前完成。seal 添加也取同一 data lock，
+所以 seal 一旦返回成功，后续写入/改变大小不能绕过它。拒绝时保持原 size 和内容。
+锁顺序为 inode data → seal；不得反向调用，也不得持 seal mutex 进行 user copy。
+
+本次未重写 shared mmap/COW，也不以用户态返回 errno 代替数据不变检查。回归
+覆盖实际 VfsFile write/truncate、只允许不增长的写入、同长度 truncate、零长度
+write、WRITE/FUTURE_WRITE，以及已存在共享可写映射与新映射的区别。

@@ -819,7 +819,19 @@ impl FileOperations for MemoryNode {
 
     fn write_iter(&self, iocb: &mut Kiocb<'_>, iter: &mut IovIterSource<'_>) -> VfsResult<usize> {
         self.inode.as_file()?;
-        iocb.generic_file_write_iter(iter)
+        let state = self.inode.shmem_state();
+        let inode = iocb.file().inode().clone();
+        iocb.generic_file_write_iter_with_checks(iter, |pos, count| {
+            if let Some(state) = state {
+                state.check_write_allowed()?;
+                let end = pos
+                    .checked_add(*count as u64)
+                    .ok_or(VfsError::InvalidInput)?;
+                let old_len = inode.size();
+                state.check_resize_allowed(old_len, old_len.max(end))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -872,6 +884,9 @@ impl AddressSpaceOperations for MemoryAddressSpaceOperations {
         let vfs_inode = mapping.inode().ok_or(VfsError::InvalidInput)?;
         let node = vfs_inode.private::<MemoryNode>()?;
         node.inode.as_file()?;
+        if let Some(state) = node.inode.shmem_state() {
+            state.check_resize_allowed(vfs_inode.size(), len)?;
+        }
         node.inode.metadata.lock().size = len;
         mapping.truncate_setsize(len)
     }

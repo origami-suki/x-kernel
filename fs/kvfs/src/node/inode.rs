@@ -1800,7 +1800,14 @@ impl VfsInode {
         self.mapping.truncate_setsize_after_backing_change(len)
     }
 
-    pub(crate) fn lock_data(&self) -> RwLockWriteGuard<'_, ()> {
+    /// Serializes filesystem policy changes with buffered writes and truncation.
+    ///
+    /// Filesystems must take this lock before changing policy (such as memfd
+    /// seals) that their write/truncate callbacks inspect under the same lock.
+    /// This is a blocking, non-reentrant task-context lock, not an IRQ API.
+    /// While holding it, do not call buffered-write or truncate entry points,
+    /// or acquire any lock whose owner may wait for this inode's data lock.
+    pub fn lock_data(&self) -> RwLockWriteGuard<'_, ()> {
         self.data_lock.write()
     }
 

@@ -121,7 +121,7 @@ impl ShmemObjectState {
     }
 
     /// Checks whether ordinary write operations are allowed.
-    fn check_write_allowed(&self) -> VfsResult<()> {
+    pub(super) fn check_write_allowed(&self) -> VfsResult<()> {
         if self
             .seals()
             .intersects(ShmemSealSet::WRITE | ShmemSealSet::FUTURE_WRITE)
@@ -132,7 +132,7 @@ impl ShmemObjectState {
     }
 
     /// Checks whether resizing from `old_len` to `new_len` is allowed.
-    fn check_resize_allowed(&self, old_len: u64, new_len: u64) -> VfsResult<()> {
+    pub(super) fn check_resize_allowed(&self, old_len: u64, new_len: u64) -> VfsResult<()> {
         let seals = self.seals();
         if new_len < old_len && seals.contains(ShmemSealSet::SHRINK) {
             return Err(kvfs::VfsError::OperationNotPermitted);
@@ -354,6 +354,10 @@ pub fn seal_bits_for_location(location: &Path) -> VfsResult<u32> {
 pub fn add_seals_for_location(location: &Path, seal_bits: u32) -> VfsResult<()> {
     let new_seals = ShmemSealSet::from_bits(seal_bits).ok_or(kvfs::VfsError::InvalidInput)?;
     let state = state_for_location(location).ok_or(kvfs::VfsError::InvalidInput)?;
+    let inode = location.inode();
+    // The same lock spans actual buffered writes and truncation, so a seal
+    // cannot be added between their policy check and content/size mutation.
+    let _data_guard = inode.lock_data();
     state.add_seals(new_seals)
 }
 
@@ -607,5 +611,64 @@ mod tests {
             Err(kvfs::VfsError::OperationNotPermitted)
         );
         assert_eq!(check_resize_allowed(location, 4096, 4096), Ok(()));
+    }
+    #[def_test]
+    fn memfd_resize_seals_guard_real_file_operations() {
+        let cred = kcred::initial_cred();
+        let file = create_memfd_file("resize-contract", true, cred.clone())
+            .unwrap()
+            .into_file(cred)
+            .unwrap();
+        file.truncate(4096).unwrap();
+        assert_eq!(file.write_from(b"A", &mut 0), Ok(1));
+        add_seals_for_location(
+            file.path(),
+            (ShmemSealSet::SHRINK | ShmemSealSet::GROW).bits(),
+        )
+        .unwrap();
+        assert_eq!(file.truncate(0), Err(kvfs::VfsError::OperationNotPermitted));
+        assert_eq!(
+            file.truncate(8192),
+            Err(kvfs::VfsError::OperationNotPermitted)
+        );
+        assert_eq!(file.truncate(4096), Ok(()));
+        assert_eq!(file.size(), 4096);
+        assert_eq!(
+            file.write_from(b"XX", &mut 4095),
+            Err(kvfs::VfsError::OperationNotPermitted)
+        );
+        assert_eq!(file.write_from(b"B", &mut 0), Ok(1));
+        let mut byte = [0];
+        assert_eq!(file.read_from(&mut byte, &mut 0), Ok(1));
+        assert_eq!(byte, [b'B']);
+        assert_eq!(file.read_from(&mut byte, &mut 4095), Ok(1));
+        assert_eq!(byte, [0]);
+        assert_eq!(file.size(), 4096);
+    }
+
+    #[def_test]
+    fn memfd_write_seals_guard_real_file_operations() {
+        for seal in [ShmemSealSet::WRITE, ShmemSealSet::FUTURE_WRITE] {
+            let cred = kcred::initial_cred();
+            let file = create_memfd_file("write-contract", true, cred.clone())
+                .unwrap()
+                .into_file(cred)
+                .unwrap();
+            assert_eq!(file.write_from(b"A", &mut 0), Ok(1));
+            add_seals_for_location(file.path(), seal.bits()).unwrap();
+            assert_eq!(
+                file.write_from(b"B", &mut 0),
+                Err(kvfs::VfsError::OperationNotPermitted)
+            );
+            assert_eq!(
+                file.write_from(b"C", &mut 1),
+                Err(kvfs::VfsError::OperationNotPermitted)
+            );
+            assert_eq!(file.write_from(b"", &mut 0), Ok(0));
+            let mut byte = [0];
+            assert_eq!(file.read_from(&mut byte, &mut 0), Ok(1));
+            assert_eq!(byte, [b'A']);
+            assert_eq!(file.size(), 1);
+        }
     }
 }

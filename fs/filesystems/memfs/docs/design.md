@@ -147,3 +147,18 @@ FIFO 和设备 inode 在 VFS open 时安装专用 operation table，不继承该
 
 - inode 释放时，`AddressSpace` 与其私有 `PageCache` 随引用计数释放。
 - 目录删除逻辑由 `InodeRef` 和 nlink 维护。
+
+## Memfd seals 的实际写入边界（M1-004）
+
+`MemoryNode::write_iter` 使用 KVFS 的 `generic_file_write_iter_with_checks`，
+在 inode data lock 内、复制数据之前检查 WRITE/FUTURE_WRITE，以及写入末端超过
+当前 EOF 时的 GROW。零长度写保持通用写路径的行为。truncate 的
+`MemoryAddressSpaceOperations::set_len` 在修改 backing metadata 和发布 i_size 前
+检查 SHRINK/GROW；失败不会改长度或内容，同长度 truncate 仍允许。
+
+`add_seals_for_location` 获取同一个 inode data lock 再添加 seal。生产路径统一
+按 data lock → seal mutex 的次序检查/改变 policy，避免检查成功后并发添加 seal
+而写入仍继续的窗口。seal mutex 不跨 user copy、page-cache 更新或 MM 回调持有。
+映射注册与 F_SEAL_WRITE 的互斥仍由已有 seal mutex / writable_shared_pages 负责。
+真实 VfsFile 单测和同盘 Linux/x-kernel guest 探针同时验证此接线；只测 policy
+helper 无法证明系统调用已经执行这些限制。

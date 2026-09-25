@@ -381,3 +381,11 @@ slot 在 callback 前已经存在，commit 只交换 location 和原位替换 sl
 - shared-file write fault 是否在 address-space invalidate shared lock 和 folio lock 内完成
   filesystem `page_mkwrite` prepare、folio dirty 和 writable PTE publish，且不取得 inode
   exclusive data lock。
+
+### Filesystem policy mutation lock
+
+The public inode data lock lets filesystem policy mutations share the same
+serialization domain as buffered writes/truncate. It is blocking and
+non-reentrant; callers must not hold IRQ/spin locks or reenter operations that
+acquire it. Memfs takes data before its seal mutex. KVFS does not interpret seal
+bits and introduces no filesystem-specific dependency or new unsafe boundary.
