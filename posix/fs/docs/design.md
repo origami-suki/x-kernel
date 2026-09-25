@@ -480,3 +480,14 @@ pathname DAC。这对应 Linux `vfs_truncate()` 与 `do_ftruncate()` 的语义�
    执行。
 8. POSIX ACL 仍未实现权限计算、mode 同步和继承；KExt4 不把 core 中的 opaque ACL bytes
    作为普通 `system.posix_acl_*` xattr 暴露。
+
+### F_DUPFD minimum descriptor number
+
+`F_DUPFD` and `F_DUPFD_CLOEXEC` pass the complete argument to
+`ProcessResources::duplicate_file_from`. The lowest available descriptor at or
+above that argument and below RLIMIT_NOFILE is returned; the commands differ
+only in the new descriptor's CLOEXEC bit. A missing source yields EBADF before
+minimum validation, a negative/out-of-limit argument yields EINVAL, and an
+exhausted valid range yields EMFILE. Shared offsets/status flags remain owned
+by the same VfsFile; no user-space workaround or temporary FD reservations are
+required. Ordinary dup and fixed-target duplication are unchanged.

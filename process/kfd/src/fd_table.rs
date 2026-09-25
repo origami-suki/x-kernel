@@ -144,6 +144,40 @@ impl FdTable {
         self.add(FileDescriptor::new(file, cloexec))
     }
 
+    /// Duplicates `old_fd` into the lowest free number in `min_fd..max_nofile`.
+    ///
+    /// Source lookup and insertion require one exclusive table borrow. The new
+    /// descriptor shares the open file but has the requested close-on-exec bit.
+    /// Existing descriptors above a lowered soft limit do not consume numbers
+    /// in the permitted range.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BadFileDescriptor` for an absent source, before validating the
+    /// minimum. Returns `InvalidInput` when `min_fd >= max_nofile`, otherwise
+    /// `TooManyOpenFiles` if no slot below both the soft limit and capacity is free.
+    pub fn duplicate_from(
+        &mut self,
+        old_fd: c_int,
+        min_fd: usize,
+        max_nofile: u64,
+        cloexec: bool,
+    ) -> KResult<c_int> {
+        let file = self.get_file(old_fd)?;
+        if min_fd as u64 >= max_nofile {
+            return Err(KError::InvalidInput);
+        }
+        let end = max_nofile.min(krlimit::FILE_LIMIT as u64) as usize;
+        // FlattenObjects has no range allocator. This bounded search inspects
+        // at most FILE_LIMIT (1024) slots and never reserves temporary low FDs.
+        let new_fd = (min_fd..end)
+            .find(|&fd| !self.entries.is_assigned(fd))
+            .ok_or(KError::TooManyOpenFiles)?;
+        self.add_at(new_fd, FileDescriptor::new(file, cloexec))
+            .map(|fd| fd as c_int)
+            .map_err(|_| KError::TooManyOpenFiles)
+    }
+
     /// Removes a descriptor from the table.
     ///
     /// # Errors

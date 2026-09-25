@@ -65,3 +65,9 @@ file release.
 - Detach slots before executing close callbacks.
 - Reject attempts to replace a detached owner.
 - Distinguish retained snapshots from current descriptor membership.
+
+`duplicate_file_from` enforces the allowed new descriptor-number range through
+`FdTable::duplicate_from`. Invalid sources precede minimum validation; no slot
+is installed on failure. The owner guard prevents detachment during the
+operation and the write guard serializes source lookup with insertion. Other
+insertion and fixed-slot duplication policies are unchanged.

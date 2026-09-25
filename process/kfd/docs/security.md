@@ -72,3 +72,14 @@ are intentionally stale, and external `Arc`s may delay final close.
 - Preserve per-descriptor flags when cloning tables.
 - Do not authorize current-FD operations from stale snapshots.
 - Validate actual byte initialization at metadata copyout boundaries.
+
+## Minimum-number duplication boundary
+
+`duplicate_from` rejects a missing source with EBADF, an out-of-soft-limit
+minimum with EINVAL, and an exhausted valid range with EMFILE. Source lookup,
+range selection and insertion share one exclusive table borrow. Failures do
+not publish descriptors or retain extra file references. Limits bound new FD
+numbers: already-open high FDs after a limit reduction do not count against
+free low slots. Tests cover holes, flags, reference identity, repeated failures,
+soft-limit reduction and physical capacity. Existing add/fixed-slot policies
+listed above remain limitations outside this F_DUPFD change.

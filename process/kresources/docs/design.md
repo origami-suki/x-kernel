@@ -68,3 +68,8 @@ closes its remaining entries. No custom `ProcessResources::drop` is needed.
 Limits are stored independently from descriptor ownership so they remain
 queryable after files are detached. This is storage and local policy, not an
 enforcement engine for every Linux resource limit.
+
+`duplicate_file_from` supplies the process soft limit to the F_DUPFD range
+allocator while holding the same owner -> table -> limits order as insertion.
+Source lookup and slot publication occur under one table write lock; shared
+open-file state and independent close-on-exec flags are preserved.

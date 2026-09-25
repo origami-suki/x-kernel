@@ -114,8 +114,9 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> KResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
 
     match cmd as u32 {
-        F_DUPFD => dup_fd(fd, false),
-        F_DUPFD_CLOEXEC => dup_fd(fd, true),
+        F_DUPFD | F_DUPFD_CLOEXEC => kprocess::current_resources()
+            .duplicate_file_from(fd, arg, cmd as u32 == F_DUPFD_CLOEXEC)
+            .map(|new_fd| new_fd as isize),
         F_SETLK | F_SETLKW => Ok(0),
         F_OFD_SETLK | F_OFD_SETLKW => Ok(0),
         F_GETLK | F_OFD_GETLK => {

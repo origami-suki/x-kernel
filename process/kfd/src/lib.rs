@@ -168,6 +168,88 @@ mod tests {
     }
 
     #[def_test]
+    fn test_duplicate_from_selects_range_and_shares_file() {
+        let mut table = FdTable::default();
+        let file = snapshot_test_file();
+        let source = table.add_file(128, file.clone(), true).unwrap();
+        assert_eq!(table.duplicate_from(source, 64, 128, false), Ok(64));
+        assert_eq!(table.duplicate_from(source, 64, 128, true), Ok(65));
+        assert!(Arc::ptr_eq(&table.get_file(64).unwrap(), &file));
+        assert_eq!(table.cloexec(source), Ok(true));
+        assert_eq!(table.cloexec(64), Ok(false));
+        assert_eq!(table.cloexec(65), Ok(true));
+        table.file_close_fd_locked(64).unwrap().close().unwrap();
+        assert_eq!(table.duplicate_from(source, 64, 128, false), Ok(64));
+        assert_eq!(table.duplicate_from(source, 0, 128, false), Ok(1));
+    }
+
+    #[def_test]
+    fn test_duplicate_from_validates_source_then_minimum_without_leaks() {
+        use kerrno::KError;
+        let mut table = FdTable::default();
+        let file = snapshot_test_file();
+        let source = table.add_file(128, file.clone(), false).unwrap();
+        let refs = Arc::strong_count(&file);
+        for _ in 0..3 {
+            assert_eq!(
+                table.duplicate_from(-1, usize::MAX, 128, false),
+                Err(KError::BadFileDescriptor)
+            );
+            assert_eq!(
+                table.duplicate_from(2, 128, 128, false),
+                Err(KError::BadFileDescriptor)
+            );
+            assert_eq!(
+                table.duplicate_from(source, usize::MAX, 128, false),
+                Err(KError::InvalidInput)
+            );
+            assert_eq!(
+                table.duplicate_from(source, 128, 128, false),
+                Err(KError::InvalidInput)
+            );
+            assert_eq!(
+                table.duplicate_from(source, 0, 0, false),
+                Err(KError::InvalidInput)
+            );
+            assert_eq!(
+                table.duplicate_from(source, krlimit::FILE_LIMIT, u64::MAX, false),
+                Err(KError::TooManyOpenFiles)
+            );
+            assert_eq!(table.count(), 1);
+            assert_eq!(Arc::strong_count(&file), refs);
+        }
+    }
+
+    #[def_test]
+    fn test_duplicate_from_bounds_numbers_instead_of_occupied_count() {
+        use kerrno::KError;
+        let mut table = FdTable::default();
+        let source = table.add_file(128, snapshot_test_file(), false).unwrap();
+        for fd in 100..128 {
+            assert_eq!(table.duplicate_from(source, fd, 128, false), Ok(fd as i32));
+        }
+        assert_eq!(
+            table.duplicate_from(source, 100, 128, false),
+            Err(KError::TooManyOpenFiles)
+        );
+        assert_eq!(table.duplicate_from(source, 1, 2, false), Ok(1));
+        assert_eq!(
+            table.duplicate_from(source, 0, 2, false),
+            Err(KError::TooManyOpenFiles)
+        );
+        table.file_close_fd_locked(110).unwrap().close().unwrap();
+        assert_eq!(table.duplicate_from(source, 100, 128, true), Ok(110));
+        assert_eq!(
+            table.duplicate_from(source, 1023, u64::MAX, false),
+            Ok(1023)
+        );
+        assert_eq!(
+            table.duplicate_from(source, 1023, u64::MAX, false),
+            Err(KError::TooManyOpenFiles)
+        );
+    }
+
+    #[def_test]
     fn test_fd_table_drop_closes_remaining_descriptors() {
         let flushes = Arc::new(AtomicUsize::new(0));
         let mut table = FdTable::default();

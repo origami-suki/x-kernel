@@ -272,3 +272,13 @@ kfd resources / kvfs / device and pipe implementations
 - [ ] 新增日志不输出文件内容或敏感用户缓冲区。
 - [ ] xattr list 是否逐项检查累计长度、只使用一个输出缓冲区，并在 `size == 0` 时只计数？
 - [ ] 若修复当前已知限制，同步更新本文和 `design.md`。
+
+### F_DUPFD range enforcement
+
+F_DUPFD/F_DUPFD_CLOEXEC no longer discard the minimum argument. The resources
+layer performs source validation and range allocation under one table lock.
+The user-controlled minimum cannot overwrite occupied slots, allocate beyond
+the soft limit, or leak a descriptor on failure. Negative arguments arrive as
+out-of-range unsigned syscall values and are rejected with EINVAL after source
+validation. Dynamic/static guest probes check Linux errno precedence, CLOEXEC
+across exec, shared offsets/status flags, exhaustion, holes and lowered limits.

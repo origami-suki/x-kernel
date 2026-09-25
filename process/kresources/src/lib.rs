@@ -201,6 +201,29 @@ impl ProcessResources {
         self.add_file(file, cloexec)
     }
 
+    /// Duplicates a descriptor at or above `min_fd`, below `RLIMIT_NOFILE`.
+    ///
+    /// Requires task context. Source lookup and allocation hold one table write
+    /// lock; the limit is sampled under the existing owner -> table -> limits
+    /// lock order. Open-file state is shared, descriptor flags are independent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoSuchProcess` after detachment. Propagates `BadFileDescriptor`,
+    /// `InvalidInput`, or `TooManyOpenFiles` from [`FdTable::duplicate_from`].
+    pub fn duplicate_file_from(
+        &self,
+        fd: c_int,
+        min_fd: usize,
+        cloexec: bool,
+    ) -> kerrno::KResult<c_int> {
+        self.with_fd_table(|table| {
+            table
+                .write()
+                .duplicate_from(fd, min_fd, self.max_nofile(), cloexec)
+        })
+    }
+
     /// Duplicates a descriptor into a fixed slot.
     ///
     /// The table capacity is checked, but this method does not apply `RLIMIT_NOFILE`.

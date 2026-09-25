@@ -83,3 +83,12 @@ Merely dropping that value releases its `Arc` but is not the explicit descriptor
 flush operation. `FdTable::drop` removes and closes all remaining descriptors,
 ignoring individual close errors so one failure cannot prevent other cleanup.
 A snapshot or cloned table owner can intentionally delay final file release.
+
+## Minimum-number duplication
+
+`duplicate_from` implements the F_DUPFD range contract under one exclusive
+table borrow. It validates the source before the minimum, then selects the
+lowest free number in `[min_fd, min(RLIMIT_NOFILE, FILE_LIMIT))`. No temporary
+FDs are installed and no occupied entry is replaced. A bounded scan is used
+because FlattenObjects 0.2.4 exposes no range allocator; at most 1024 slots are
+inspected. Ordinary add/dup and fixed-slot dup retain their existing policies.
