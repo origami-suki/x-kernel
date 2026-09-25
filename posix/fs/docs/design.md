@@ -491,3 +491,10 @@ minimum validation, a negative/out-of-limit argument yields EINVAL, and an
 exhausted valid range yields EMFILE. Shared offsets/status flags remain owned
 by the same VfsFile; no user-space workaround or temporary FD reservations are
 required. Ordinary dup and fixed-target duplication are unchanged.
+
+### Unknown fcntl commands
+
+The fallback validates the source descriptor, then returns EINVAL for an
+unknown command. Missing descriptors return EBADF first. No file or descriptor
+state is changed; the warning remains available to unsupported-interface
+inventory tools. This does not implement the separately listed file locks.

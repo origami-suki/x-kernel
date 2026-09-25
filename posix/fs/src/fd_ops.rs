@@ -170,8 +170,10 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> KResult<isize> {
             Ok(0)
         }
         _ => {
+            // Linux validates the source before rejecting an unknown command.
+            kprocess::current_resources().get_file(fd)?;
             warn!("unsupported fcntl parameters: cmd: {cmd}");
-            Ok(0)
+            Err(KError::InvalidInput)
         }
     }
 }

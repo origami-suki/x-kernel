@@ -193,7 +193,7 @@ kfd resources / kvfs / device and pipe implementations
 | F-07 | `mount` 请求未知文件系统类型或无效 backing source | 名称未注册，或 source 不是可用 block-special path | 返回 `NoSuchDevice`、`ENOTBLK`、`ENXIO` 等对应错误 | 用户态 mount 失败 | 3 | 按 KVFS registry 精确查找；nodev/device-backed 类型统一经 `FsContext`，设备 source 由 `get_tree_bdev` 校验 |
 | F-08 | `syncfs` 目标不是文件或目录 | fd 指向 pipe/socket/设备 | 返回 `InvalidInput` | 当前同步请求失败 | 4 | downcast 后只 flush 文件系统对象 |
 | F-09 | `copy_file_range` 语义不完整 | 重叠和普通文件检查 TODO | 可能出现与 Linux 不一致的数据结果 | 相关应用复制行为异常 | 2 | 非零 flags 显式拒绝；其余限制实现前需要补充测试 |
-| F-10 | `fcntl` unsupported cmd 返回成功 | 兼容占位 | 应用误判某些控制操作已生效 | 可能产生行为差异 | 2 | warning 记录；有安全影响的命令应显式实现或拒绝 |
+| F-10 | `fcntl` unsupported cmd | 未实现或未知命令 | 有效 FD 返回 EINVAL，坏 FD 优先 EBADF | 应用可识别不支持并回退 | 2 | warning 记录有效 FD 上的未知命令；不修改 FD 状态 |
 | F-11 | `close_range(UNSHARE)` 无法取得 files owner | 进程退出已脱离 fd table owner | `unshare_fd_table` 返回 `NoSuchProcess` | 当前 syscall 失败，已脱离的 fd table 不会被重新安装 | 3 | `sys_close_range` 通过 `?` 将资源层错误传播为用户态 syscall 错误 |
 | F-12 | FIEMAP 输出容量不足或中途遇到坏用户页 | 调用者提供较小数组或不可写地址 | 返回已统计数量或 `BadAddress` | 当前查询失败，文件系统状态不变 | 3 | `FiemapExtentInfo` 达到容量后正常停止；writer 每项通过 `UserPtr` 写入并传播 copy fault |
 | F-13 | mount data 复制失败 | 首字节不可读，或整页读取失败后逐字节恢复也无法读取首字节 | `mount(2)` 在创建 superblock 前返回 `BadAddress` | 当前挂载不发生，不留下部分 topology | 3 | 先尝试整页复制，失败后恢复可读前缀并零填充尾部；只有零字节可读时传播错误 |
@@ -213,9 +213,9 @@ kfd resources / kvfs / device and pipe implementations
 - `WouldBlock`、`WriteZero`、`BrokenPipe` 等 I/O 错误由底层对象传播。
 - 对常见探测型 ioctl 失败，例如非终端 fd 上的 `TCGETS` / `TIOCGWINSZ`，
   不记录 warning，避免日志噪声。
-- 对不支持的 `fcntl` 参数当前记录 warning 但返回成功，
-  这是兼容占位，不应扩展到有安全影响的新命令。`F_ADD_SEALS` 和
-  `F_GET_SEALS` 已显式接入 shmem object state。
+- 未知 `fcntl` 命令先查验源 FD，坏 FD 返回 EBADF；有效 FD 记录 warning 后
+  返回 EINVAL，不再静默成功。已识别的文件锁命令仍有上文列出的占位限制。
+  `F_ADD_SEALS` 和 `F_GET_SEALS` 已显式接入 shmem object state。
 - 本 crate 没有统一重试机制；
   用户态或上层 syscall 调度负责根据 errno 决定重试。
 
