@@ -128,9 +128,14 @@ pub fn sys_getcpu(cpu: UserPtr<u32>, node: UserPtr<u32>, tcache: usize) -> KResu
     Ok(0)
 }
 
-/// Returns the current scheduler policy.
+/// Returns the selected thread's scheduler policy (`pid` 0 selects the caller).
+///
+/// # Errors
+///
+/// Returns `InvalidInput` for a negative TID and `NoSuchProcess` for an
+/// unpublished nonzero TID. Requires a current user thread.
 pub fn sys_sched_getscheduler(pid: i32) -> KResult<isize> {
-    let task = scheduler_target(pid)?;
+    let task = scheduler_query_target(pid)?;
 
     Ok(task
         .as_thread()
@@ -150,9 +155,18 @@ pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: UserConstPtr<()>) ->
     Ok(0)
 }
 
-/// Returns scheduler parameters.
+/// Returns the selected thread's scheduler parameters (`pid` 0 selects the caller).
+///
+/// # Errors
+///
+/// Rejects a negative TID or null `param` with `InvalidInput` before lookup,
+/// then returns `NoSuchProcess` for an unpublished nonzero TID or `BadAddress`
+/// if writing the result fails. Requires a current user thread.
 pub fn sys_sched_getparam(pid: i32, param: UserPtr<()>) -> KResult<isize> {
-    let task = scheduler_target(pid)?;
+    if param.is_null() {
+        return Err(KError::InvalidInput);
+    }
+    let task = scheduler_query_target(pid)?;
     let param = param.cast::<SchedParam>();
 
     param.write_vm(SchedParam {
@@ -292,6 +306,13 @@ fn scheduler_target(pid: i32) -> KResult<ktask::KtaskRef> {
     kprocess::scheduler::target_task(pid)
 }
 
+fn scheduler_query_target(pid: i32) -> KResult<KtaskRef> {
+    let tid = u32::try_from(pid).map_err(|_| KError::InvalidInput)?;
+    // Queries select the exact thread, including the leader when given a TGID.
+    // Do not extend the setters' target scope without checking their permissions.
+    kprocess::scheduler::task_by_tid(tid)
+}
+
 fn configured_scheduler_policy() -> u32 {
     if kbuild_config::KFEAT_SCHED_FIFO {
         SCHED_FIFO
@@ -427,8 +448,42 @@ mod tests {
 
     use super::{
         affinity_target, check_affinity_permission, check_setpriority_permission,
-        prepare_setaffinity_target,
+        prepare_setaffinity_target, scheduler_query_target, sys_sched_getparam,
+        sys_sched_getscheduler,
     };
+
+    #[def_test]
+    fn scheduler_queries_reject_negative_tid_before_user_access() {
+        for tid in [-1, i32::MIN] {
+            assert_eq!(sys_sched_getscheduler(tid), Err(KError::InvalidInput));
+            assert_eq!(
+                sys_sched_getparam(tid, 1usize.into()),
+                Err(KError::InvalidInput)
+            );
+        }
+    }
+
+    #[def_test]
+    fn scheduler_getparam_null_precedes_missing_tid() {
+        assert_eq!(
+            sys_sched_getparam(i32::MAX, 0usize.into()),
+            Err(KError::InvalidInput)
+        );
+        assert_eq!(sys_sched_getscheduler(i32::MAX), Err(KError::NoSuchProcess));
+        assert_eq!(
+            sys_sched_getparam(i32::MAX, 1usize.into()),
+            Err(KError::NoSuchProcess)
+        );
+    }
+
+    #[def_test(user, serial)]
+    fn scheduler_queries_zero_and_current_tid_select_caller() {
+        let via_zero = scheduler_query_target(0).expect("zero selects caller");
+        let tid = kprocess::current_user_tid() as i32;
+        let via_tid = scheduler_query_target(tid).expect("published caller TID");
+        assert!(current().ptr_eq(&via_zero));
+        assert!(current().ptr_eq(&via_tid));
+    }
 
     fn assert_affinity_err<T>(result: Result<T, KError>, expected: KError) {
         match result {

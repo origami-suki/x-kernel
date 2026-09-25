@@ -95,6 +95,12 @@ copy wrappers.
 
 ## Audit checklist
 
+- Scheduler policy/parameter queries use the published TID directory and hold
+  an owned task reference across the read. They never replace a missing TID
+  with a process representative. Output uses `UserPtr` after argument and
+  target checks. The existing scheduler setters still need a separate target
+  and permission audit; accepting a TID for read access does not authorize
+  scheduler state changes.
 - cgroup/namespace flags may leave the `ENOSYS` list only when fully
   implemented; adapters do not create a second membership or namespace-view
   state.

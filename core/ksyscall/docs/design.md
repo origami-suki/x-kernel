@@ -161,6 +161,13 @@ ksyscall::dispatch_irq_syscall
 - `task/sched.rs`: `sched_yield` / `sched_*affinity` / `sched_*scheduler` /
   `getcpu` / `getpriority` / `setpriority`; owners in `ktask` scheduling
   interfaces, `kprocess` process/thread state, and `khal` CPU queries.
+  `sched_getscheduler` and `sched_getparam` resolve an exact published TID
+  through `kprocess::scheduler::task_by_tid`; zero selects the caller and a
+  process ID selects its leader, even when queried by a sibling thread.
+  Negative TIDs and null `sched_getparam` output pointers return EINVAL before
+  lookup, absent TIDs return ESRCH, and failed output writes return EFAULT.
+  These query adapters do not change the setters' existing target resolution
+  or scheduler implementation.
   `PRIO_PROCESS` selects one task by TID; `PRIO_PGRP` and `PRIO_USER`
   iterate every published task — a process representative thread must not
   stand in for per-thread nice or real UID. `setpriority` compares the
