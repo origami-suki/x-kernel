@@ -85,6 +85,14 @@ retains init identity; orphan reparenting reserves an init relation slot.
 - `TaskStat`, `system_view`, nice/scheduler and CPU-accounting APIs provide
   procfs/scheduler snapshots rather than owning hardware scheduling policy.
 
+CPU accounting uses `Inactive`, `Kernel`, and `User` states, following Linux
+generic vtime. Switch-out settles the interval; switch-in starts kernel time.
+User transitions are marked at `UserContext::run` boundaries before IRQ dispatch.
+Sampling settles the elapsed interval under `SpinNoPreempt`, advancing
+`last_wall` so later samples cannot count the same interval again.
+The existing exit flag prevents restarting finalized accounting during cleanup.
+Separate IRQ/steal/guest accounting remains outside this model.
+
 ## Execution context and calling constraints
 
 Construction, fork, runtime capability acquisition, publication, cgroup migration
@@ -184,8 +192,8 @@ references and then observes them under the domain read lock. Tree/member/group
 locks protect local containers; cross-object invariants require the domain token.
 Session terminal and group lists have their own IRQ-safe spin locks.
 
-Runtime fs/ns slots and exec metadata use RwLock; mm-user state, CPU accounting,
-scheduler state and timers use mutexes. Thread credential commit takes objective
+Runtime fs/ns slots and exec metadata use RwLock; mm-user state, scheduler
+state and timers use mutexes. CPU accounting uses SpinNoPreempt. Thread credential commit takes objective
 then subjective credential write locks and asserts the pointers were not
 independently overridden. CPU totals use relaxed nanosecond atomics and are
 observational counters, not publication barriers. Heap and thread control fields
