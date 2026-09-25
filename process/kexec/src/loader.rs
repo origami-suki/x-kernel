@@ -345,6 +345,27 @@ fn load_range_for_segments(segments: &[LoadSegment], base: usize) -> Option<Virt
     ))
 }
 
+/// Bytes that must stay free for `segments` to be mapped at a chosen base.
+///
+/// `span` is computed with the preferred base, but the image does not start
+/// there: its first mapped page sits `align_down(virtual_addr)` bytes above the
+/// bias. The reserved region therefore has to start at the bias rather than at
+/// the image's first page, so `offset(span.start, base)` must be covered too.
+///
+/// Reserving only `span.size()` lets the search return a region whose tail the
+/// image then maps over: a main image that leaves one free page before an
+/// occupied one makes the search report that page as usable, while the
+/// interpreter's first segment maps into the occupied page.
+///
+/// Returns `None` when the span starts below `base` or the size overflows.
+fn placement_reservation(span: VirtAddrRange, base: usize, align: usize) -> Option<usize> {
+    let normalized_offset = span.start.as_usize().checked_sub(base)?;
+    let unaligned = normalized_offset.checked_add(span.size())?;
+    // Checked rounding: `align_up` panics on overflow, and both the offset and
+    // the size come from the file.
+    Some(unaligned.checked_add(align - 1)? & !(align - 1))
+}
+
 /// Chooses a free load bias for the dynamic interpreter.
 ///
 /// The interpreter is position-independent, so its bias is a placement
@@ -367,7 +388,8 @@ fn select_interpreter_base(uspace: &MmSpace, entry: &ElfCacheEntry) -> KResult<u
         .map_or(PAGE_SIZE_4K, |segment| segment.align.max(PAGE_SIZE_4K));
     // `find_free_area` only reports a free start address that is itself
     // `align`-aligned, so the reserved size must cover the same rounding.
-    let size = VirtAddr::from_usize(span.size()).align_up(align).as_usize();
+    let size =
+        placement_reservation(span, hint.as_usize(), align).ok_or(KError::InvalidExecutable)?;
 
     uspace
         .find_free_area(hint, size, limit, align)
@@ -717,7 +739,7 @@ mod tests {
 
     use super::{
         ExecRequest, ExecSource, LoadSegment, load_range_for_segments, mapping_flags,
-        script_interpreter_args,
+        placement_reservation, script_interpreter_args,
     };
 
     #[def_test]
@@ -893,6 +915,84 @@ mod tests {
         // The span must cover the fixed interpreter hint that the old loader
         // used unconditionally.
         assert!(range.contains(VirtAddr::from_usize(0x400_0000)));
+    }
+
+    /// A free-region search that also reports the region it verified.
+    ///
+    /// `MmSpace::find_free_area` returns only the chosen start address, so a
+    /// test cannot see which interval it confirmed free. This mirror keeps that
+    /// interval, which is what the placement contract is about.
+    fn search_free_region(
+        occupied: &[(usize, usize)],
+        hint: usize,
+        size: usize,
+    ) -> (usize, usize, usize) {
+        let mut last_end = hint;
+        for (start, occupied_size) in occupied {
+            if last_end + size <= *start {
+                return (last_end, last_end, last_end + size);
+            }
+            last_end = last_end.max(start + occupied_size);
+        }
+        (last_end, last_end, last_end + size)
+    }
+
+    /// Placement must map only inside the free region it verified.
+    ///
+    /// Reserving `align_up(span.size())` is enough only while the image starts
+    /// at the bias. When the first mapped page sits one page above the bias,
+    /// the reservation verifies one page too few, and the image is placed
+    /// partly outside the region the search confirmed. The mapped page can
+    /// still be free today, because a smaller reservation only makes the search
+    /// return a later address, but the placement no longer matches its own
+    /// precondition and nothing in the search enforces it.
+    #[def_test]
+    fn placement_reserves_the_region_it_verifies() {
+        let base = 0x0400_0000usize;
+        let align = 0x1000usize;
+        // Interpreter: one segment whose first mapped page is above the bias.
+        let segments = [LoadSegment {
+            virtual_addr: 0x1000,
+            mem_size: 0x1000,
+            align,
+        }];
+        let span = load_range_for_segments(&segments, base).expect("span");
+        assert_eq!(span.start.as_usize(), 0x0400_1000);
+        assert_eq!(span.size(), 0x1000);
+
+        // Main image leaves two free pages and then occupies the third, so a
+        // reservation is placed where the offset actually decides the outcome.
+        let occupied = [(base + 0x2000, 0x1000)];
+
+        let previous_size = align_up(span.size(), align);
+        let (previous_bias, previous_lo, previous_hi) =
+            search_free_region(&occupied, base, previous_size);
+        let previous_mapped =
+            load_range_for_segments(&segments, previous_bias).expect("previous mapping");
+        assert_eq!(previous_bias, base);
+
+        let size = placement_reservation(span, base, align).expect("reservation");
+        assert_eq!(size, 0x2000);
+        let (bias, verified_lo, verified_hi) = search_free_region(&occupied, base, size);
+        let mapped = load_range_for_segments(&segments, bias).expect("mapping");
+
+        assert!(
+            verified_lo <= mapped.start.as_usize() && mapped.end.as_usize() <= verified_hi,
+            "mapped {:#x}..{:#x} escapes the verified free region \
+             {verified_lo:#x}..{verified_hi:#x}",
+            mapped.start.as_usize(),
+            mapped.end.as_usize()
+        );
+        assert!(
+            previous_mapped.start.as_usize() < previous_lo
+                || previous_hi < previous_mapped.end.as_usize(),
+            "the offset-free reservation must escape its verified region, otherwise this \
+             regression does not exercise the defect"
+        );
+    }
+
+    fn align_up(value: usize, align: usize) -> usize {
+        (value + align - 1) & !(align - 1)
     }
 
     #[def_test]
