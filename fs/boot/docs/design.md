@@ -92,3 +92,16 @@ registry，root 格式由 registry 探测结果决定。
 - cgroup2 hierarchy 的启动挂载属于 feature-controlled boot policy；`mini-oci` 等用户态
   消费者不负责初始化宿主机全局 hierarchy。
 - boot 负责递归创建其声明拥有的 mountpoint；KVFS mount helper 只挂载已解析目录。
+
+## DRM 启动期设备发现
+
+在 devtmpfs 和 sysfs 已挂载后，boot 检查真实 `/dev/dri/card0` 字符节点，
+从其 inode rdev 取得 major/minor，再发布 `/sys/devices/virtual/drm/card0` 的
+`dev`、`uevent`，以及 `/sys/class/drm/card0`、`/sys/dev/char/<major>:<minor>`
+和 subsystem 链接。卡节点不存在就不导出，其他异常正常传播。
+
+这是 x-kernel 虚拟 DRM adapter 的启动期描述，既不伪造 PCI vendor/device，
+也不将底层 virtio GPU 冒充完整 Linux PCI/sysfs 实现。libudev 可用这些事实
+定位已有设备节点，再通过真实 ioctl 检查 KMS 能力。属性权限 0444；目录 0755。
+当前 sysfs 仍是既有 memfs，尚无 kernfs 或设备移除/热插拔更新能力；输入设备发现
+不在此改动内。对应故障是 Weston 的 no drm device found，后续协议和像素仍须实测。

@@ -245,6 +245,8 @@ impl BootVfs {
         }
         self.create_sys_graphics_links()
             .expect("Failed to create sys graphics links");
+        self.create_sys_drm_links()
+            .expect("Failed to publish DRM device discovery");
 
         if let Err(err) = devfs::bind_dev_log() {
             if err != kerrno::LinuxError::ENOSYS && err != kerrno::LinuxError::EOPNOTSUPP {
@@ -311,6 +313,70 @@ impl BootVfs {
             &self.root,
             &self.root,
         )?;
+        Ok(())
+    }
+
+    /// Publish the existing virtual DRM adapter, not an invented PCI device.
+    /// libudev needs a /sys/devices path, subsystem/class links, and the same
+    /// device number/name exposed by devtmpfs. This is a boot-time snapshot;
+    /// dynamic hotplug and input enumeration are separate capabilities.
+    fn create_sys_drm_links(&self) -> kvfs::VfsResult<()> {
+        let card = match self.lookup("/dev/dri/card0") {
+            Ok(card) => card,
+            Err(error) if error.canonicalize() == kvfs::VfsError::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if card.node_type() != kvfs::NodeType::CharacterDevice {
+            return Err(kvfs::VfsError::NoSuchDevice);
+        }
+        let number = card.inode().rdev();
+        let device = "/sys/devices/virtual/drm/card0";
+        for path in [device, "/sys/class/drm", "/sys/dev/char"] {
+            self.ensure_directory_path(path)?;
+        }
+        let cred = kcred::initial_cred();
+        let attributes = [
+            (
+                format!("{device}/dev"),
+                format!("{}:{}\n", number.major(), number.minor()),
+            ),
+            (
+                format!("{device}/uevent"),
+                format!(
+                    "MAJOR={}\nMINOR={}\nDEVNAME=dri/card0\n",
+                    number.major(),
+                    number.minor()
+                ),
+            ),
+        ];
+        for (path, value) in attributes {
+            let file = Filename::new(path).open_with_flags_at(
+                &self.root,
+                &self.root,
+                (kvfs::OpenFlags::CREATE | kvfs::OpenFlags::TRUNCATE | kvfs::OpenFlags::WRITE_ONLY)
+                    .bits(),
+                NodePermission::from_bits_truncate(0o444),
+                NodePermission::empty(),
+                cred.clone(),
+            )?;
+            if file.write(value.as_bytes())? != value.len() {
+                return Err(kvfs::VfsError::Io);
+            }
+        }
+        let links = [
+            (format!("{device}/subsystem"), "../../../../class/drm"),
+            (
+                "/sys/class/drm/card0".into(),
+                "../../devices/virtual/drm/card0",
+            ),
+            (
+                format!("/sys/dev/char/{}:{}", number.major(), number.minor()),
+                "../../devices/virtual/drm/card0",
+            ),
+        ];
+        for (path, target) in links {
+            Filename::new(path).symlink_at(&self.root, &self.root, target, &cred)?;
+        }
         Ok(())
     }
 

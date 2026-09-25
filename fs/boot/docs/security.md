@@ -94,3 +94,14 @@ root/关键虚拟文件系统失败会停止启动，避免在不完整 namespac
 - 新启动 mount 的 flags 是否写入 `Mount`；`/dev` 是否保持可访问设备节点？
 - 真实 root mount 失败是否在启动用户态前终止，并保留明确错误？
 - backing device 生命周期是否由 mount/session handle 持有，而不是在 boot 复制状态？
+
+## DRM 发现信息边界
+
+导出的设备号必须来自真实字符节点的 inode，不能由 rootfs 中的任意普通文件决定。
+只有 boot 串行初始化写入固定命名空间；写入不完整或链接失败不能静默标记初始化成功。
+这些 metadata 仅支持设备发现，不赋予打开设备、DRM master 或 seat 权限。
+libudev/Weston 随后仍须打开 `/dev/dri/card0` 并经过原有 VFS/设备操作。
+
+本次不引入 unsafe 或具体 PCI 驱动依赖。sysfs 沿用 memfs，0444 防止普通用户更改
+属性，但不宣称具有完整 kernfs 的不可修改属性及热插拔生命周期。GPU 移除场景仍需
+后续同步注册机制，不能把启动快照当作实时设备清单。
