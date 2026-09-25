@@ -218,8 +218,15 @@ impl<'a> CMsgBuilder<'a> {
         };
         write_vm_mem(self.hdr.as_ptr().cast_mut(), core::slice::from_ref(&hdr))?;
 
-        self.hdr = UserPtr::from(self.hdr.as_ptr() as usize + cmsg_len);
-        *self.len += cmsg_len;
+        // CMSG_NXTHDR advances by native-word alignment; msg_controllen
+        // includes available trailing padding, while cmsg_len excludes it.
+        let aligned_len = cmsg_len
+            .checked_add(size_of::<usize>() - 1)
+            .ok_or(KError::InvalidInput)?
+            & !(size_of::<usize>() - 1);
+        let used = aligned_len.min(remaining);
+        self.hdr = UserPtr::from(self.hdr.as_ptr() as usize + used);
+        *self.len += used;
         Ok(true)
     }
 }

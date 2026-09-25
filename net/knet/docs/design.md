@@ -914,3 +914,31 @@ Implementation details: [packet.rs](../src/link/packet.rs), [rtnetlink.rs](../sr
 | vsock transport removal | Clears device/transport state, closes tracked connections, wakes connection/listener/credit waiters, clears listen and bridge-event queues, and resets polling references. Existing socket references retain connection entries until cleanup. |
 | vsock stream drop | Shuts down the connection and removes its manager entry. |
 | Bridge connection close | Removes the bridge entry and TIPC handle-set registration, closes the channel, and disconnects vsock. Disconnect/abort wakes credit waiters before removing the manager entry. Reverse TIPC ports remain registered for the global bridge runtime's lifetime. |
+
+### Unix STREAM ancillary byte ownership (M1-004)
+
+The existing byte rings remain the payload storage. Each direction also has a
+shared `StreamControl` mutex with wrapping read/write byte positions and a FIFO
+of ancillary records. A record covers the first published byte chunk of a
+sendmsg; a partial send transfers its references exactly once. A zero-byte send
+never queues references. The POSIX boundary resolves SCM_RIGHTS to owned file
+references; transport does not interpret descriptor numbers.
+
+Send copies into the producer's vacant slices before acquiring control metadata.
+It reserves metadata capacity before taking the short `tx_order` spinlock, then
+publishes record and byte index under that ordering point. Receive snapshots
+published byte count and the first record's end while holding the metadata
+mutex, releases it for user copies, and bounds the copy to that snapshot. On
+consumption it removes a record once at least its first byte was read. The next
+read can merge the remaining plain bytes with later data. This implements the
+ancillary barrier described by Linux unix(7) without packetizing ordinary writes.
+
+Lock order is local channel mutex, directional control mutex, then producer
+`tx_order`. User copies and reference destruction never run under the control or
+directional spin lock. Receiver close marks RX closed under the same producer
+ordering, detaches the pending records, and drops references outside those locks;
+the sender may remain alive. Plain read discards consumed ancillary references.
+The existing EOF/publication and shutdown ordering remains in force.
+
+This change does not add non-consuming Unix MSG_PEEK support or garbage
+collection for cycles formed by passing Unix sockets through other Unix sockets.

@@ -25,8 +25,8 @@ use kvfs::VfsFile;
 use linux_raw_sys::{
     general::timespec,
     net::{
-        MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_PEEK, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET,
-        cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+        MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_PEEK, MSG_TRUNC, SCM_RIGHTS,
+        SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
 use osvm::{VirtPtr, VmBytes, VmBytesMut, write_vm_mem};
@@ -61,6 +61,7 @@ fn parse_send_cmsgs(
     control_len: usize,
 ) -> KResult<Vec<AncillaryData>> {
     let mut ancillary = Vec::new();
+    let mut rights = Vec::new();
     if control_ptr == 0 || control_len == 0 {
         return Ok(ancillary);
     }
@@ -79,10 +80,22 @@ fn parse_send_cmsgs(
             return Err(KError::InvalidInput);
         }
 
-        ancillary.push(Box::new(CMsg::parse(resources, hdr_ptr, hdr)?) as AncillaryData);
-        ptr += hdr.cmsg_len;
+        let CMsg::Rights { fds } = CMsg::parse(resources, hdr_ptr, hdr)?;
+        if rights.len() + fds.len() > 253 {
+            return Err(KError::InvalidInput);
+        }
+        rights.extend(fds);
+        let aligned_len = hdr
+            .cmsg_len
+            .checked_add(size_of::<usize>() - 1)
+            .ok_or(KError::InvalidInput)?
+            & !(size_of::<usize>() - 1);
+        ptr = ptr.checked_add(aligned_len).ok_or(KError::InvalidInput)?;
     }
 
+    if !rights.is_empty() {
+        ancillary.push(Box::new(CMsg::Rights { fds: rights }) as AncillaryData);
+    }
     Ok(ancillary)
 }
 
@@ -116,28 +129,46 @@ fn push_socket_cmsg(
     resources: &kresources::ProcessResources,
     builder: &mut CMsgBuilder<'_>,
     ancillary: SocketAncillary,
+    cloexec: bool,
+    truncated: &mut bool,
 ) -> KResult<bool> {
     match ancillary {
-        SocketAncillary::Rights { fds } => builder.push(SOL_SOCKET, SCM_RIGHTS, |data| {
-            let body_len = fds
-                .len()
-                .checked_mul(size_of::<i32>())
-                .ok_or(KError::from(LinuxError::ENOBUFS))?;
-            if data.len() < body_len {
-                return Err(KError::from(LinuxError::ENOBUFS));
+        SocketAncillary::Rights { fds } => {
+            // Only install descriptors that fit. Excess references are dropped,
+            // including on fd-table exhaustion (unix(7) SCM_RIGHTS semantics).
+            let mut installed = Vec::new();
+            let result = builder.push(SOL_SOCKET, SCM_RIGHTS, |data| {
+                let capacity = data.len() / size_of::<i32>();
+                *truncated |= capacity < fds.len();
+                if capacity == 0 && !fds.is_empty() {
+                    return Err(KError::from(LinuxError::ENOBUFS));
+                }
+                for (file, chunk) in fds.into_iter().zip(data.chunks_exact_mut(size_of::<i32>())) {
+                    match resources.add_file(file, cloexec) {
+                        Ok(fd) => {
+                            installed.push(fd);
+                            chunk.copy_from_slice(&fd.to_ne_bytes());
+                        }
+                        Err(KError::TooManyOpenFiles) => {
+                            *truncated = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if installed.is_empty() {
+                    return Err(KError::from(LinuxError::ENOBUFS));
+                }
+                Ok(installed.len() * size_of::<i32>())
+            });
+            if result.is_err() {
+                // A failed user copy must not leave unreported descriptors.
+                for fd in installed {
+                    let _ = resources.close_file(fd);
+                }
             }
-
-            let mut written = 0;
-            for (f, chunk) in fds
-                .into_iter()
-                .zip(data[..body_len].chunks_exact_mut(size_of::<i32>()))
-            {
-                let fd = resources.add_file(f, false)?;
-                chunk.copy_from_slice(&fd.to_ne_bytes());
-                written += size_of::<i32>();
-            }
-            Ok(written)
-        }),
+            result
+        }
         SocketAncillary::IpError(err) => push_ip_recverr_cmsg(builder, err),
     }
 }
@@ -310,14 +341,20 @@ fn recv_impl(
         output.addrlen.write(addrlen_value)?;
     }
 
-    let mut cmsg_truncated = false;
+    let mut cmsg_truncated = output.cmsg_builder.is_none() && !ancillary.is_empty();
     if let Some(mut builder) = output.cmsg_builder {
         for ancillary in ancillary {
             let Some(ancillary) = into_socket_ancillary(ancillary) else {
                 warn!("received unexpected ancillary");
                 continue;
             };
-            let push_result = push_socket_cmsg(resources.as_ref(), &mut builder, ancillary);
+            let push_result = push_socket_cmsg(
+                resources.as_ref(),
+                &mut builder,
+                ancillary,
+                flags & MSG_CMSG_CLOEXEC != 0,
+                &mut cmsg_truncated,
+            );
 
             match push_result {
                 Ok(true) => {}
@@ -336,6 +373,7 @@ fn recv_impl(
 
     if let Some(msg_flags) = output.msg_flags {
         *msg_flags |= recv_truncate_to_msg_flag(reported_flags);
+        *msg_flags |= flags & MSG_CMSG_CLOEXEC;
         if flags & MSG_ERRQUEUE != 0 {
             *msg_flags |= MSG_ERRQUEUE;
         }

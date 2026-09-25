@@ -7,7 +7,7 @@
 mod channel;
 mod listener;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use ringbuf::traits::{Consumer, Observer, Producer};
 
 pub(crate) use self::listener::Bind;
 use self::{
-    channel::{Channel, StreamEndpoint},
+    channel::{Channel, ControlRecord, StreamEndpoint},
     listener::{ConnRequest, ListenerQueue},
 };
 use crate::{
@@ -221,7 +221,7 @@ impl UnixTransportOps for StreamTransport {
         ))
     }
 
-    fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> KResult<usize> {
+    fn send(&self, mut src: impl Read + IoBuf, mut options: SendOptions) -> KResult<usize> {
         if options.to.is_some() {
             return Err(KError::InvalidInput);
         }
@@ -261,6 +261,13 @@ impl UnixTransportOps for StreamTransport {
                     }
                     count
                 };
+                let mut control = chan.tx_control.lock();
+                if count > 0 && !options.ancillary.is_empty() {
+                    control
+                        .pending
+                        .try_reserve(1)
+                        .map_err(|_| KError::NoMemory)?;
+                }
                 {
                     let _tx_order = self.endpoint.tx_order.lock();
                     if self.endpoint.tx_closed.load(Ordering::Acquire)
@@ -269,11 +276,21 @@ impl UnixTransportOps for StreamTransport {
                     {
                         return finish_send_on_error(total, KError::BrokenPipe);
                     }
+                    if count > 0 && !options.ancillary.is_empty() {
+                        let start = control.written;
+                        control.pending.push_back(ControlRecord {
+                            start,
+                            end: start.wrapping_add(count),
+                            data: core::mem::take(&mut options.ancillary),
+                        });
+                    }
+                    control.written = control.written.wrapping_add(count);
                     // SAFETY: `count` is the sum of bytes written into the vacant
                     // slices above, so it never exceeds the producer capacity that
                     // was exposed while the channel lock excluded other producers.
                     unsafe { chan.tx.advance_write_index(count) };
                 }
+                drop(control);
                 total += count;
                 if count > 0 {
                     chan.peer_endpoint.polls.readable.wake();
@@ -287,7 +304,7 @@ impl UnixTransportOps for StreamTransport {
             })
     }
 
-    fn recv(&self, mut dst: impl Write + IoBufMut, options: RecvOptions) -> KResult<usize> {
+    fn recv(&self, mut dst: impl Write + IoBufMut, mut options: RecvOptions) -> KResult<usize> {
         let is_zero_length = dst.remaining_mut() == 0;
         self.options
             .recv_poller_with_nonblocking(self, options.flags.nonblocking(), || {
@@ -296,14 +313,26 @@ impl UnixTransportOps for StreamTransport {
                     return Err(KError::NotConnected);
                 };
 
-                let occupied_before = chan.rx.occupied_len();
+                // Snapshot metadata and published bytes together, then release
+                // the shared lock before faultable user copies. A producer may
+                // append meanwhile; this read remains bounded by the snapshot.
+                let (occupied_before, read_limit) = {
+                    let control = chan.rx_control.lock();
+                    let occupied = chan.rx.occupied_len();
+                    let limit = control.pending.front().map_or(occupied, |record| {
+                        occupied.min(record.end.wrapping_sub(control.read))
+                    });
+                    (occupied, limit)
+                };
                 if is_zero_length && occupied_before > 0 {
                     return Ok(0);
                 }
                 let count = {
                     let (left, right) = chan.rx.as_slices();
+                    let left = &left[..left.len().min(read_limit)];
                     let mut count = dst.write(left)?;
                     if count >= left.len() {
+                        let right = &right[..right.len().min(read_limit - count)];
                         count += dst.write(right)?;
                     }
                     // SAFETY: `count` is the sum of bytes copied out of the
@@ -313,11 +342,31 @@ impl UnixTransportOps for StreamTransport {
                     count
                 };
                 if count > 0 {
+                    let delivered = {
+                        let mut control = chan.rx_control.lock();
+                        let reaches_control = control
+                            .pending
+                            .front()
+                            .is_some_and(|record| record.start.wrapping_sub(control.read) < count);
+                        control.read = control.read.wrapping_add(count);
+                        if reaches_control {
+                            control.pending.pop_front().expect("front checked").data
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    let peer = chan.peer_endpoint.clone();
+                    drop(guard);
+                    if let Some(ancillary) = options.ancillary.as_mut() {
+                        ancillary.extend(delivered);
+                    } else {
+                        drop(delivered);
+                    }
                     let occupied_after = occupied_before - count;
                     if !channel::is_stream_writable(occupied_before)
                         && channel::is_stream_writable(occupied_after)
                     {
-                        chan.peer_endpoint.polls.writable.wake();
+                        peer.polls.writable.wake();
                     }
                     return Ok(count);
                 }
@@ -494,6 +543,7 @@ impl Drop for StreamTransport {
 #[cfg(unittest)]
 mod tests {
     use alloc::{
+        boxed::Box,
         sync::{Arc, Weak},
         task::Wake,
         vec,
@@ -522,6 +572,101 @@ mod tests {
         options::{Configurable, GetSocketOption, SetSocketOption},
         unix::{BindEntry, UnixAddr},
     };
+
+    struct ControlDrop(Arc<AtomicUsize>);
+
+    impl Drop for ControlDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn control_options(drops: &Arc<AtomicUsize>) -> SendOptions {
+        SendOptions {
+            ancillary: vec![Box::new(ControlDrop(drops.clone()))],
+            ..SendOptions::default()
+        }
+    }
+
+    #[def_test]
+    fn unix_stream_control_released_when_unread_receiver_closes() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (left, right) = StreamTransport::new_pair(1);
+        assert_eq!(left.send(&b"x"[..], control_options(&drops)), Ok(1));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(right);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(left);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[def_test]
+    fn unix_stream_control_released_by_plain_read() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (left, right) = StreamTransport::new_pair(1);
+        assert_eq!(left.send(&b"x"[..], control_options(&drops)), Ok(1));
+        let mut byte = [0];
+        assert_eq!(right.recv(&mut byte[..], RecvOptions::default()), Ok(1));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[def_test]
+    fn unix_stream_control_zero_length_send_does_not_queue_references() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (left, right) = StreamTransport::new_pair(1);
+        assert_eq!(left.send(&b""[..], control_options(&drops)), Ok(0));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let mut byte = [0];
+        assert_eq!(
+            right.recv(
+                &mut byte[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                }
+            ),
+            Err(KError::WouldBlock)
+        );
+    }
+
+    #[def_test]
+    fn unix_stream_control_partial_send_delivers_references_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (left, right) = StreamTransport::new_pair(1);
+        let data = vec![b'x'; STREAM_BUF_BYTES + 1];
+        let mut options = control_options(&drops);
+        options.flags = SendFlags::DONT_WAIT;
+        assert_eq!(left.send(&data[..], options), Ok(STREAM_BUF_BYTES));
+        let mut received = Vec::new();
+        let mut byte = [0];
+        assert_eq!(
+            right.recv(
+                &mut byte[..],
+                RecvOptions {
+                    ancillary: Some(&mut received),
+                    ..RecvOptions::default()
+                }
+            ),
+            Ok(1)
+        );
+        assert_eq!(received.len(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(received);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let mut rest = vec![0; STREAM_BUF_BYTES];
+        let mut received = Vec::new();
+        assert_eq!(
+            right.recv(
+                &mut rest[..],
+                RecvOptions {
+                    ancillary: Some(&mut received),
+                    ..RecvOptions::default()
+                }
+            ),
+            Ok(STREAM_BUF_BYTES - 1)
+        );
+        assert!(received.is_empty());
+    }
 
     const TASK_WAIT_ROUNDS: usize = 100_000;
 

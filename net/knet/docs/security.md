@@ -746,3 +746,20 @@ Changes to this module must verify the following:
 - New kernel call paths must not depend on `current_cred()`.
   Callers must select credentials explicitly.
 - Before adding a public API, verify whether cross-crate exposure is required.
+
+### STREAM ancillary ownership audit (M1-004)
+
+Untrusted users may enqueue file references with stream bytes. Control records
+are associated with byte positions under a shared directional mutex and published
+with the byte ring under `tx_order`; receive cannot see bytes before their control
+record. Ring capacity bounds outstanding records (every record needs a byte),
+and the POSIX parser limits each syscall to 253 descriptors. This is not a global
+in-flight descriptor quota. Cyclic socket-reference garbage collection remains
+unimplemented, as in the pre-existing datagram ancillary path.
+
+Close releases unread references even if the sender remains open. Plain read,
+truncation at the POSIX boundary, and process exit release their respective
+ownership. The drop-counter kernel tests and socket-peer EOF guest probes cover
+noncyclic references; they do not claim cycle collection or process-wide memory
+peak measurement. No new unsafe block is introduced; bounded copies still use
+the existing ring-buffer publication invariants. MSG_PEEK limitations above remain.
