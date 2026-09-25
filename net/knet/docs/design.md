@@ -929,8 +929,10 @@ It reserves metadata capacity before taking the short `tx_order` spinlock, then
 publishes record and byte index under that ordering point. Receive snapshots
 published byte count and the first record's end while holding the metadata
 mutex, releases it for user copies, and bounds the copy to that snapshot. On
-consumption it removes a record once at least its first byte was read. The next
-read can merge the remaining plain bytes with later data. This implements the
+consumption it detaches rights once at least their first byte was read. Records
+with sender credentials remain until their last byte is consumed. With PASSCRED,
+a read stops before the start of a differently attributed interval; plain-prefix
+bytes must not inherit the following sender identity. This implements the
 ancillary barrier described by Linux unix(7) without packetizing ordinary writes.
 
 Lock order is local channel mutex, directional control mutex, then producer
@@ -940,5 +942,25 @@ ordering, detaches the pending records, and drops references outside those locks
 the sender may remain alive. Plain read discards consumed ancillary references.
 The existing EOF/publication and shutdown ordering remains in force.
 
-This change does not add non-consuming Unix MSG_PEEK support or garbage
-collection for cycles formed by passing Unix sockets through other Unix sockets.
+Unix MSG_PEEK copies bytes and clones immutable ancillary ownership without
+advancing positions or dropping queued references. A peek cannot publish freed
+ring capacity or wake blocked writers. Cyclic Unix socket garbage collection is
+still not implemented.
+
+### Unix PASSCRED and datagram receive
+
+Stream endpoints and datagram bind/peer handles share an independent atomic
+PASSCRED flag (Relaxed: no coupled data is published through this boolean).
+The POSIX and VFS adapters pass validated `UnixSendCredentials`; transport code
+selects the send-time snapshot when either endpoint has PASSCRED or explicit
+credentials were supplied. Receivers emit it only while their own option is on.
+Stream accepted endpoints inherit the listener option when the connection is
+queued. SO_PEERCRED and unbound-socket autobind are separate, unchanged contracts.
+
+Datagrams retain optional credentials alongside payload/address/ancillary data.
+A mutex-protected front packet stages MSG_PEEK without dequeuing again on the
+next call, and participates in poll readiness. Consuming reads detach this
+packet and drop references outside the receive lock. MSG_DONTWAIT is propagated
+to the receive poller; truncated payload reports MSG_TRUNC. The underlying queue
+remains unbounded, and SEQPACKET still uses this transport with its existing
+connection-management limitations.

@@ -16,7 +16,7 @@ use ringbuf::{
     traits::{Observer, Split},
 };
 
-use crate::AncillaryData;
+use crate::{AncillaryData, options::UnixCredentials};
 
 pub(super) const STREAM_BUF_BYTES: usize = 64 * 1024;
 pub(super) const STREAM_WRITABLE_MAX_OCCUPIED_BYTES: usize = STREAM_BUF_BYTES / 4;
@@ -70,6 +70,8 @@ impl StreamPollSets {
 #[derive(Default)]
 pub(super) struct StreamEndpoint {
     pub(super) polls: StreamPollSets,
+    /// Independent receive option, observed by either endpoint at send time.
+    pub(super) has_passcred: AtomicBool,
     /// Orders data publication, shutdown, and EOF observation for this
     /// endpoint's transmit direction.
     pub(super) tx_order: SpinNoPreempt<()>,
@@ -93,6 +95,7 @@ pub(super) struct ControlRecord {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) data: Vec<AncillaryData>,
+    pub(super) credentials: Option<UnixCredentials>,
 }
 
 pub(super) fn new_duplex_channel(

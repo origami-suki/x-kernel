@@ -20,8 +20,26 @@ copy after a successful control copy retain the existing syscall behavior.
 
 ## Limits and audit
 
-Unix non-consuming MSG_PEEK and cyclic Unix socket-reference collection are
-transport limitations; this layer does not fix them. Verify successful receipt,
+Cyclic Unix socket-reference collection remains a transport limitation; this
+layer does not fix it. Unix MSG_PEEK shares immutable queued ownership and
+installs separate receiver descriptors on each peek. Verify successful receipt,
 short buffers, no buffer, CLOEXEC, bad sender fd, segmented control delivery,
 receiver close and process exit against Linux. Raw runner success is insufficient
 unless guest assertions and their exit codes also pass.
+
+## Credential authorization and limits
+
+Explicit SCM_CREDENTIALS requires exactly three 32-bit fields. PID must equal
+the calling process TGID, UID/GID must match one of its real/effective/saved IDs,
+and the invalid all-ones UID/GID returns EINVAL. Unauthorized identities return
+EPERM before payload publication. This implements Linux's unprivileged contract;
+capability-based arbitrary PID/UID/GID impersonation is not supported, including
+for root. There is no added capability or user/PID namespace implementation.
+Automatic credentials always use real IDs. Numeric sender identities are captured
+at send time and remain valid as recorded values after the sender exits.
+
+SO_PEERCRED's pre-existing creation-time placeholder, Unix autobind semantics,
+and the existing mapping of SEQPACKET to the datagram transport are unchanged;
+PASSCRED success does not certify those separate contracts. Missing credentials
+on bytes queued before either side enabled PASSCRED are represented by Linux's
+PID 0 / overflow UID and GID 65534 when subsequently received with PASSCRED.

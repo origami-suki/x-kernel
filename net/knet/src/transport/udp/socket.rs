@@ -2,7 +2,7 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 
 use ::core::net::SocketAddr;
 use kerrno::{KError, KResult, LinuxError, k_bail};
@@ -74,6 +74,7 @@ impl UdpSocket {
                 to: Some(SocketAddrEx::Ip(remote_addr)),
                 flags: SendFlags::DONT_WAIT,
                 ancillary: Vec::new(),
+                credentials: None,
             },
         )
     }
@@ -307,7 +308,7 @@ impl UdpSocket {
             *from = SocketAddrEx::Ip(addr);
         }
         if let Some(ancillary) = msg.ancillary.as_deref_mut() {
-            ancillary.push(Box::new(KernelAncillaryData::IpError(recv_error)));
+            ancillary.push(Arc::new(KernelAncillaryData::IpError(recv_error)));
         }
 
         Ok(copy_udp_error_payload(&payload, msg))
@@ -430,6 +431,7 @@ impl SocketOps for UdpSocket {
             to,
             flags,
             ancillary: _,
+            ..
         } = options;
         let initial_len = src.remaining();
         self.send_reader(&mut src, to, flags)?;

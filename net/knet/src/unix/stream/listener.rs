@@ -5,6 +5,7 @@
 //! Unix stream listener queue and admission state.
 
 use alloc::{collections::VecDeque, sync::Arc};
+use core::sync::atomic::Ordering;
 
 use event_listener::{Event, listener};
 use kerrno::{KError, KResult};
@@ -39,6 +40,10 @@ pub(super) struct ListenerQueue {
 }
 
 impl ListenerQueue {
+    pub(super) fn has_passcred(&self) -> bool {
+        self.endpoint.has_passcred.load(Ordering::Relaxed)
+    }
+
     pub(super) fn new(endpoint: Arc<StreamEndpoint>) -> Self {
         Self {
             state: Mutex::new(ListenerState::default()),

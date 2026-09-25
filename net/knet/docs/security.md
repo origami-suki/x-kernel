@@ -762,4 +762,27 @@ truncation at the POSIX boundary, and process exit release their respective
 ownership. The drop-counter kernel tests and socket-peer EOF guest probes cover
 noncyclic references; they do not claim cycle collection or process-wide memory
 peak measurement. No new unsafe block is introduced; bounded copies still use
-the existing ring-buffer publication invariants. MSG_PEEK limitations above remain.
+the existing ring-buffer publication invariants. MSG_PEEK now retains queued
+ownership; each receive adapter is responsible for allocating fresh descriptors.
+
+
+### Unix credential delivery (M1-007)
+
+`UnixSendCredentials` is a trusted kernel boundary value, not a userspace ucred.
+Only the POSIX credential validator may authorize explicit identities. Automatic
+snapshots come from the current process at the POSIX/VFS send adapters; queue
+code does not infer identity from the receiver or socket creator. The existing
+kprocess adapters and dependency are reused; no reverse subsystem dependency is
+introduced. PASSCRED atomics carry only an independent option flag.
+
+Ancillary payloads use Arc<dyn Any + Send + Sync> for non-consuming peeks. The
+transport treats them as immutable; peeking shares ownership, never sender fd
+numbers. Final drops remain outside control/spin locks. The receive queue holds
+one staged datagram for peeks; it remains visible to readiness checks. Streams
+retain credentials through partial reads but detach rights only once. Existing
+unbounded datagram queues and cyclic socket references remain resource risks.
+
+Known limits: capability-authorized impersonation, namespace ID translation,
+SO_PEERCRED placeholder replacement, Unix autobind, and full SEQPACKET connection
+semantics are outside this patch. The ABI regression exercises connected pairs,
+normal/mixed real-effective-saved IDs, and explicit rejection boundaries.

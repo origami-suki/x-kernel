@@ -12,11 +12,11 @@ use core::{mem::size_of, net::SocketAddr, ptr};
 
 use bytemuck::{NoUninit, bytes_of};
 use kerrno::{KError, KResult, LinuxError};
-use knet::{SocketErrorInfo, SocketErrorOrigin};
+use knet::{SocketErrorInfo, SocketErrorOrigin, options::UnixCredentials};
 use kvfs::VfsFile;
 use linux_raw_sys::net::{
-    AF_INET, AF_UNSPEC, IP_RECVERR, IPPROTO_IP, SCM_RIGHTS, SOL_SOCKET, cmsghdr, in_addr,
-    sockaddr_in,
+    AF_INET, AF_UNSPEC, IP_RECVERR, IPPROTO_IP, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr,
+    in_addr, sockaddr_in,
 };
 use osvm::{VirtPtr, write_vm_mem};
 use posix_types::{UserConstPtr, UserPtr};
@@ -132,7 +132,10 @@ pub(crate) fn push_ip_recverr_cmsg(
 }
 
 /// Control message types for socket operations (ancillary data)
+#[derive(Clone)]
 pub(crate) enum CMsg {
+    /// Sender-authorized process identity.
+    Credentials(UnixCredentials),
     /// SCM_RIGHTS: file descriptor passing between processes
     Rights { fds: Vec<Arc<VfsFile>> },
 }
@@ -150,6 +153,30 @@ impl CMsg {
         let data = UserConstPtr::<u8>::from(hdr_ptr.as_ptr() as usize + size_of::<cmsghdr>())
             .load_vm_vec(hdr.cmsg_len - size_of::<cmsghdr>())?;
         Ok(match (hdr.cmsg_level as u32, hdr.cmsg_type as u32) {
+            (SOL_SOCKET, SCM_CREDENTIALS) => {
+                if data.len() != 12 {
+                    return Err(KError::InvalidInput);
+                }
+                let value = UnixCredentials {
+                    pid: u32::from_ne_bytes(data[0..4].try_into().unwrap()),
+                    uid: u32::from_ne_bytes(data[4..8].try_into().unwrap()),
+                    gid: u32::from_ne_bytes(data[8..12].try_into().unwrap()),
+                };
+                if value.uid == u32::MAX || value.gid == u32::MAX {
+                    return Err(KError::InvalidInput);
+                }
+                let cred = kprocess::current_cred();
+                // This kernel has no per-capability authorization model. Support
+                // the unprivileged Linux contract; do not silently grant arbitrary
+                // PID/ID impersonation to a caller claiming privileged credentials.
+                if value.pid != kprocess::current_user_thread().pid()
+                    || ![cred.ruid(), cred.euid(), cred.suid()].contains(&value.uid)
+                    || ![cred.rgid(), cred.egid(), cred.sgid()].contains(&value.gid)
+                {
+                    return Err(KError::from(LinuxError::EPERM));
+                }
+                Self::Credentials(value)
+            }
             (SOL_SOCKET, SCM_RIGHTS) => {
                 if data.len() % size_of::<i32>() != 0 {
                     return Err(KError::InvalidInput);

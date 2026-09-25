@@ -10,7 +10,7 @@
 //! - Out-of-band data handling
 //! - Ancillary data (control messages)
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{any::TypeId, net::Ipv4Addr};
 
 use kerrno::{KError, KResult, LinuxError};
@@ -18,15 +18,17 @@ use khal::time::monotonic_time;
 use kio::prelude::*;
 use knet::{
     AncillaryData, KernelAncillaryData, RecvFlags, RecvOptions, SendFlags, SendOptions, Socket,
-    SocketAddrEx, SocketErrorInfo, SocketOps, sock_from_file,
+    SocketAddrEx, SocketErrorInfo, SocketOps,
+    options::{UnixCredentials, UnixSendCredentials},
+    sock_from_file,
 };
 use ktime_types::TimeSpan;
 use kvfs::VfsFile;
 use linux_raw_sys::{
     general::timespec,
     net::{
-        MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_PEEK, MSG_TRUNC, SCM_RIGHTS,
-        SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+        MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_PEEK, MSG_TRUNC,
+        SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
 use osvm::{VirtPtr, VmBytes, VmBytesMut, write_vm_mem};
@@ -80,11 +82,15 @@ fn parse_send_cmsgs(
             return Err(KError::InvalidInput);
         }
 
-        let CMsg::Rights { fds } = CMsg::parse(resources, hdr_ptr, hdr)?;
-        if rights.len() + fds.len() > 253 {
-            return Err(KError::InvalidInput);
+        match CMsg::parse(resources, hdr_ptr, hdr)? {
+            CMsg::Rights { fds } => {
+                if rights.len() + fds.len() > 253 {
+                    return Err(KError::InvalidInput);
+                }
+                rights.extend(fds);
+            }
+            value @ CMsg::Credentials(_) => ancillary.push(Arc::new(value) as AncillaryData),
         }
-        rights.extend(fds);
         let aligned_len = hdr
             .cmsg_len
             .checked_add(size_of::<usize>() - 1)
@@ -94,12 +100,13 @@ fn parse_send_cmsgs(
     }
 
     if !rights.is_empty() {
-        ancillary.push(Box::new(CMsg::Rights { fds: rights }) as AncillaryData);
+        ancillary.push(Arc::new(CMsg::Rights { fds: rights }) as AncillaryData);
     }
     Ok(ancillary)
 }
 
 enum SocketAncillary {
+    Credentials(UnixCredentials),
     Rights { fds: Vec<Arc<VfsFile>> },
     IpError(SocketErrorInfo),
 }
@@ -111,13 +118,15 @@ fn into_socket_ancillary(ancillary: AncillaryData) -> Option<SocketAncillary> {
     let type_id = ancillary.as_ref().type_id();
     if type_id == TypeId::of::<CMsg>() {
         let ancillary = ancillary.downcast::<CMsg>().ok()?;
-        return Some(match *ancillary {
+        return Some(match ancillary.as_ref().clone() {
             CMsg::Rights { fds } => SocketAncillary::Rights { fds },
+            CMsg::Credentials(cred) => SocketAncillary::Credentials(cred),
         });
     }
     if type_id == TypeId::of::<KernelAncillaryData>() {
         let ancillary = ancillary.downcast::<KernelAncillaryData>().ok()?;
-        return Some(match *ancillary {
+        return Some(match ancillary.as_ref().clone() {
+            KernelAncillaryData::Credentials(cred) => SocketAncillary::Credentials(cred),
             KernelAncillaryData::IpError(err) => SocketAncillary::IpError(err),
         });
     }
@@ -133,6 +142,16 @@ fn push_socket_cmsg(
     truncated: &mut bool,
 ) -> KResult<bool> {
     match ancillary {
+        SocketAncillary::Credentials(cred) => builder.push(SOL_SOCKET, SCM_CREDENTIALS, |data| {
+            let mut bytes = [0u8; 12];
+            bytes[0..4].copy_from_slice(&cred.pid.to_ne_bytes());
+            bytes[4..8].copy_from_slice(&cred.uid.to_ne_bytes());
+            bytes[8..12].copy_from_slice(&cred.gid.to_ne_bytes());
+            let count = data.len().min(bytes.len());
+            data[..count].copy_from_slice(&bytes[..count]);
+            *truncated |= count < bytes.len();
+            Ok(count)
+        }),
         SocketAncillary::Rights { fds } => {
             // Only install descriptors that fit. Excess references are dropped,
             // including on fd-table exhaustion (unix(7) SCM_RIGHTS semantics).
@@ -196,10 +215,38 @@ fn send_impl(
     if file.is_nonblocking() {
         send_flags |= SendFlags::DONT_WAIT;
     }
+    let is_unix = matches!(socket.as_ref(), Socket::Unix(_));
+    if !is_unix
+        && ancillary
+            .iter()
+            .any(|data| matches!(data.downcast_ref::<CMsg>(), Some(CMsg::Credentials(_))))
+    {
+        return Err(KError::InvalidInput);
+    }
+    let mut credentials = if is_unix {
+        Some(UnixSendCredentials::Automatic(
+            UnixCredentials::from_sender(
+                kprocess::current_user_thread().pid(),
+                &kprocess::current_cred(),
+            ),
+        ))
+    } else {
+        None
+    };
+    let mut ancillary = ancillary;
+    ancillary.retain(|data| {
+        if let Some(CMsg::Credentials(value)) = data.downcast_ref::<CMsg>() {
+            credentials = Some(UnixSendCredentials::Explicit(*value));
+            false
+        } else {
+            true
+        }
+    });
     let options = SendOptions {
         to: addr,
         flags: send_flags,
         ancillary,
+        credentials,
     };
     let sent = match socket.as_ref() {
         Socket::Netlink(_) => {

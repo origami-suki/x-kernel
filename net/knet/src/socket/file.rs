@@ -68,6 +68,15 @@ impl FileOperations for SocketFileOps {
         let socket = Self::socket(file)?;
         let src = buf;
         let mut options = SendOptions::default();
+        if matches!(socket.as_ref(), Socket::Unix(_)) {
+            let cred = kprocess::current_cred();
+            options.credentials = Some(crate::options::UnixSendCredentials::Automatic(
+                crate::options::UnixCredentials::from_sender(
+                    kprocess::current_user_thread().pid(),
+                    &cred,
+                ),
+            ));
+        }
         if file.is_nonblocking() {
             options.flags |= SendFlags::DONT_WAIT;
         }

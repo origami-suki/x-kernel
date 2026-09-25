@@ -29,3 +29,20 @@ https://man7.org/linux/man-pages/man2/recvmsg.2.html
 Syscalls require the current process resources and faultable user-memory access.
 No transport lock is retained while adding or removing receiver descriptors.
 The syscall boundary does not implement stream byte ordering, EOF or wakeups.
+
+## Unix sender credentials
+
+`send_impl` captures the current process TGID and real UID/GID for Unix sends.
+The VFS socket write adapter supplies the same snapshot for write/writev; neither
+path uses the socket creator's PID or the file's open credentials. Parsed explicit
+SCM_CREDENTIALS overrides that automatic snapshot only after authorization.
+`SendOptions::credentials` transports this value without a process lookup in the
+stream/datagram queue implementations. Sender metadata is retained if either
+endpoint enables PASSCRED, or the sender explicitly supplies credentials.
+
+Receiving with PASSCRED emits credentials before rights. A short credential body
+is copied as a prefix and marked MSG_CTRUNC, including the header-only case.
+`AncillaryData` has immutable shared ownership so MSG_PEEK can install fresh
+receiver descriptors without consuming the queued references. Later reads still
+receive the original message; stream short reads retain its sender identity while
+rights detach only on the first consuming read.

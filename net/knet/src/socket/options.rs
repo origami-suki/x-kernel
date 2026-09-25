@@ -34,14 +34,51 @@ macro_rules! define_options {
 
 /// Credentials delivered over Unix-domain sockets.
 #[repr(C)]
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnixCredentials {
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
 }
 
+/// Sender identity validated at the POSIX/VFS boundary. Transports must not
+/// substitute socket creation credentials or read the receiving task's identity.
+#[derive(Debug, Clone, Copy)]
+pub enum UnixSendCredentials {
+    /// Snapshot of the sending process TGID and real user/group IDs.
+    Automatic(UnixCredentials),
+    /// Explicit SCM_CREDENTIALS already checked against the sender's identity.
+    Explicit(UnixCredentials),
+}
+
+impl UnixSendCredentials {
+    pub(crate) fn for_passcred(self, is_enabled: bool) -> Option<UnixCredentials> {
+        match self {
+            Self::Explicit(cred) => Some(cred),
+            Self::Automatic(cred) => is_enabled.then_some(cred),
+        }
+    }
+}
+
 impl UnixCredentials {
+    /// Snapshot a caller-supplied process TGID and real IDs; no current-task lookup.
+    pub fn from_sender(pid: u32, cred: &kcred::Cred) -> Self {
+        Self {
+            pid,
+            uid: cred.ruid(),
+            gid: cred.rgid(),
+        }
+    }
+
+    /// Linux's unmapped credentials for bytes queued without sender metadata.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            pid: 0,
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
     pub fn new(pid: u32) -> Self {
         UnixCredentials {
             pid,

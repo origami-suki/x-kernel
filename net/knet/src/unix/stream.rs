@@ -23,7 +23,7 @@ use self::{
     listener::{ConnRequest, ListenerQueue},
 };
 use crate::{
-    ConnectOptions, RecvOptions, SendOptions, Shutdown,
+    ConnectOptions, KernelAncillaryData, RecvFlags, RecvOptions, SendOptions, Shutdown,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, OptionHandled, SetSocketOption, UnixCredentials},
     unix::{UnixAddr, UnixTransport, UnixTransportOps},
@@ -85,7 +85,9 @@ impl Configurable for StreamTransport {
             O::SendBuffer(size) => {
                 **size = channel::STREAM_BUF_BYTES;
             }
-            O::PassCredentials(_) => {}
+            O::PassCredentials(value) => {
+                **value = self.endpoint.has_passcred.load(Ordering::Relaxed);
+            }
             O::PeerCredentials(cred) => {
                 let peer_pid = self
                     .channel
@@ -107,7 +109,9 @@ impl Configurable for StreamTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::PassCredentials(value) => {
+                self.endpoint.has_passcred.store(*value, Ordering::Relaxed);
+            }
             _ => return Ok(OptionHandled::No),
         }
         Ok(OptionHandled::Yes)
@@ -186,6 +190,9 @@ impl UnixTransportOps for StreamTransport {
         }
 
         let server_endpoint = Arc::new(StreamEndpoint::default());
+        server_endpoint
+            .has_passcred
+            .store(bind.listener.has_passcred(), Ordering::Relaxed);
         let (mut client_channel, mut server_channel) =
             channel::new_duplex_channel(self.endpoint.clone(), server_endpoint, 0);
         client_channel.peer_pid = bind.pid;
@@ -261,8 +268,15 @@ impl UnixTransportOps for StreamTransport {
                     }
                     count
                 };
+                let credentials = options.credentials.and_then(|value| {
+                    value.for_passcred(
+                        self.endpoint.has_passcred.load(Ordering::Relaxed)
+                            || chan.peer_endpoint.has_passcred.load(Ordering::Relaxed),
+                    )
+                });
+                let has_control = credentials.is_some() || !options.ancillary.is_empty();
                 let mut control = chan.tx_control.lock();
-                if count > 0 && !options.ancillary.is_empty() {
+                if count > 0 && has_control {
                     control
                         .pending
                         .try_reserve(1)
@@ -276,12 +290,13 @@ impl UnixTransportOps for StreamTransport {
                     {
                         return finish_send_on_error(total, KError::BrokenPipe);
                     }
-                    if count > 0 && !options.ancillary.is_empty() {
+                    if count > 0 && has_control {
                         let start = control.written;
                         control.pending.push_back(ControlRecord {
                             start,
                             end: start.wrapping_add(count),
                             data: core::mem::take(&mut options.ancillary),
+                            credentials,
                         });
                     }
                     control.written = control.written.wrapping_add(count);
@@ -306,6 +321,8 @@ impl UnixTransportOps for StreamTransport {
 
     fn recv(&self, mut dst: impl Write + IoBufMut, mut options: RecvOptions) -> KResult<usize> {
         let is_zero_length = dst.remaining_mut() == 0;
+        let is_peek = options.flags.contains(RecvFlags::PEEK);
+        let has_passcred = self.endpoint.has_passcred.load(Ordering::Relaxed);
         self.options
             .recv_poller_with_nonblocking(self, options.flags.nonblocking(), || {
                 let mut guard = self.channel.lock();
@@ -320,7 +337,12 @@ impl UnixTransportOps for StreamTransport {
                     let control = chan.rx_control.lock();
                     let occupied = chan.rx.occupied_len();
                     let limit = control.pending.front().map_or(occupied, |record| {
-                        occupied.min(record.end.wrapping_sub(control.read))
+                        let boundary = if has_passcred && record.start != control.read {
+                            record.start
+                        } else {
+                            record.end
+                        };
+                        occupied.min(boundary.wrapping_sub(control.read))
                     });
                     (occupied, limit)
                 };
@@ -338,7 +360,11 @@ impl UnixTransportOps for StreamTransport {
                     // SAFETY: `count` is the sum of bytes copied out of the
                     // occupied slices returned by `as_slices`, so advancing by this
                     // amount stays within the consumer's readable region.
-                    unsafe { chan.rx.advance_read_index(count) };
+                    if !is_peek {
+                        // SAFETY: Same initialized occupied-slice bound as above;
+                        // a peek must leave the consumer index unchanged.
+                        unsafe { chan.rx.advance_read_index(count) };
+                    }
                     count
                 };
                 if count > 0 {
@@ -348,12 +374,37 @@ impl UnixTransportOps for StreamTransport {
                             .pending
                             .front()
                             .is_some_and(|record| record.start.wrapping_sub(control.read) < count);
-                        control.read = control.read.wrapping_add(count);
+                        let next_read = control.read.wrapping_add(count);
+                        let mut delivered = Vec::new();
+                        let mut credentials = None;
                         if reaches_control {
-                            control.pending.pop_front().expect("front checked").data
-                        } else {
-                            Vec::new()
+                            let record = control.pending.front_mut().expect("front checked");
+                            credentials = record.credentials;
+                            if is_peek {
+                                delivered.extend(record.data.iter().cloned());
+                            } else {
+                                delivered = core::mem::take(&mut record.data);
+                                // Credentials describe every byte, whereas rights
+                                // are detached on the first consuming read.
+                                if record.credentials.is_some() && next_read != record.end {
+                                    record.start = next_read;
+                                } else {
+                                    control.pending.pop_front();
+                                }
+                            }
                         }
+                        if !is_peek {
+                            control.read = next_read;
+                        }
+                        if has_passcred {
+                            delivered.insert(
+                                0,
+                                Arc::new(KernelAncillaryData::Credentials(
+                                    credentials.unwrap_or_else(UnixCredentials::unavailable),
+                                )),
+                            );
+                        }
+                        delivered
                     };
                     let peer = chan.peer_endpoint.clone();
                     drop(guard);
@@ -363,7 +414,8 @@ impl UnixTransportOps for StreamTransport {
                         drop(delivered);
                     }
                     let occupied_after = occupied_before - count;
-                    if !channel::is_stream_writable(occupied_before)
+                    if !is_peek
+                        && !channel::is_stream_writable(occupied_before)
                         && channel::is_stream_writable(occupied_after)
                     {
                         peer.polls.writable.wake();
@@ -543,7 +595,6 @@ impl Drop for StreamTransport {
 #[cfg(unittest)]
 mod tests {
     use alloc::{
-        boxed::Box,
         sync::{Arc, Weak},
         task::Wake,
         vec,
@@ -583,7 +634,7 @@ mod tests {
 
     fn control_options(drops: &Arc<AtomicUsize>) -> SendOptions {
         SendOptions {
-            ancillary: vec![Box::new(ControlDrop(drops.clone()))],
+            ancillary: vec![Arc::new(ControlDrop(drops.clone()))],
             ..SendOptions::default()
         }
     }
@@ -666,6 +717,117 @@ mod tests {
             Ok(STREAM_BUF_BYTES - 1)
         );
         assert!(received.is_empty());
+    }
+
+    #[def_test]
+    fn unix_stream_peek_keeps_rights_until_consumed() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (left, right) = StreamTransport::new_pair(1);
+        left.send(&b"abc"[..], control_options(&drops)).unwrap();
+        for _ in 0..2 {
+            let mut byte = [0];
+            let mut ancillary = Vec::new();
+            assert_eq!(
+                right.recv(
+                    &mut byte[..],
+                    RecvOptions {
+                        flags: RecvFlags::PEEK,
+                        ancillary: Some(&mut ancillary),
+                        ..RecvOptions::default()
+                    }
+                ),
+                Ok(1)
+            );
+            assert_eq!(byte, [b'a']);
+            assert_eq!(ancillary.len(), 1);
+            drop(ancillary);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        drop(right);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[def_test]
+    fn unix_stream_short_reads_retain_sender_but_detach_rights_once() {
+        use crate::{
+            KernelAncillaryData,
+            options::{UnixCredentials, UnixSendCredentials},
+        };
+        let (left, right) = StreamTransport::new_pair(1);
+        right
+            .set_option(SetSocketOption::PassCredentials(&true))
+            .unwrap();
+        let identity = UnixCredentials {
+            pid: 42,
+            uid: 1000,
+            gid: 1001,
+        };
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut options = control_options(&drops);
+        options.credentials = Some(UnixSendCredentials::Automatic(identity));
+        left.send(&b"abc"[..], options).unwrap();
+        for index in 0..3 {
+            let mut byte = [0];
+            let mut ancillary = Vec::new();
+            assert_eq!(
+                right.recv(
+                    &mut byte[..],
+                    RecvOptions {
+                        ancillary: Some(&mut ancillary),
+                        ..RecvOptions::default()
+                    }
+                ),
+                Ok(1)
+            );
+            assert_eq!(byte, [b'a' + index]);
+            assert_eq!(ancillary.len(), if index == 0 { 2 } else { 1 });
+            assert!(matches!(ancillary[0].downcast_ref::<KernelAncillaryData>(),
+                Some(KernelAncillaryData::Credentials(value)) if *value == identity));
+            drop(ancillary);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[def_test]
+    fn unix_stream_late_passcred_does_not_attribute_plain_prefix_to_next_sender() {
+        use crate::{
+            KernelAncillaryData,
+            options::{UnixCredentials, UnixSendCredentials},
+        };
+        let (left, right) = StreamTransport::new_pair(1);
+        left.send(&b"old"[..], SendOptions::default()).unwrap();
+        right
+            .set_option(SetSocketOption::PassCredentials(&true))
+            .unwrap();
+        let identity = UnixCredentials {
+            pid: 42,
+            uid: 1000,
+            gid: 1001,
+        };
+        left.send(
+            &b"new"[..],
+            SendOptions {
+                credentials: Some(UnixSendCredentials::Automatic(identity)),
+                ..SendOptions::default()
+            },
+        )
+        .unwrap();
+        for expected in [UnixCredentials::unavailable(), identity] {
+            let mut bytes = [0; 6];
+            let mut ancillary = Vec::new();
+            assert_eq!(
+                right.recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        ancillary: Some(&mut ancillary),
+                        ..RecvOptions::default()
+                    }
+                ),
+                Ok(3)
+            );
+            assert!(matches!(ancillary[0].downcast_ref::<KernelAncillaryData>(),
+                Some(KernelAncillaryData::Credentials(value)) if *value == expected));
+        }
     }
 
     const TASK_WAIT_ROUNDS: usize = 100_000;

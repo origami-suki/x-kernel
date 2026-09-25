@@ -13,7 +13,7 @@ mod test_options;
 #[cfg(unittest)]
 mod test_state;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     fmt::{self, Debug},
@@ -145,7 +145,9 @@ impl RecvFlags {
     }
 }
 
-pub type AncillaryData = Box<dyn Any + Send + Sync>;
+/// Shared immutable control payload. Peeking clones ownership without consuming
+/// the queued message; protocol adapters allocate fresh receiving descriptors.
+pub type AncillaryData = Arc<dyn Any + Send + Sync>;
 
 /// Options for initiating a socket connection.
 #[derive(Default, Debug, Clone, Copy)]
@@ -185,6 +187,8 @@ pub struct SocketErrorInfo {
 /// Ancillary data produced by the networking stack itself.
 #[derive(Debug, Clone)]
 pub enum KernelAncillaryData {
+    /// Unix sender identity retained with the queued byte/message interval.
+    Credentials(options::UnixCredentials),
     IpError(SocketErrorInfo),
 }
 
@@ -196,6 +200,8 @@ pub struct SendOptions {
     pub to: Option<SocketAddrEx>,
     pub flags: SendFlags,
     pub ancillary: Vec<AncillaryData>,
+    /// Validated Unix sender snapshot supplied by the syscall or VFS adapter.
+    pub credentials: Option<options::UnixSendCredentials>,
 }
 
 /// Options for receiving data from a socket.

@@ -36,24 +36,24 @@ fn test_unix_credentials_construction() {
 }
 
 #[def_test]
-fn test_unix_credentials_clone() {
-    // Test clone functionality
+fn test_unix_credentials_copy() {
+    // Copying an identity must preserve the original snapshot.
     let original = UnixCredentials {
         pid: 100,
         uid: 1000,
         gid: 2000,
     };
 
-    let cloned = original.clone();
-    assert_eq!(original.pid, cloned.pid);
-    assert_eq!(original.uid, cloned.uid);
-    assert_eq!(original.gid, cloned.gid);
+    let copied = original;
+    assert_eq!(original.pid, copied.pid);
+    assert_eq!(original.uid, copied.uid);
+    assert_eq!(original.gid, copied.gid);
 
-    // Verify modifications to clone don't affect original
-    let mut modified_clone = original.clone();
-    modified_clone.pid = 999;
+    // Modifying a copy does not mutate the source.
+    let mut modified_copy = original;
+    modified_copy.pid = 999;
     assert_eq!(original.pid, 100);
-    assert_eq!(modified_clone.pid, 999);
+    assert_eq!(modified_copy.pid, 999);
 }
 
 #[def_test]
