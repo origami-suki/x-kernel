@@ -11,7 +11,7 @@
 
 use core::ffi::c_char;
 
-use kerrno::{KError, KResult, LinuxError};
+use kerrno::{KError, KResult};
 use ktask::current;
 use kuaccess::vm_load_string;
 use linux_raw_sys::general::{__user_cap_data_struct, __user_cap_header_struct};
@@ -74,6 +74,8 @@ pub fn sys_get_mempolicy(
 /// - PR_SET_SECCOMP: enable seccomp mode, with the mode specified in `arg2`
 /// - PR_CAPBSET_READ: return whether a capability is in the bounding set
 /// - PR_GET_KEEPCAPS / PR_SET_KEEPCAPS: query or set the keep-capabilities flag
+/// - PR_GET_NO_NEW_PRIVS / PR_SET_NO_NEW_PRIVS: query or permanently set the calling thread's
+///   no-new-privileges flag, inherited by fork/clone and preserved across exec
 /// - PR_MCE_KILL: set the machine check exception policy
 /// - PR_SET_MM options: set various memory management options (start/end code/data/brk/stack)
 ///
@@ -121,7 +123,7 @@ pub fn sys_prctl(
             if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
                 return Err(KError::InvalidInput);
             }
-            return Err(KError::from(LinuxError::ENOSYS));
+            kprocess::current_user_thread().set_no_new_privileges();
         }
         PR_GET_NO_NEW_PRIVS => {
             if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
@@ -210,7 +212,7 @@ pub fn sys_prctl(
 
 #[cfg(unittest)]
 mod tests {
-    use kerrno::{KError, LinuxError};
+    use kerrno::KError;
     use linux_raw_sys::prctl::*;
     use unittest::{assert_eq, def_test};
 
@@ -264,16 +266,41 @@ mod tests {
     }
 
     #[def_test(user, serial)]
-    fn prctl_get_no_new_privs_reports_unset() {
+    fn prctl_no_new_privs_is_monotonic() {
         assert_eq!(sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), Ok(0));
+        assert_eq!(sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), Ok(0));
+        assert_eq!(sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), Ok(1));
+        assert_eq!(sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), Ok(0));
+        assert_eq!(
+            sys_prctl(PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0),
+            Err(KError::InvalidInput)
+        );
+        assert_eq!(sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), Ok(1));
     }
 
     #[def_test(user, serial)]
-    fn prctl_set_no_new_privs_requires_exec_enforcement() {
-        assert_eq!(
-            sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
-            Err(KError::from(LinuxError::ENOSYS))
-        );
+    fn prctl_no_new_privs_rejects_invalid_arguments_without_mutation() {
+        let initial = sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+        for (arg2, arg3, arg4, arg5) in [
+            (0, 0, 0, 0),
+            (2, 0, 0, 0),
+            (1, 1, 0, 0),
+            (1, 0, 1, 0),
+            (1, 0, 0, 1),
+        ] {
+            assert_eq!(
+                sys_prctl(PR_SET_NO_NEW_PRIVS, arg2, arg3, arg4, arg5),
+                Err(KError::InvalidInput)
+            );
+            assert_eq!(sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), initial);
+        }
+        for (arg2, arg3, arg4, arg5) in [(1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)] {
+            assert_eq!(
+                sys_prctl(PR_GET_NO_NEW_PRIVS, arg2, arg3, arg4, arg5),
+                Err(KError::InvalidInput)
+            );
+            assert_eq!(sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0), initial);
+        }
     }
 
     #[def_test(user, serial)]

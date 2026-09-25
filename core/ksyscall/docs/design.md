@@ -181,11 +181,21 @@ ksyscall::dispatch_irq_syscall
 
 Until unified user-namespace capability authorization exists, `clone` /
 `clone3` return `ENOSYS` for `CLONE_NEWCGROUP` instead of improvising
-namespace-creation permission with UID checks. The exec credential path
-does not yet enforce `no_new_privileges` promotion constraints, so
-`PR_SET_NO_NEW_PRIVS` returns `ENOSYS` and `PR_GET_NO_NEW_PRIVS` reports
-unset. seccomp likewise has no execution engine yet: `seccomp(2)` and
-`PR_SET_SECCOMP` return `ENOSYS` rather than faking success.
+namespace-creation permission with UID checks.
+
+`PR_SET_NO_NEW_PRIVS` validates the Linux argument contract and permanently
+sets the calling `Thread`'s flag; `PR_GET_NO_NEW_PRIVS` reads that flag.
+Fork and thread clone copy it from the calling thread, while exec preserves it.
+Existing sibling threads are unaffected. No privilege check is required to set it.
+The current exec path preserves effective UID/GID and supplementary groups;
+it only resets saved/filesystem IDs to effective IDs and clears keep-capabilities.
+It does not derive privileges from setuid/setgid file bits, file capabilities,
+or LSM transitions, so exec cannot add privileges with the flag set.
+Future file-based privilege transitions must consult the executing thread's
+flag before changing credentials. This does not implement seccomp or full
+capability enforcement, and it does not prohibit authorized non-exec set-ID calls.
+The contract follows the
+[Linux no-new-privileges documentation](https://docs.kernel.org/userspace-api/no_new_privs.html).
 
 ## Non-goals
 

@@ -122,8 +122,12 @@ same slot when it is Vacant/Retired, protecting reused PID/TID bindings. A
 
 Thread accounting uses None/User/Kernel: each state change charges elapsed time
 to the prior state before selecting the next. Thread exit and no-new-privileges
-are separately published atomic flags. Group/session changes create or select a
-group and publish group/session identity together; existing-group movement
+are separately published atomic flags. No-new-privileges is monotonic: it may be
+set on the calling thread, is copied at fork/clone, and is not cleared by exec.
+It is not shared with existing sibling threads. The exec credential owner must
+honor it when implementing any executable privilege transition.
+Group/session changes create or select a group and publish group/session identity
+together; existing-group movement
 requires the same session. The syscall owner checks additional leader/ID rules.
 
 ## Critical flows

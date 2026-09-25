@@ -520,6 +520,8 @@ impl Cred {
     /// supplementary groups remain unchanged. `KEEP_CAPS_LOCKED` remains set if it was set, while
     /// `KEEP_CAPS` is cleared regardless of that lock. This method does not
     /// inspect an executable, apply setuid/setgid file bits, or publish credentials.
+    /// Any caller adding executable privilege transitions must suppress them when
+    /// the executing thread has `no_new_privileges` set, before calling this reset.
     pub fn apply_exec(&mut self) {
         // Future setuid/setgid executable support must update euid/egid before this reset.
         self.suid = self.euid;

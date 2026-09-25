@@ -80,6 +80,7 @@ copy wrappers.
 | T-11 | `riscv_hwprobe` consumes unvalidated user cpusets/pairs | Medium | bad pointers, oversized masks or pair counts causing huge kernel allocations (DoS) or corrupt ABI results | Pairs stream one by one (`read_vm`/`write_vm`, no bulk `Vec` allocation; an oversized `pair_count` only walks into unmapped pages and returns `EFAULT`); `cpusetsize` is clamped to `cpumask_size()` on both load and write; non-`0`/`WHICH_CPUS` `flags` return `EINVAL`; in value mode an empty intersection of the user cpuset with online CPUs returns `EINVAL`; `cpus == NULL && cpusetsize != 0` returns `EFAULT`; in WHICH_CPUS mode an empty cpuset means all online CPUs, unknown keys write `key=-1,value=0` and clear the output cpuset; key semantics live in the `kcpu` hwprobe helper |
 | T-12 | Syscall hot path reads unreliable RISC-V hardware state | Medium | S-mode reads of M-mode CSRs faulting, or capability divergence across CPUs | The source of truth is the FDT-initialized snapshot in `kcpu`; `ksyscall` only aggregates over the selected CPU mask |
 | T-13 | `get_robust_list` leaks another process's user addresses | High | target resolution | After resolving the target thread, `kprocess::ptrace::check_read_real_creds_access()` applies the uniform policy: same-thread-group exemption, asymmetric matching of caller real UID/GID against target real/effective/saved IDs, and the euid-0 approximation of `CAP_SYS_PTRACE`; otherwise `EPERM` |
+| T-14 | Exec adds privileges despite `no_new_privileges` | High | Future executable credential transitions bypass the thread flag | The current exec path does not grant file-derived privileges; the monotonic thread flag survives fork/clone/exec. Any future set-ID, file-capability or LSM privilege transition must honor it before committing credentials. |
 
 ## Known limitations
 
@@ -87,14 +88,18 @@ copy wrappers.
   falls back to file `ioctl`. Socket file vtables do not yet implement
   `ioctl`, so SIOC* still hangs on the syscall adapter instead of the Linux
   `sock_ioctl` shape.
-- Capability, seccomp, and `no_new_privileges` security ABIs must not
-  return success inconsistent with actual enforcement (currently `ENOSYS`).
+- `no_new_privileges` prevents exec from granting new privileges in the current
+  credential model; it does not supply capability sets, seccomp enforcement,
+  user-namespace isolation, or restrictions on otherwise authorized set-ID calls.
+  Capability and seccomp enforcement remain incomplete.
 
 ## Audit checklist
 
 - cgroup/namespace flags may leave the `ENOSYS` list only when fully
   implemented; adapters do not create a second membership or namespace-view
   state.
+- Do any new executable privilege transitions honor the executing thread's
+  `no_new_privileges` flag before publishing credentials?
 - Does a new syscall implementation only adapt the ABI instead of copying
   an owner state machine?
 - Is a new adapter placed near its owner rather than in a historical

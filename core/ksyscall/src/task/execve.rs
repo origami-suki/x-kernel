@@ -113,6 +113,10 @@ pub fn sys_execve(
     };
 
     process.apply_exec_update(exec_update)?;
+    // Exec currently preserves effective IDs and groups and applies neither
+    // set-ID file bits nor file capabilities, so it cannot grant new privileges.
+    // Any future file-based privilege transition must honor this thread's
+    // no_new_privileges flag before preparing or committing elevated credentials.
     let mut exec_cred = thread.prepare_creds();
     exec_cred.apply_exec();
     thread.commit_creds(exec_cred);
