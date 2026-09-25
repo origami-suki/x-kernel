@@ -145,6 +145,9 @@ TaskContext       (每架构定义，callee-saved 寄存器用于上下文切换
 
 - **`init_trap()`**：必须在 per-CPU 数据初始化之后、调度器启动之前调用。
   每个架构在该函数中完成异常表排序、硬件描述符表加载、trap 向量基址设置。
+  AArch64 在每个 CPU 上设置 `SCTLR_EL1.UCT/UCI` 并执行 `ISB`，允许 EL0
+  读取 `CTR_EL0` 及按虚拟地址进行缓存维护，使 libgcc `__clear_cache` 等
+  用户运行时能够同步新生成的指令；不修改其他 SCTLR 控制位，也不模拟成功。
 - **trap handler**（如 `x86_trap_handler`）：运行在中断关闭上下文中，
   不可睡眠或阻塞。由汇编入口直接调用，调用时栈上已保存完整 trap frame。
 - **riscv64 `gp` 不变量**：`gp`（x3）是每 CPU 的 percpu 基址，启动时由

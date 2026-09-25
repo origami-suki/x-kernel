@@ -46,6 +46,12 @@
 
 - **用户态寄存器状态**：`UserContext::run()` 切换到用户态后，用户可控制
   所有通用寄存器内容。trap handler 需正确处理任意寄存器值。
+- **AArch64 用户态缓存同步**：每 CPU 的 `init_trap()` 设置 `SCTLR_EL1.UCT/UCI`，
+  允许 EL0 读取 `CTR_EL0` 并执行架构允许的按虚拟地址缓存维护。地址转换和
+  访问检查仍由硬件执行；这不允许访问 EL1 控制寄存器或按 set/way 维护缓存。
+  未定义指令及其他禁止操作继续走异常/信号路径。当前固定同构 QEMU CPU
+  直接暴露本 CPU 的 CTR；异构缓存参数、硬件勘误或 EL2 的额外陷阱控制需
+  平台另行处理，不能据此宣称已在真实硬件验证缓存一致性。
 - **riscv64 `gp`（percpu 基址）**：`gp` 是每 CPU 不变量，绝不从每任务
   trapframe 恢复。trap 途中任务可能因 handler 阻塞而迁移到其他 hart；若从
   可迁移的 trapframe 恢复 `gp`，会把另一 hart 的 percpu 基址装入本 hart，

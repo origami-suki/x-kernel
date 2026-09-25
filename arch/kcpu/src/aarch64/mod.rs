@@ -14,7 +14,7 @@ pub mod userspace;
 
 use aarch64_cpu::{
     asm::barrier,
-    registers::{CNTKCTL_EL1, ReadWriteable},
+    registers::{CNTKCTL_EL1, ReadWriteable, SCTLR_EL1},
 };
 
 pub use self::ctx::{ExceptionContext as TrapFrame, ExceptionContext, FpState, TaskContext};
@@ -31,13 +31,24 @@ fn enable_user_timer_access() {
     barrier::isb(barrier::SY);
 }
 
+/// Allow user runtimes to discover cache line sizes and synchronize generated code.
+#[inline]
+fn enable_user_cache_access() {
+    // libgcc's __clear_cache reads CTR_EL0 before issuing VA-based cache
+    // maintenance. Configure every CPU before it can run an EL0 task.
+    SCTLR_EL1.modify(SCTLR_EL1::UCT::DontTrap + SCTLR_EL1::UCI::DontTrap);
+    barrier::isb(barrier::SY);
+}
+
 /// Initializes trap handling on the current CPU.
 ///
 /// In detail, it initializes the exception vector, and sets `TTBR0_EL1` to 0 to
-/// block low address access.
+/// block low address access. It also enables EL0 timer access, cache type reads,
+/// and address-based cache maintenance for user runtime code synchronization.
 pub fn init_trap() {
     crate::userspace_common::init_exception_table();
     enable_user_timer_access();
+    enable_user_cache_access();
     unsafe extern "C" {
         fn exception_vector_base();
     }
