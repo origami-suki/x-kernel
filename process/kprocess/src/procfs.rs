@@ -46,3 +46,11 @@ pub fn thread_task(tid: Tid) -> KResult<KtaskRef> {
 pub fn thread_ids(process: &Arc<Process>) -> alloc::vec::Vec<Tid> {
     process.threads()
 }
+
+/// Counts currently published threads without allocating a thread-ID snapshot.
+///
+/// Uses the same membership view as [`thread_ids`]. Call from task context;
+/// the count is observational and does not pin membership against clone/exit.
+pub fn thread_count(process: &Process) -> usize {
+    process.thread_count()
+}

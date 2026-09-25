@@ -135,6 +135,15 @@ pub trait SimpleDirOps: Send + Sync + 'static {
     /// Look up a child directory or file by name.
     fn lookup_child(&self, lookup: SimpleDirLookup<'_>, name: &str) -> VfsResult<Dentry>;
 
+    /// Refreshes a metadata snapshot for each stat query, including open directory FDs.
+    ///
+    /// The default preserves stored metadata. Called in task context after the
+    /// simple node's metadata lock is released; changes affect only this query.
+    /// Chained operations apply left to right. Errors propagate to the caller.
+    fn getattr(&self, metadata: Metadata) -> VfsResult<Metadata> {
+        Ok(metadata)
+    }
+
     /// Check if the directory is cacheable.
     fn supports_dentry_cache(&self) -> bool {
         true
@@ -300,6 +309,10 @@ impl Default for DirMapping {
 pub struct ChainedDirOps<A, B>(A, B);
 
 impl<A: SimpleDirOps, B: SimpleDirOps> SimpleDirOps for ChainedDirOps<A, B> {
+    fn getattr(&self, metadata: Metadata) -> VfsResult<Metadata> {
+        self.1.getattr(self.0.getattr(metadata)?)
+    }
+
     fn child_names<'a>(&'a self) -> VfsResult<Box<dyn Iterator<Item = Cow<'a, str>> + 'a>> {
         Ok(Box::new(self.0.child_names()?.chain(self.1.child_names()?)))
     }
@@ -435,9 +448,11 @@ impl<O: SimpleDirOps> InodeOperations for SimpleDirInodeOperations<O> {
         request_mask: crate::GetattrRequestMask,
         query_flags: crate::GetattrQueryFlags,
     ) -> VfsResult<Metadata> {
-        self.dir
+        let metadata = self
+            .dir
             .node
-            .getattr(idmap, path, request_mask, query_flags)
+            .getattr(idmap, path, request_mask, query_flags)?;
+        self.dir.ops.getattr(metadata)
     }
 
     fn setattr(
@@ -611,5 +626,82 @@ impl<O: SimpleDirOps> FileDirOperations for SimpleDirFileOperations<O> {
     fn iterate_shared(&self, file: &VfsFile, ctx: &mut DirContext<'_>) -> VfsResult<usize> {
         let start = ctx.pos();
         self.dir.read_dir_at(file.path().dentry(), start, ctx)
+    }
+}
+
+#[cfg(unittest)]
+mod tests {
+    use unittest::{assert_eq, def_test};
+
+    use super::*;
+    use crate::{FileSystemType, GetattrQueryFlags, GetattrRequestMask, Mount};
+
+    static TEST_FS: FileSystemType = FileSystemType::internal("simple-dir-stat-test");
+
+    struct DynamicDir {
+        links: Arc<Mutex<VfsResult<u64>>>,
+    }
+
+    impl SimpleDirOps for DynamicDir {
+        fn child_names<'a>(&'a self) -> VfsResult<Box<dyn Iterator<Item = Cow<'a, str>> + 'a>> {
+            Ok(Box::new(core::iter::empty()))
+        }
+
+        fn lookup_child(&self, _lookup: SimpleDirLookup<'_>, _name: &str) -> VfsResult<Dentry> {
+            Err(VfsError::NotFound)
+        }
+
+        fn getattr(&self, mut metadata: Metadata) -> VfsResult<Metadata> {
+            metadata.nlink = (*self.links.lock())?;
+            Ok(metadata)
+        }
+    }
+
+    #[def_test]
+    fn simple_dir_stat_refreshes_same_inode_and_propagates_errors() {
+        let links = Arc::new(Mutex::new(Ok(3)));
+        let ops = Arc::new(
+            DynamicDir {
+                links: links.clone(),
+            }
+            .chain(DirMapping::new()),
+        );
+        let fs = SimpleFs::new_with(&TEST_FS, 0, move |fs| SimpleDir::new_maker(fs, ops));
+        let path = Mount::new_root(&fs).root_path();
+        let inode = path.dentry().inode_ref();
+        let stat = || {
+            inode.getattr(
+                &path,
+                GetattrRequestMask::empty(),
+                GetattrQueryFlags::empty(),
+            )
+        };
+        for count in [3, 4, 5, 4, 3, 2] {
+            *links.lock() = Ok(count);
+            assert_eq!(stat().unwrap().nlink, count);
+            // The query override must not mutate the cached inode identity/state.
+            assert_eq!(inode.metadata().nlink, 2);
+        }
+        *links.lock() = Err(VfsError::NoSuchProcess);
+        assert_eq!(stat().unwrap_err(), VfsError::NoSuchProcess);
+    }
+
+    #[def_test]
+    fn simple_dir_default_stat_preserves_stored_metadata() {
+        let fs = SimpleFs::new_with(&TEST_FS, 0, |fs| {
+            SimpleDir::new_maker(fs, Arc::new(DirMapping::new()))
+        });
+        let path = Mount::new_root(&fs).root_path();
+        let inode = path.dentry().inode_ref();
+        let stat = inode
+            .getattr(
+                &path,
+                GetattrRequestMask::empty(),
+                GetattrQueryFlags::empty(),
+            )
+            .unwrap();
+        assert_eq!(stat.nlink, 2);
+        assert_eq!(stat.mode, inode.metadata().mode);
+        assert_eq!(stat.inode, inode.metadata().inode);
     }
 }

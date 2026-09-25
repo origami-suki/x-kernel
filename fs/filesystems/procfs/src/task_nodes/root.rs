@@ -51,6 +51,17 @@ struct ProcessTaskDir {
 }
 
 impl SimpleDirOps for ProcessTaskDir {
+    fn getattr(&self, mut metadata: Metadata) -> VfsResult<Metadata> {
+        // Linux proc_task_getattr includes one link per published thread.
+        // An open directory must observe clone/exit, not its creation-time count.
+        let thread_count = self
+            .process
+            .upgrade()
+            .map_or(0, |process| procfs::thread_count(&process));
+        metadata.nlink = 2 + thread_count as u64;
+        Ok(metadata)
+    }
+
     fn child_names<'a>(&'a self) -> VfsResult<Box<dyn Iterator<Item = Cow<'a, str>> + 'a>> {
         let Some(process) = self.process.upgrade() else {
             return Ok(Box::new(iter::empty()));

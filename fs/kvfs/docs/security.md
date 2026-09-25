@@ -389,3 +389,9 @@ serialization domain as buffered writes/truncate. It is blocking and
 non-reentrant; callers must not hold IRQ/spin locks or reenter operations that
 acquire it. Memfs takes data before its seal mutex. KVFS does not interpret seal
 bits and introduces no filesystem-specific dependency or new unsafe boundary.
+
+### 动态目录 stat
+
+`SimpleDirOps::getattr` 只处理内核元数据快照，不接收用户指针。SimpleFsNode 的元数据锁
+在调用后端前释放，避免再查询进程成员表时引入锁反转。后端错误必须传播；默认目录的
+元数据不变。快照不提供跨 clone/exit 的事务保证，不能用一次计数作为后续授权依据。

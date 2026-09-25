@@ -148,3 +148,7 @@ exit readiness and CPU accounting. Test source existence is not execution proof.
 - Preserve objective/subjective credential lock order and override assertion.
 - Check signal preparation retry safety and commit-before-wakeup ordering.
 - Document and validate optional TEE/TIPC callbacks and architecture MM hooks.
+
+Procfs thread counts are observational membership snapshots, not lifetime pins or
+permission checks. The count uses the existing membership/slot locks and excludes
+reserved or retired slots; no separate atomic counter can drift from publication.

@@ -64,6 +64,9 @@ retains init identity; orphan reparenting reserves an init relation slot.
 - `scheduler`, `resource_limits`, `capability` and job-control mutation queries
   resolve non-exited processes. Query/pidfd views may retain published zombies.
   `procfs` additionally requires a representative published task for listing.
+  Its `thread_count` facade shares the published-membership view used by
+  `thread_ids`, without allocating a vector; clone publication and exit retirement
+  therefore update proc task directory link counts through the same lifecycle.
 - `process_signals` resolves process/group/thread targets and calls `ksignal`,
   interrupting a chosen task. `None` probes a target without queuing a signal.
   These helpers do not perform all syscall permission checks.

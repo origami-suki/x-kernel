@@ -708,6 +708,11 @@ credential。`child_names()` 可传播生命周期或后端错误，使旧目录
 静默转换为空目录。需要持久 identity 的 pseudo filesystem 可用 `SimpleFile::new_inode()`、
 `SimpleDir::new_inode_with_owner()` 和 `SimpleDirLookup::{file,dir}_from_inode()` 重用 inode。
 
+`SimpleDirOps::getattr()` 在复制节点元数据并释放其锁后更新本次查询的快照。
+默认实现保留原值，链式目录按左右顺序应用更新，错误原样传播。这个入口覆盖路径 stat
+和已打开目录的 fstat，适用于 proc task 等随生命周期变化的字段；不改写 inode 缓存，
+不在目录初始化时固定线程数，也不让 VFS 反向依赖进程模块。
+
 ## Drop / 资源释放
 
 VFS 对象通过 `Arc`/`Weak` 管理生命周期。unlink、rename replacement 和 forget 会从
