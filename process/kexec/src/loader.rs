@@ -313,18 +313,28 @@ fn load_segments(entry: &ElfCacheEntry, base: usize) -> Option<Vec<LoadSegment>>
 
 /// Range covered by `segments` when the image is loaded at `base`.
 ///
-/// The result uses the same page rounding as `map_elf`, so it describes the
-/// exact span that must stay free before `base` can be used. Returns `None`
-/// when there is no loadable segment or when an end address overflows.
+/// The result mirrors `map_elf` exactly: a segment maps
+/// `align_up(mem_size + page_offset)` bytes starting at
+/// `align_down(virtual_addr)`. The page offset must be added *before* rounding,
+/// because a segment that starts mid-page needs a partial final page; rounding
+/// `align_down(virtual_addr) + mem_size` instead drops that page whenever
+/// `mem_size` is not a multiple of the page size.
+///
+/// Returns `None` when there is no loadable segment or when an end address
+/// overflows.
 fn load_range_for_segments(segments: &[LoadSegment], base: usize) -> Option<VirtAddrRange> {
     let mut start = None;
     let mut end = 0usize;
 
     for segment in segments {
         let vaddr = segment.virtual_addr.checked_add(base)?;
+        let page_offset = vaddr.align_offset_4k();
         let mapped_start = VirtAddr::from_usize(vaddr).align_down_4k().as_usize();
-        let seg_end = mapped_start.checked_add(segment.mem_size)?;
-        let mapped_end = VirtAddr::from_usize(seg_end).align_up_4k().as_usize();
+        // Round up with checked arithmetic: `VirtAddr::align_up_4k` panics on
+        // overflow, and both the page offset and the size come from the file.
+        let unaligned_size = page_offset.checked_add(segment.mem_size)?;
+        let mapped_size = unaligned_size.checked_add(PAGE_SIZE_4K - 1)? & !(PAGE_SIZE_4K - 1);
+        let mapped_end = mapped_start.checked_add(mapped_size)?;
         start = Some(start.map_or(mapped_start, |current: usize| current.min(mapped_start)));
         end = end.max(mapped_end);
     }
@@ -785,17 +795,42 @@ mod tests {
         }
     }
 
+    /// Independent copy of `map_elf`'s mapping arithmetic.
+    ///
+    /// Tests compare against this instead of hard-coded numbers: a literal
+    /// expected value can be edited to match a wrong implementation, which is
+    /// how the missing-page defect survived review once already.
+    fn map_elf_pages(vaddr: usize, mem_size: usize) -> (usize, usize) {
+        let mapped_start = VirtAddr::from_usize(vaddr).align_down_4k().as_usize();
+        let mapped_size = VirtAddr::from_usize(vaddr.align_offset_4k() + mem_size)
+            .align_up_4k()
+            .as_usize();
+        (mapped_start, mapped_start + mapped_size)
+    }
+
+    fn expected_range(segments: &[LoadSegment], base: usize) -> (usize, usize) {
+        let mut start = usize::MAX;
+        let mut end = 0;
+        for segment in segments {
+            let (segment_start, segment_end) =
+                map_elf_pages(segment.virtual_addr + base, segment.mem_size);
+            start = start.min(segment_start);
+            end = end.max(segment_end);
+        }
+        (start, end)
+    }
+
     #[def_test]
     fn load_range_covers_every_load_segment() {
         // Same shape as the shipped musl loader: an RX segment and a far RW one.
-        // The end is page-rounded only; rounding up to the load alignment is
-        // the placement step's job, because `find_free_area` reports an
-        // `align`-aligned start rather than an aligned span end.
         let segments = [load_segment(0x0, 0xa19f4), load_segment(0xbfb00, 0x3410)];
-        let range = load_range_for_segments(&segments, 0x400_0000).expect("range");
+        let base = 0x400_0000;
+        let range = load_range_for_segments(&segments, base).expect("range");
 
-        assert_eq!(range.start.as_usize(), 0x400_0000);
-        assert_eq!(range.end.as_usize(), 0x40c_3000);
+        assert_eq!(
+            (range.start.as_usize(), range.end.as_usize()),
+            expected_range(&segments, base)
+        );
         assert_eq!(range.size(), 0xc_3000);
         // The placement step reserves an `align`-aligned span, because
         // `find_free_area` reports an aligned start rather than an aligned end.
@@ -808,16 +843,53 @@ mod tests {
     }
 
     #[def_test]
+    fn load_range_adds_the_page_offset_before_rounding() {
+        // A segment that starts mid-page and does not end on a page boundary
+        // needs a partial final page. Rounding `align_down(vaddr) + mem_size`
+        // instead of `align_offset(vaddr) + mem_size` drops that page, so the
+        // placement search would treat a mapped page as free.
+        let segments = [load_segment(0x10dd0, 0x5000298)];
+        let base = 0x1000;
+        let range = load_range_for_segments(&segments, base).expect("range");
+
+        assert_eq!(range.end.as_usize(), 0x501_3000);
+        assert_eq!(range.size(), 0x500_2000);
+        assert_eq!(range.end.as_usize(), expected_range(&segments, base).1);
+    }
+
+    #[def_test]
+    fn load_range_agrees_with_map_elf_for_many_layouts() {
+        for page_offset in [0usize, 1, 0x40, 0x800, 0xfff] {
+            for mem_size in [1usize, 0x1000, 0x1fff, 0x2000, 0x3410, 0xa19f4, 0x5000298] {
+                let segments = [
+                    load_segment(page_offset, mem_size),
+                    load_segment(0xbfb00, 0x3410),
+                ];
+                let base = 0x400_0000;
+                let range = load_range_for_segments(&segments, base).expect("range");
+
+                assert_eq!(
+                    (range.start.as_usize(), range.end.as_usize()),
+                    expected_range(&segments, base),
+                    "vaddr={page_offset:#x} mem_size={mem_size:#x}"
+                );
+            }
+        }
+    }
+
+    #[def_test]
     fn load_range_includes_page_rounding_of_large_bss() {
         // An 80 MiB BSS in a PIE whose RW segment starts mid-page: the range
         // must reach past the interpreter hint so placement can detect it.
         let segments = [load_segment(0x0, 0x974), load_segment(0x10dd0, 0x5000298)];
-        let range = load_range_for_segments(&segments, 0x1000).expect("range");
+        let base = 0x1000;
+        let range = load_range_for_segments(&segments, base).expect("range");
 
         assert_eq!(
-            (range.start.as_usize(), range.end.as_usize(), range.size()),
-            (0x1000, 0x501_2000, 0x501_1000)
+            (range.start.as_usize(), range.end.as_usize()),
+            expected_range(&segments, base)
         );
+        assert_eq!(range.end.as_usize(), 0x501_3000);
         // The span must cover the fixed interpreter hint that the old loader
         // used unconditionally.
         assert!(range.contains(VirtAddr::from_usize(0x400_0000)));
