@@ -161,7 +161,7 @@ impl SlabHeap {
             slab_512: Slab::new(),
             slab_1024: Slab::new(),
             slab_2048: Slab::new(),
-            buddy: BuddyAllocator::new(),
+            buddy: BuddyAllocator::new_for_slab_heap(),
         };
         heap.buddy.init_region(start, size).unwrap_or_else(|e| {
             panic!(

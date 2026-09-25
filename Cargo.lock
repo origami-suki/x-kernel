@@ -103,6 +103,7 @@ version = "0.2.0"
 dependencies = [
  "buddy_system_allocator",
  "criterion 0.5.1",
+ "intrusive-collections",
  "kerrno",
  "rand",
  "rlsf",
@@ -1957,6 +1958,15 @@ name = "int_ratio"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6045ea39e8d2862506c0dff6c65d068da362335df698bb1634033492740d2170"
+
+[[package]]
+name = "intrusive-collections"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b719c59241cfaac1042a6d26787e28ed7ee4a4e21a5a907786f54222d1b0062"
+dependencies = [
+ "memoffset",
+]
 
 [[package]]
 name = "iov_iter"
