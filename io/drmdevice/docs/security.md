@@ -115,3 +115,13 @@ interaction goes through the `DisplayDevice` trait object.
 - Any new mmap-visible offset comes from the kernel offset allocator.
 - New object tables retain backing memory as long as user mappings can
   reference them.
+
+## String copy boundaries
+
+VERSION string lengths are untrusted capacities on input; output lengths do not
+increase the permitted copy size. Zero/NULL queries never dereference user memory.
+GET_UNIQUE must not partially overwrite a short buffer: it reports the size and
+copies only a complete value. Both ioctls retain UserPtr copying and EFAULT for
+invalid destinations. Guest canaries verify bytes beyond the advertised capacity
+remain unchanged. Fixed identity/master-state limitations are not resolved by
+this buffer-safety correction.

@@ -139,3 +139,17 @@ primary ClassDevice<DisplayDeviceImpl> (display scanout backend, via kclass)
 - Build-once system blobs behind double-checked atomics: the IN-FORMATS
   blob is read on every atomic check but must be allocated once; the
   atomic fast path keeps per-frame ioctls lock-free on the hot path.
+
+## Driver string query ABI
+
+VERSION records each input capacity before reporting the full string length and
+copies at most that capacity. A NULL pointer or zero capacity requests only the
+length; no terminating NUL is added. GET_UNIQUE uses the distinct Linux rule:
+copy only when the complete value fits, otherwise leave the buffer untouched
+and report its required size. Invalid non-NULL copy destinations return EFAULT.
+The minimal fixed driver identity remains unchanged; this does not implement
+Linux per-open master or SET_VERSION-dependent bus-id lifetime.
+
+Reference: Linux v6.12 drivers/gpu/drm/drm_ioctl.c (drm_copy_field, drm_getunique).
+Regression: the same AArch64 ioctl probe on the supplied Linux and x-kernel,
+including zero buffers, short-buffer canaries, full values and bad pointers.

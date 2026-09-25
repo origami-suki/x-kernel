@@ -120,6 +120,19 @@ struct DrmModeSetCrtc(DrmModeCrtc);
 #[derive(Clone, Copy, bytemuck::AnyBitPattern, macros::UserRead, macros::UserWrite)]
 struct DrmModeRmFb(u32);
 
+/// VERSION allows length-only queries and truncates each string to the
+/// supplied capacity. Lengths report the full value, without a trailing NUL.
+/// This follows Linux drm_copy_field, including NULL with nonzero capacity.
+fn copy_version_field(ptr: UserPtr<u8>, capacity: &mut usize, value: &[u8]) -> VfsResult<()> {
+    let count = (*capacity).min(value.len());
+    *capacity = value.len();
+    if count != 0 && !ptr.is_null() {
+        ptr.write_vm_slice(&value[..count])
+            .map_err(|_| VfsError::BadAddress)?;
+    }
+    Ok(())
+}
+
 impl DrmIoctl for DrmVersion {
     const CMD: u32 = iowr::<DrmVersion>(DRM_TYPE, 0x00);
 
@@ -127,21 +140,9 @@ impl DrmIoctl for DrmVersion {
         version.version_major = DRIVER_VERSION_MAJOR;
         version.version_minor = DRIVER_VERSION_MINOR;
         version.version_patchlevel = DRIVER_VERSION_PATCHLEVEL;
-        version.name_len = DRIVER_NAME.len();
-        version
-            .name
-            .write_vm_slice(DRIVER_NAME.as_bytes())
-            .map_err(|_| VfsError::BadAddress)?;
-        version.date_len = DRIVER_DATE.len();
-        version
-            .date
-            .write_vm_slice(DRIVER_DATE.as_bytes())
-            .map_err(|_| VfsError::BadAddress)?;
-        version.desc_len = DRIVER_DESC.len();
-        version
-            .desc
-            .write_vm_slice(DRIVER_DESC.as_bytes())
-            .map_err(|_| VfsError::BadAddress)?;
+        copy_version_field(version.name, &mut version.name_len, DRIVER_NAME.as_bytes())?;
+        copy_version_field(version.date, &mut version.date_len, DRIVER_DATE.as_bytes())?;
+        copy_version_field(version.desc, &mut version.desc_len, DRIVER_DESC.as_bytes())?;
         Ok(0)
     }
 }
@@ -167,11 +168,15 @@ impl DrmIoctl for DrmUnique {
 
     fn handle(_dev: &Card0, unique: &mut Self) -> VfsResult<usize> {
         let unique_str: String = format!("{}:0", DRIVER_NAME);
+        // Unlike VERSION, Linux GET_UNIQUE copies only when the whole value
+        // fits. A short buffer is a size query and must remain untouched.
+        if unique.unique_len >= unique_str.len() {
+            unique
+                .unique
+                .write_vm_slice(unique_str.as_bytes())
+                .map_err(|_| VfsError::BadAddress)?;
+        }
         unique.unique_len = unique_str.len();
-        unique
-            .unique
-            .write_vm_slice(unique_str.as_bytes())
-            .map_err(|_| VfsError::BadAddress)?;
         Ok(0)
     }
 }
