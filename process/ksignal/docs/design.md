@@ -168,3 +168,20 @@ Managers are created by `kprocess` when a process/thread runtime is built
 kernel resources are allocated beyond the queues themselves; frame memory
 lives in user address space and alternate stacks are user-owned. There is
 no explicit Drop behavior in this crate.
+
+## Pending arrival notification
+
+ProcessSignalManager owns a PollSet for arrivals to the process queue or any
+member thread queue. Both enqueue paths publish the pending signal, release
+pending/action/children locks, then wake this source. ThreadSignalManager exposes
+registration for signalfd readers. The source is a recheck hint, not a claim
+that a particular fd mask or calling thread has a matching signal. Unrelated
+thread arrivals can wake subscribers; final readiness/dequeue still uses the
+calling thread's private plus process pending state.
+
+This follows the separation used by Linux signalfd: queue readiness notifications
+are independent of whether ordinary handler delivery can interrupt a task.
+Blocked signals stay blocked; no forced task interruption, periodic polling or
+signalfd-to-creator-thread binding is added. The source owns no file/thread
+callbacks directly: cancellable PollRegistrations retain the existing kpoll
+lifecycle, including an allowed late wake after concurrent cancellation.

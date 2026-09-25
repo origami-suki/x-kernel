@@ -13,6 +13,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use kpoll::{PollContext, PollRegisterError, PollSet};
 use kspin::SpinNoIrq;
 
 use crate::{
@@ -55,6 +56,9 @@ impl IndexMut<Signo> for SignalActions {
 pub struct ProcessSignalManager {
     /// Process-level pending signals queue
     pending: SpinNoIrq<PendingSignals>,
+
+    /// Arrivals to process or member-thread queues; readers recheck their mask.
+    pending_events: PollSet,
 
     /// Shared signal action handlers
     pub actions: Arc<SpinNoIrq<SignalActions>>,
@@ -106,6 +110,7 @@ impl ProcessSignalManager {
     pub fn new(actions: Arc<SpinNoIrq<SignalActions>>, default_restorer: usize) -> Self {
         Self {
             pending: SpinNoIrq::new(PendingSignals::default()),
+            pending_events: PollSet::new(),
             actions,
             default_restorer,
             children: SpinNoIrq::new(Vec::new()),
@@ -309,9 +314,24 @@ impl ProcessSignalManager {
     }
 
     fn put_pending_signal(&self, sig: SignalInfo) {
-        if self.pending.lock().put_signal(sig) {
+        let queued = self.pending.lock().put_signal(sig);
+        if queued {
             self.has_pending.store(true, Ordering::Release);
+            self.notify_pending_signal();
         }
+    }
+
+    /// Publish readiness only after the pending/action/children locks are gone:
+    /// a waker may synchronously re-enter signal inspection or epoll.
+    pub(super) fn notify_pending_signal(&self) {
+        self.pending_events.wake();
+    }
+
+    pub(super) fn register_pending_signals(
+        &self,
+        context: &mut PollContext<'_>,
+    ) -> Result<(), PollRegisterError> {
+        context.register(&self.pending_events)
     }
 
     /// Finds a suitable thread and reports whether any live thread blocks it.

@@ -12,6 +12,7 @@ use core::{
 
 use kcpu::userspace::{UserContext, UserRestorableContext};
 use kerrno::{KResult, LinuxError};
+use kpoll::{PollContext, PollRegisterError};
 use kspin::SpinNoIrq;
 use osvm::VirtMutPtr;
 
@@ -296,10 +297,29 @@ impl ThreadSignalManager {
             return false;
         }
 
-        if self.pending.lock().put_signal(sig) {
+        let queued = self.pending.lock().put_signal(sig);
+        if queued {
             self.possibly_has_signal.store(true, Ordering::Release);
+            self.proc.notify_pending_signal();
         }
         !is_blocked
+    }
+
+    /// Subscribes to pending-signal arrivals in this process and its threads.
+    ///
+    /// This is a readiness hint: consumers must recheck this calling thread's
+    /// pending queues against their own mask. Unrelated thread signals can
+    /// cause spurious wakes. Registration does not change signal blocking or
+    /// bind a signalfd to the thread that originally created the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Forwards poll registration allocation or token-exhaustion errors.
+    pub fn register_pending_signals(
+        &self,
+        context: &mut PollContext<'_>,
+    ) -> Result<(), PollRegisterError> {
+        self.proc.register_pending_signals(context)
     }
 
     /// Returns the current blocked signal set.

@@ -101,3 +101,18 @@ metadata, not user file content. No other user data is processed or logged.
 - Dequeue observers must stay cheap and non-sleeping.
 - Fast-path atomics must be updated with the queue-lock discipline described
   in design.md (store after successful enqueue under lock).
+
+## signalfd readiness observers
+
+A successfully queued process or thread signal notifies the process arrival
+PollSet only after all local signal-state spin guards have been released.
+Callbacks may synchronously re-enter pending-state inspection; holding a queue
+lock across wake would deadlock. No user pointers or new unsafe operations are
+introduced. Pending masks and send_signal's target/interrupt result are unchanged.
+
+The notification source is process-scoped and carries no signal payload. Readers
+must use their current thread plus process queue and their own selected mask.
+Spurious wakes do not authorize consumption of another thread's pending signals.
+Tests cover both directed paths, callback re-entry, cancelled subscriptions,
+shared descriptors and fd-mask updates. This does not broaden inherited epoll
+registration guarantees across fork.

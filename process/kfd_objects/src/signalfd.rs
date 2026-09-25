@@ -197,6 +197,7 @@ impl Pollable for SignalfdAccess {
     ) -> Result<(), PollRegisterError> {
         if events.contains(IoEvents::IN) {
             context.register(&self.signalfd.poll_rx)?;
+            self.signal.register_pending_signals(context)?;
         }
         Ok(())
     }
@@ -278,10 +279,167 @@ impl FileOperations for SignalfdFops {
 
 #[cfg(unittest)]
 mod tests {
-    use ksignal::{ChildExitInfo, ChildExitSignalInfo, Signo};
+    use alloc::{sync::Weak, task::Wake};
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Waker},
+    };
+
+    use kpoll::PollRegistrations;
+    use ksignal::{
+        ChildExitInfo, ChildExitSignalInfo, Signo,
+        api::{ProcessSignalManager, SignalActions},
+    };
+    use kspin::SpinNoIrq;
     use unittest::{assert, assert_eq, def_test};
 
     use super::*;
+
+    struct PendingWake {
+        signal: Weak<ThreadSignalManager>,
+        count: AtomicUsize,
+    }
+
+    impl Wake for PendingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            // Re-enter the queue: notifying while holding its spinlock would
+            // deadlock here. The signal must already be visible to the reader.
+            let signal = self.signal.upgrade().expect("live signal manager");
+            core::assert!(signal.pending().has(Signo::SIGTERM));
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_access() -> (SignalfdAccess, Arc<PendingWake>) {
+        let process = Arc::new(ProcessSignalManager::new(
+            Arc::new(SpinNoIrq::new(SignalActions::default())),
+            0,
+        ));
+        let signal = ThreadSignalManager::new(1, process);
+        let mut mask = SignalSet::default();
+        mask.add(Signo::SIGTERM);
+        signal.set_blocked(mask);
+        let wake = Arc::new(PendingWake {
+            signal: Arc::downgrade(&signal),
+            count: AtomicUsize::new(0),
+        });
+        (
+            SignalfdAccess {
+                signalfd: Signalfd::new(mask),
+                signal,
+            },
+            wake,
+        )
+    }
+
+    #[def_test]
+    fn test_signalfd_wakes_for_blocked_process_and_thread_arrivals() {
+        for thread_directed in [false, true] {
+            let (access, wake) = pending_access();
+            let waker = Waker::from(wake.clone());
+            let context = Context::from_waker(&waker);
+            let mut registrations = PollRegistrations::new();
+            access
+                .register(&mut registrations.context(&context), IoEvents::IN)
+                .unwrap();
+            assert!(access.poll().is_empty());
+            if thread_directed {
+                assert!(
+                    !access
+                        .signal
+                        .send_signal(SignalInfo::new_kernel(Signo::SIGTERM))
+                );
+            } else {
+                assert_eq!(
+                    access
+                        .signal
+                        .process()
+                        .send_signal(SignalInfo::new_kernel(Signo::SIGTERM)),
+                    None
+                );
+            }
+            assert_eq!(wake.count.load(Ordering::SeqCst), 1);
+            assert!(access.signal.signal_blocked(Signo::SIGTERM));
+            assert!(access.poll().contains(IoEvents::IN));
+            assert_eq!(access.dequeue_signal().unwrap().signo(), Signo::SIGTERM);
+            assert!(access.poll().is_empty());
+        }
+    }
+
+    #[def_test]
+    fn test_signalfd_pending_registration_cancels_on_drop() {
+        let (access, wake) = pending_access();
+        let waker = Waker::from(wake.clone());
+        let context = Context::from_waker(&waker);
+        let mut registrations = PollRegistrations::new();
+        access
+            .register(&mut registrations.context(&context), IoEvents::IN)
+            .unwrap();
+        drop(registrations);
+        assert!(
+            !access
+                .signal
+                .send_signal(SignalInfo::new_kernel(Signo::SIGTERM))
+        );
+        assert_eq!(wake.count.load(Ordering::SeqCst), 0);
+        assert!(access.poll().contains(IoEvents::IN));
+    }
+
+    #[def_test]
+    fn test_signalfd_shared_descriptor_rechecks_the_calling_thread() {
+        let (first, _) = pending_access();
+        let second = ThreadSignalManager::new(2, first.signal.process().clone());
+        second.set_blocked(first.signal.blocked());
+        let wake = Arc::new(PendingWake {
+            signal: Arc::downgrade(&second),
+            count: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(wake.clone());
+        let context = Context::from_waker(&waker);
+        let mut registrations = PollRegistrations::new();
+        first
+            .register(&mut registrations.context(&context), IoEvents::IN)
+            .unwrap();
+        assert!(!second.send_signal(SignalInfo::new_kernel(Signo::SIGTERM)));
+        assert_eq!(wake.count.load(Ordering::SeqCst), 1);
+        assert!(first.poll().is_empty());
+        let other_access = SignalfdAccess {
+            signalfd: first.signalfd.clone(),
+            signal: second,
+        };
+        assert!(other_access.poll().contains(IoEvents::IN));
+        assert_eq!(
+            other_access.dequeue_signal().unwrap().signo(),
+            Signo::SIGTERM
+        );
+    }
+
+    #[def_test]
+    fn test_signalfd_mask_change_retains_its_own_wakeup_source() {
+        let (access, wake) = pending_access();
+        let selected = access.signalfd.mask();
+        access.signalfd.update_mask(SignalSet::default());
+        let waker = Waker::from(wake.clone());
+        let context = Context::from_waker(&waker);
+        let mut registrations = PollRegistrations::new();
+        access
+            .register(&mut registrations.context(&context), IoEvents::IN)
+            .unwrap();
+        assert!(
+            !access
+                .signal
+                .send_signal(SignalInfo::new_kernel(Signo::SIGTERM))
+        );
+        assert_eq!(wake.count.load(Ordering::SeqCst), 1);
+        assert!(access.poll().is_empty());
+        access.signalfd.update_mask(selected);
+        assert_eq!(wake.count.load(Ordering::SeqCst), 2);
+        assert!(access.poll().contains(IoEvents::IN));
+    }
 
     #[def_test]
     fn test_signalfd_poll_empty() {

@@ -97,3 +97,13 @@ claim they were executed by this documentation edit.
 - Keep epoll MOD identity, queue deduplication and generation checks together.
 - Drop registration owners outside their mutex; verify callback lock context.
 - Keep limitations aligned with implementation rather than assumed Linux behavior.
+
+## signalfd notification boundary
+
+Fd mask changes and pending arrivals have separate sources. Registration owns
+cancellable kpoll tokens and does not add a strong reference cycle to a signal
+manager. ksignal releases its spin locks before invoking wakers; readiness is
+rechecked against the current reader's pending queues, not the signal sender's
+context. Blocked SIGTERM becomes fd readiness rather than an artificial EINTR.
+Regression includes callback re-entry and cancellation, process/thread delivery,
+and a shared fd whose unrelated thread signal must not be consumed by this reader.

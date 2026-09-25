@@ -97,3 +97,18 @@ filtering (including uncatchable signals) belongs to its syscall adapter. This
 backend does not promise complete Linux epoll graph/cycle validation, timer
 clock-change cancellation, semaphore-mode return compatibility or synchronous
 file-close cancellation of retained timer callbacks.
+
+## signalfd asynchronous arrivals
+
+SignalfdAccess registers both the fd-local mask-change source and the current
+signal manager's process-scoped arrival source. ksignal wakes the latter when a
+signal enters either the shared or a thread-private pending queue, even when
+blocked. Poll/read continue to resolve the calling thread and filter by fd mask;
+a signal for another thread can cause a wake but cannot make this access readable.
+No object is bound to its creator thread and no periodic polling is introduced.
+
+Epoll's interest waker only queues the interest; the actual file poll occurs in
+the waiting context. This preserves current-thread selection while allowing the
+process-wide arrival source to wake a different waiting thread. Fork-inherited
+epoll registrations retain their existing scope; callers may need to register
+again in the child, as documented for signalfd/epoll on Linux.
