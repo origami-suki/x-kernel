@@ -2314,6 +2314,7 @@ dependencies = [
 name = "kexec"
 version = "0.2.0"
 dependencies = [
+ "entropy",
  "filemap",
  "kaddr_layout",
  "kcred",
