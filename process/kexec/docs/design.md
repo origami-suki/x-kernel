@@ -76,7 +76,9 @@ ELF-provided constant: `load_segments` collects the PT_LOAD placement facts,
 `load_range_for_segments` computes the page-rounded span the image occupies, and
 `select_interpreter_base` asks `MmSpace::find_free_area` for the first free
 start inside `[USER_INTERP_BASE, USER_HEAP_BASE)` that fits, with the reserved
-size rounded up to the first segment's `p_align`. `USER_INTERP_BASE` is
+size covering the distance from the load bias to the last mapped page,
+including any gap before a nonzero first PT_LOAD address, and rounded up to
+the first segment's `p_align`. `USER_INTERP_BASE` is
 therefore a preferred hint, not a fixed address; the heap and brk keep their
 fixed placement below and above that window. An image whose pages fill the
 window fails the load with `NoMemory`.

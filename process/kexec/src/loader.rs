@@ -316,9 +316,9 @@ fn load_segments(entry: &ElfCacheEntry, base: usize) -> Option<Vec<LoadSegment>>
 /// The result mirrors `map_elf` exactly: a segment maps
 /// `align_up(mem_size + page_offset)` bytes starting at
 /// `align_down(virtual_addr)`. The page offset must be added *before* rounding,
-/// because a segment that starts mid-page needs a partial final page; rounding
-/// `align_down(virtual_addr) + mem_size` instead drops that page whenever
-/// `mem_size` is not a multiple of the page size.
+/// because rounding the length alone can omit a mapped tail page. The lengths
+/// differ exactly when `align_up(mem_size + page_offset)` exceeds
+/// `align_up(mem_size)`; neither the offset nor the length alone decides this.
 ///
 /// Returns `None` when there is no loadable segment or when an end address
 /// overflows.
@@ -623,9 +623,9 @@ pub fn clear_elf_cache() {
 ///
 /// # Panics
 ///
-/// Loader assertions panic on mismatched ELF virtual/file page offsets, a short
-/// PT_INTERP read, or a prepared cache entry missing at commit. Current-context
-/// and filesystem initialization preconditions must also hold.
+/// A prepared cache entry missing at commit violates an internal invariant and
+/// panics. Current-context and filesystem initialization preconditions must
+/// also hold. Invalid page offsets and short PT_INTERP reads return errors.
 pub fn load_user_app_request(
     uspace: &mut MmSpace,
     request: ExecRequest,
@@ -732,8 +732,9 @@ fn load_user_app_request_inner(
 mod tests {
     use alloc::{borrow::ToOwned, vec};
 
-    use khal::paging::MappingFlags;
-    use memaddr::{MemoryAddr, VirtAddr};
+    use khal::paging::{MappingFlags, PageSize};
+    use memaddr::{MemoryAddr, VirtAddr, VirtAddrRange};
+    use memspace::{VmArea, VmAreaSet, VmBackingInfo, VmBackingKind};
     use unittest::def_test;
     use xmas_elf::program::{FLAG_R, FLAG_W, FLAG_X, Flags};
 
@@ -917,82 +918,52 @@ mod tests {
         assert!(range.contains(VirtAddr::from_usize(0x400_0000)));
     }
 
-    /// A free-region search that also reports the region it verified.
-    ///
-    /// `MmSpace::find_free_area` returns only the chosen start address, so a
-    /// test cannot see which interval it confirmed free. This mirror keeps that
-    /// interval, which is what the placement contract is about.
-    fn search_free_region(
-        occupied: &[(usize, usize)],
-        hint: usize,
-        size: usize,
-    ) -> (usize, usize, usize) {
-        let mut last_end = hint;
-        for (start, occupied_size) in occupied {
-            if last_end + size <= *start {
-                return (last_end, last_end, last_end + size);
-            }
-            last_end = last_end.max(start + occupied_size);
-        }
-        (last_end, last_end, last_end + size)
-    }
-
-    /// Placement must map only inside the free region it verified.
-    ///
-    /// Reserving `align_up(span.size())` is enough only while the image starts
-    /// at the bias. When the first mapped page sits one page above the bias,
-    /// the reservation verifies one page too few, and the image is placed
-    /// partly outside the region the search confirmed. The mapped page can
-    /// still be free today, because a smaller reservation only makes the search
-    /// return a later address, but the placement no longer matches its own
-    /// precondition and nothing in the search enforces it.
+    /// Exercise the same VMA search used by MmSpace, with one free page
+    /// immediately before an occupied page. A search-algorithm copy would not
+    /// protect this contract when memspace changes.
     #[def_test]
     fn placement_reserves_the_region_it_verifies() {
         let base = 0x0400_0000usize;
         let align = 0x1000usize;
-        // Interpreter: one segment whose first mapped page is above the bias.
-        let segments = [LoadSegment {
-            virtual_addr: 0x1000,
-            mem_size: 0x1000,
-            align,
-        }];
+        let hint = VirtAddr::from_usize(base);
+        let limit = VirtAddrRange::new(hint, VirtAddr::from_usize(base + 0x1_0000));
+        let segments = [load_segment(0x1000, 0x1000)];
         let span = load_range_for_segments(&segments, base).expect("span");
-        assert_eq!(span.start.as_usize(), 0x0400_1000);
-        assert_eq!(span.size(), 0x1000);
+        let mut occupied = VmAreaSet::new();
+        let flags = MappingFlags::USER | MappingFlags::READ;
+        for (start, size) in [(0x1000, base - 0x1000), (base + 0x1000, 0x1000)] {
+            occupied
+                .try_insert(VmArea::new(
+                    VirtAddr::from_usize(start),
+                    size,
+                    flags,
+                    flags,
+                    VmBackingInfo::new(VmBackingKind::Linear, PageSize::Size4K),
+                    0,
+                    None,
+                ))
+                .expect("non-overlapping main image");
+        }
 
-        // Main image leaves two free pages and then occupies the third, so a
-        // reservation is placed where the offset actually decides the outcome.
-        let occupied = [(base + 0x2000, 0x1000)];
-
-        let previous_size = align_up(span.size(), align);
-        let (previous_bias, previous_lo, previous_hi) =
-            search_free_region(&occupied, base, previous_size);
-        let previous_mapped =
-            load_range_for_segments(&segments, previous_bias).expect("previous mapping");
-        assert_eq!(previous_bias, base);
+        // The old reservation accepts the hole, but the interpreter's first
+        // mapped page then lands on the main image. This is the negative control.
+        let old_bias = occupied
+            .find_free_area(hint, span.size(), limit, align)
+            .expect("old reservation finds the hole");
+        assert_eq!(old_bias, hint);
+        let old_mapping =
+            load_range_for_segments(&segments, old_bias.as_usize()).expect("old mapping");
+        assert!(occupied.overlaps(old_mapping));
 
         let size = placement_reservation(span, base, align).expect("reservation");
         assert_eq!(size, 0x2000);
-        let (bias, verified_lo, verified_hi) = search_free_region(&occupied, base, size);
-        let mapped = load_range_for_segments(&segments, bias).expect("mapping");
-
-        assert!(
-            verified_lo <= mapped.start.as_usize() && mapped.end.as_usize() <= verified_hi,
-            "mapped {:#x}..{:#x} escapes the verified free region \
-             {verified_lo:#x}..{verified_hi:#x}",
-            mapped.start.as_usize(),
-            mapped.end.as_usize()
-        );
-        assert!(
-            previous_mapped.start.as_usize() < previous_lo
-                || previous_hi < previous_mapped.end.as_usize(),
-            "the offset-free reservation must escape its verified region, otherwise this \
-             regression does not exercise the defect"
-        );
-    }
-
-    fn align_up(value: usize, align: usize) -> usize {
-        (value + align - 1) & !(align - 1)
+        let bias = occupied
+            .find_free_area(hint, size, limit, align)
+            .expect("space after main image");
+        assert_eq!(bias.as_usize(), base + 0x2000);
+        let mapped = load_range_for_segments(&segments, bias.as_usize()).expect("mapping");
+        assert!(!occupied.overlaps(mapped));
+        assert!(bias <= mapped.start && mapped.end.as_usize() <= bias.as_usize() + size);
     }
 
     #[def_test]

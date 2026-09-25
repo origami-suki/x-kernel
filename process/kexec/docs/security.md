@@ -25,8 +25,10 @@ iteration panic. A PT_INTERP short read and a PT_LOAD whose `p_vaddr` page
 offset disagrees with `p_offset` are rejected with `InvalidInput` and
 `InvalidExecutable` respectively. The interpreter load bias is chosen from the
 free address ranges inside the interpreter window instead of a fixed constant,
-so a main image that occupies the preferred address yields `NoMemory` rather
-than a VMA overlap assertion.
+including the gap from the bias to a nonzero first mapped page. The reserved
+interval contains every interpreter mapping, so a hole before an occupied main
+image segment cannot hide a collision. An occupied preferred address causes
+the search to continue; an exhausted search window yields `NoMemory`.
 
 There is no direct user-pointer, MMIO, DMA, firmware, FFI call, or assembly here.
 The signing feature delegates TA verification to `tee_task_iface`; MM methods
