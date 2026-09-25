@@ -109,6 +109,10 @@ PID 1 不再有特殊的 bootstrap 转换路径：late-init 线程通过
 `switch_page_table_root` 自动激活，无需 `activate_current_user_page_table` 这类
 "运行中任务热切页表"的特例接口。
 
+## 用户任务运行边界
+
+`UserTaskRuntime::on_leave` 在保存旧任务上下文前执行；`on_enter` 在切换栈并恢复当前异常上下文后，针对 `current()` 执行。首次运行由 `task_entry` 调用 `on_enter`，因此首次调度和后续恢复均有进入标记。回调不覆盖就绪排队或阻塞期间；kprocess 用这些边界暂停和恢复 CPU 计账。回调仍须短小、不睡眠、不触发调度。
+
 ## 核心流程
 
 ### 1) 初始化流程

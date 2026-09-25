@@ -74,6 +74,8 @@ ksched algorithms / karch context switch / allocator
    要求，不可当作 TCG 兜底删除），保证至少一方完成入队；禁止 IRQ-off 自旋
    等待远端 `on_cpu`。
 
+`on_enter` 必须在新任务栈上调用，不能在旧任务栈上为 next 提前调用；否则依赖当前任务的禁抢占 guard 会操作错误任务。首次入口与恢复入口各调用一次，IRQ 保持关闭，回调不得睡眠或重入调度。`on_leave` 在切出前结算，避免把 off-CPU 区间计入运行时间。
+
 ### 3) `task.rs`：`TaskContext` 内部可变与当前任务 TLS/CPU-local 指针
 
 - `UnsafeCell<TaskContext>` 的共享读取
