@@ -13,6 +13,7 @@ mod irq_nodes;
 mod kwork_stress_nodes;
 mod mem_nodes;
 mod root;
+mod syscall_profile;
 #[cfg(feature = "sysrq")]
 mod sysrq_nodes;
 mod task_nodes;

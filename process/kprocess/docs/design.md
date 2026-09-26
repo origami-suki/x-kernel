@@ -221,3 +221,26 @@ representative-thread credential snapshots, simplified ptrace privilege checks
 (effective UID zero substitutes for CAP_SYS_PTRACE), and no full authorization
 policy in signal/job-control facade helpers. Optional TEE/TIPC behavior exists
 only with its Cargo feature enabled.
+
+## Opt-in syscall observations
+
+`syscall_profile` owns bounded per-process dispatcher observations, controlled
+through root-only `/proc/syscall_profile`. `start` resets a stopped epoch;
+`stop` disables new observations and drains existing shard writers. Reading
+while active returns EBUSY. The default is off (one atomic check at dispatch).
+Sixteen preallocated tables, each with 1024 rows and at most 32 hash probes,
+retain `(PID at entry, raw syscall number)` counts, errors, CPU/elapsed sums
+and maxima. TID selects the shard; migration does not change a token's owner.
+There is no hot-path allocation, logging, global control lock or table scan.
+Capacity loss increments `dropped` instead of overwriting data.
+
+CPU samples use the current thread's scheduler-aware kernel time, enclosed by
+monotonic elapsed samples. Short measurements include sampling overhead;
+interrupt time follows existing accounting. Dispatcher timing excludes trap
+entry/return, post-syscall signal handling, user faults and kernel workers.
+Calls that never return or cross stop/start remain outstanding, not zero-time
+samples; `started - completed` and capacity loss must accompany every report.
+Stop and shard-drain timestamps bound collection closure. Epoch checks under
+shard locks reject old completions after reset. PID reuse is not distinguished
+within a collection. Export uses preallocated row copies under short locks and
+formats outside those locks, after collection is stopped.

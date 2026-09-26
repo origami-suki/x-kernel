@@ -118,3 +118,7 @@ copy wrappers.
   architecture owner instead of ad-hoc probing in the adapter?
 - When owner routing changes, are this crate's and the owner's documents
   updated together?
+
+The syscall observer never copies or interprets arguments. Collection is
+privileged and off by default; kprocess owns bounded state and authorization.
+Observation does not change syscall results, return contexts or signal actions.

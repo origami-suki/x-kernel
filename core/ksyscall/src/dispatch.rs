@@ -79,9 +79,11 @@ fn sys_riscv_flush_icache(flags: usize) -> KResult<isize> {
 /// Handler access to missing current process/thread state or uninitialized
 /// providers can panic. Allocation failure follows kernel allocator policy.
 pub fn dispatch_irq_syscall(uctx: &mut UserContext) -> UserThreadRuntimeAction {
+    let profile = kprocess::syscall_profile::begin(uctx.sysno());
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
         uctx.set_retval(-LinuxError::ENOSYS.into_raw() as _);
+        kprocess::syscall_profile::finish(profile, true);
         return UserThreadRuntimeAction::Continue;
     };
 
@@ -858,6 +860,8 @@ pub fn dispatch_irq_syscall(uctx: &mut UserContext) -> UserThreadRuntimeAction {
     };
 
     debug!("Syscall {sysno} return {result:?}");
+
+    kprocess::syscall_profile::finish(profile, result.is_err());
 
     uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).into_raw() as _) as _);
 

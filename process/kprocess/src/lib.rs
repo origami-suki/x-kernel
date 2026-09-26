@@ -81,6 +81,8 @@ pub mod resource_limits;
 pub mod scheduler;
 mod session;
 mod stat;
+/// Bounded, opt-in per-process syscall CPU and elapsed-time observations.
+pub mod syscall_profile;
 /// System-wide observable process/task views.
 pub mod system_view;
 mod thread;

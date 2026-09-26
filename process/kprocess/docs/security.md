@@ -154,3 +154,16 @@ exit readiness and CPU accounting. Test source existence is not execution proof.
 Procfs thread counts are observational membership snapshots, not lifetime pins or
 permission checks. The count uses the existing membership/slot locks and excludes
 reserved or retired slots; no separate atomic counter can drift from publication.
+
+## Syscall profile control
+
+Both control and snapshot APIs require current effective UID 0, including on
+inherited descriptors. Procfs also sets mode 0600. The observer never reads
+syscall arguments or user buffers and keeps no pointer in its scalar token.
+The static control mutex serializes start/stop/export; measured paths only use
+short non-sleeping shard locks and the existing CPU-accounting lock, never held
+simultaneously. Fixed table capacity bounds retained memory. Invalid, oversized
+or active-start commands fail; stop is idempotent. Epoch matching prevents old
+completions corrupting later windows. Counters saturate; capacity loss and
+clock inconsistencies are exported. Results include numeric process IDs and
+must remain privileged. This diagnostic interface is not Linux ABI emulation.

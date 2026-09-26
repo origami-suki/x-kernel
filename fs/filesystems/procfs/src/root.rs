@@ -20,6 +20,7 @@ pub fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleFile::new(fs.clone(), NodeType::Symlink, || Ok("self/mounts")),
     );
     trace_nodes::root::add_root_entries(&mut root, fs.clone());
+    crate::syscall_profile::add_root_entry(&mut root, fs.clone());
     #[cfg(feature = "lock_stat")]
     root.add(
         "lock_stat",

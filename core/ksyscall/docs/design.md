@@ -214,3 +214,10 @@ The contract follows the
 - implement path resolution, signal state machines, timer state machines,
   or pipe buffer behavior;
 - provide a convenient catch-all owner abstraction.
+
+Opt-in profiling brackets dispatch through `kprocess::syscall_profile`.
+The owner retains counters; this adapter passes only the raw syscall number
+and actual `KResult` error status. Unknown numbers are included, and restored
+registers from `rt_sigreturn` are not misclassified as errors. Non-returning
+handlers leave explicit unfinished counts. Disabled collection does not sample
+clocks; see the owner's design for coverage and epoch boundaries.
