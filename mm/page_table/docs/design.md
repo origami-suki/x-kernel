@@ -158,11 +158,29 @@ Three-level page tables (Sv39) skip P4 and start at P3.
    remaining size.
 4. Return an error if any mapping fails. Earlier mappings are not rolled back.
 
+### Sparse Region Unmapping (`unmap_sparse_region`)
+
+The caller supplies a uniform leaf page size and an aligned virtual range.
+The operation validates the range before mutation, then walks allocated tables
+once per covered subtree. A missing intermediate entry skips its entire clipped
+coverage interval; an allocated leaf table is scanned in place. Non-present
+entries are left unchanged. The walk neither allocates nor frees table frames.
+Its structure follows Linux v7.0 (`028ef9c96e96`) `zap_*_range`, adapted to this
+crate's three/four-level tables and uniform backing page-size contract.
+
+Every cleared leaf records an invalidation through the existing `flush` state.
+A present leaf of a different size is an error, including a partially covered
+huge page: the API does not split huge mappings. A mismatch can leave a cleared
+prefix, so callers must preserve backing ownership on error and allow pending
+invalidations to finish. This does not change the strict, hole-rejecting
+`unmap_region` API. Unit tests count visited entries only in test builds to
+verify subtree skipping without timing thresholds.
+
 ### Batched TLB Invalidation
 
 1. `PageTableMut` maintains a `ToFlush` value.
 2. Each successful PTE change made by
-   `map/unmap/remap/protect/replace_if_same` records its address with `flush(vaddr)`.
+   `map/unmap/unmap_sparse_region/remap/protect/replace_if_same` records its address with `flush(vaddr)`.
 3. Up to 16 addresses are retained for individual invalidation.
    Exceeding this threshold changes the state to `Full`.
 4. `finish()` invalidates each recorded address for `Addresses`, or performs

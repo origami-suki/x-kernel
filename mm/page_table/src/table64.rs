@@ -409,6 +409,8 @@ impl<M: PagingMetaData> ToFlush<M> {
 pub struct PageTableMut<'a, M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> {
     inner: &'a mut PageTable64<M, PTE, H>,
     flush: ToFlush<M>,
+    #[cfg(unittest)]
+    sparse_entries_visited: usize,
 }
 
 impl<M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> Deref
@@ -426,6 +428,8 @@ impl<'a, M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTableMut<
         Self {
             inner,
             flush: ToFlush::None,
+            #[cfg(unittest)]
+            sparse_entries_visited: 0,
         }
     }
 
@@ -775,6 +779,94 @@ impl<'a, M: PagingMetaData, PTE: PageTableEntry, H: PagingHandler> PageTableMut<
         Ok(())
     }
 
+    /// Unmaps present leaves of `page_size` in a possibly sparse region.
+    ///
+    /// Missing subtrees are skipped at their coverage boundary. Allocated leaf
+    /// tables are scanned in place, without restarting a root walk for each VA.
+    /// No table is allocated or freed. Cleared leaves use the same deferred TLB
+    /// invalidation as [`unmap`](Self::unmap); backing frames must remain owned
+    /// until [`finish`](Self::finish) returns.
+    ///
+    /// Both `vaddr` and `size` must be aligned to `page_size`. An aligned empty
+    /// region at a valid address is a no-op. Nonempty regions must not overflow
+    /// or cross the address range covered by one root table. Present leaves of
+    /// a different size are rejected; huge mappings are never split or cleared
+    /// beyond the requested range.
+    ///
+    /// # Errors
+    ///
+    /// - [`PtError::NotAligned`] — address or size is not page-size aligned.
+    /// - [`PtError::InvalidAddress`] — invalid, overflowing or root-crossing range.
+    /// - [`PtError::MappedToHugePage`] — a present leaf has a different size.
+    ///
+    /// Range validation precedes mutation. A leaf-size mismatch encountered
+    /// during traversal may leave an already-cleared prefix, whose pending TLB
+    /// invalidations are still owned by this guard. Callers must retain backing
+    /// ownership on error; this operation does not roll back cleared PTEs.
+    pub fn unmap_sparse_region(
+        &mut self,
+        vaddr: M::VirtAddr,
+        size: usize,
+        page_size: PageSize,
+    ) -> PtResult {
+        let start: usize = vaddr.into();
+        if !page_size.is_aligned(start) || !page_size.is_aligned(size) {
+            return Err(PtError::NotAligned);
+        }
+        if !M::vaddr_is_valid(start) {
+            return Err(PtError::InvalidAddress);
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        let end = start.checked_add(size).ok_or(PtError::InvalidAddress)?;
+        let address_bits = 12 + 9 * M::LEVELS;
+        if !M::vaddr_is_valid(end - 1) || start >> address_bits != (end - 1) >> address_bits {
+            return Err(PtError::InvalidAddress);
+        }
+        let table = self.table_of_mut(self.inner.root_paddr);
+        self.unmap_sparse_table(table, address_bits - 9, start, end, page_size)
+    }
+
+    fn unmap_sparse_table(
+        &mut self,
+        table: &mut [PTE],
+        shift: usize,
+        mut start: usize,
+        end: usize,
+        page_size: PageSize,
+    ) -> PtResult {
+        let span = 1usize << shift;
+        while start < end {
+            // Clip before adding, including for the last high-half table.
+            let next = start + (span - (start & (span - 1))).min(end - start);
+            let entry = &mut table[(start >> shift) & (ENTRY_COUNT - 1)];
+            #[cfg(unittest)]
+            {
+                self.sparse_entries_visited += 1;
+            }
+            if entry.is_present() {
+                if shift == 12 || entry.is_huge() {
+                    if span != page_size as usize {
+                        return Err(PtError::MappedToHugePage);
+                    }
+                    entry.clear();
+                    self.flush(start.into());
+                } else {
+                    match self.next_table_mut(entry) {
+                        Ok(child) => {
+                            self.unmap_sparse_table(child, shift - 9, start, next, page_size)?;
+                        }
+                        Err(PtError::NotMapped) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            start = next;
+        }
+        Ok(())
+    }
+
     /// Changes permission flags for a contiguous region of virtual addresses.
     ///
     /// Unmapped pages within the region are silently skipped (the iterator
@@ -1086,7 +1178,8 @@ mod tests {
         _bytes: [u8; PAGE_SIZE_4K],
     }
 
-    struct FramePool(UnsafeCell<[TestFrame; 64]>);
+    const TEST_FRAME_COUNT: usize = 128;
+    struct FramePool(UnsafeCell<[TestFrame; TEST_FRAME_COUNT]>);
 
     // SAFETY: The unit-test frame allocator publishes frames by monotonically
     // advancing `NEXT_FRAME`; each successful allocation receives a distinct
@@ -1099,7 +1192,7 @@ mod tests {
     static FRAME_POOL: FramePool = FramePool(UnsafeCell::new(
         [TestFrame {
             _bytes: [0; PAGE_SIZE_4K],
-        }; 64],
+        }; TEST_FRAME_COUNT],
     ));
 
     struct TestHandler;
@@ -1107,7 +1200,7 @@ mod tests {
     impl PagingHandler for TestHandler {
         fn alloc_frame() -> Option<PhysAddr> {
             let index = NEXT_FRAME.fetch_add(1, Ordering::Relaxed);
-            if index >= 64 {
+            if index >= TEST_FRAME_COUNT {
                 return None;
             }
             // SAFETY: Unit tests allocate each frame at most once by advancing
@@ -1242,6 +1335,238 @@ mod tests {
             .expect("map test page");
         assert!(modify.finish().had_pending());
         assert!(!modify.finish().had_pending());
+    }
+
+    #[def_test]
+    fn sparse_unmap_skips_missing_subtrees_without_flushing() {
+        let mut table = TestPageTable::try_new().unwrap();
+        let mut modify = table.modify();
+        modify
+            .unmap_sparse_region(vaddr(0), 1usize << 32, PageSize::Size4K)
+            .unwrap();
+        assert_eq!(modify.sparse_entries_visited, 1);
+        assert!(!modify.finish().had_pending());
+        modify
+            .unmap_sparse_region(vaddr(0), 0, PageSize::Size4K)
+            .unwrap();
+        assert_eq!(modify.sparse_entries_visited, 1);
+    }
+
+    #[def_test]
+    fn sparse_unmap_preserves_neighbours_across_page_table_boundaries() {
+        let mut table = TestPageTable::try_new().unwrap();
+        let start = 1usize << 21;
+        let end = (1usize << 30) + PAGE_SIZE_4K;
+        let addresses = [
+            start - PAGE_SIZE_4K,
+            start,
+            end - 2 * PAGE_SIZE_4K,
+            end - PAGE_SIZE_4K,
+            end,
+        ];
+        {
+            let mut modify = table.modify();
+            for (index, address) in addresses.into_iter().enumerate() {
+                modify
+                    .map(
+                        vaddr(address),
+                        paddr(0x100_0000 + index * PAGE_SIZE_4K),
+                        PageSize::Size4K,
+                        PagingFlags::READ,
+                    )
+                    .unwrap();
+            }
+            modify.finish();
+            modify
+                .unmap_sparse_region(vaddr(start), end - start, PageSize::Size4K)
+                .unwrap();
+            // Allocated leaf tables still require scans; the 1 GiB hole does
+            // not require hundreds of thousands of root-to-leaf walks.
+            assert!(modify.sparse_entries_visited < 2048);
+            assert!(modify.finish().had_pending());
+            modify
+                .unmap_sparse_region(vaddr(start), end - start, PageSize::Size4K)
+                .unwrap();
+            assert!(!modify.finish().had_pending());
+        }
+        assert!(table.query(vaddr(addresses[0])).is_ok());
+        assert!(table.query(vaddr(addresses[4])).is_ok());
+        for address in &addresses[1..4] {
+            assert_eq!(table.query(vaddr(*address)), Err(crate::PtError::NotMapped));
+        }
+    }
+
+    #[def_test]
+    fn sparse_unmap_batches_dense_leaf_invalidations() {
+        let mut table = TestPageTable::try_new().unwrap();
+        let mut modify = table.modify();
+        for index in 0..32 {
+            modify
+                .map(
+                    vaddr(index * PAGE_SIZE_4K),
+                    paddr(0x200_0000 + index * PAGE_SIZE_4K),
+                    PageSize::Size4K,
+                    PagingFlags::READ,
+                )
+                .unwrap();
+        }
+        modify.finish();
+        modify
+            .unmap_sparse_region(vaddr(0), 32 * PAGE_SIZE_4K, PageSize::Size4K)
+            .unwrap();
+        assert_eq!(modify.sparse_entries_visited, 35);
+        assert!(matches!(modify.flush, super::ToFlush::Full));
+        assert!(modify.finish().had_pending());
+        for index in 0..32 {
+            assert_eq!(
+                modify.query(vaddr(index * PAGE_SIZE_4K)),
+                Err(crate::PtError::NotMapped)
+            );
+        }
+    }
+
+    #[def_test]
+    fn sparse_unmap_rejects_partial_huge_and_accepts_matching_leaves() {
+        let mut table = TestPageTable::try_new().unwrap();
+        let mut modify = table.modify();
+        modify
+            .map(
+                vaddr(0x20_0000),
+                paddr(0x40_0000),
+                PageSize::Size2M,
+                PagingFlags::READ,
+            )
+            .unwrap();
+        modify
+            .map(
+                vaddr(1 << 30),
+                paddr(2 << 30),
+                PageSize::Size1G,
+                PagingFlags::READ,
+            )
+            .unwrap();
+        modify.finish();
+        assert_eq!(
+            modify.unmap_sparse_region(vaddr(0x20_1000), PAGE_SIZE_4K, PageSize::Size4K),
+            Err(crate::PtError::MappedToHugePage)
+        );
+        assert!(!modify.finish().had_pending());
+        assert_eq!(modify.query(vaddr(0x20_0000)).unwrap().2, PageSize::Size2M);
+        modify
+            .unmap_sparse_region(vaddr(0x20_0000), 1 << 21, PageSize::Size2M)
+            .unwrap();
+        modify
+            .unmap_sparse_region(vaddr(1 << 30), 1 << 30, PageSize::Size1G)
+            .unwrap();
+        assert!(modify.finish().had_pending());
+        assert_eq!(
+            modify.query(vaddr(0x20_0000)),
+            Err(crate::PtError::NotMapped)
+        );
+        assert_eq!(modify.query(vaddr(1 << 30)), Err(crate::PtError::NotMapped));
+    }
+
+    #[def_test]
+    fn sparse_unmap_validates_ranges_before_mutating() {
+        let mut table = TestPageTable::try_new().unwrap();
+        let mut modify = table.modify();
+        modify
+            .map(
+                vaddr(0),
+                paddr(0x300_0000),
+                PageSize::Size4K,
+                PagingFlags::READ,
+            )
+            .unwrap();
+        modify.finish();
+        for (start, size, expected) in [
+            (1, PAGE_SIZE_4K, crate::PtError::NotAligned),
+            (0, PAGE_SIZE_4K - 1, crate::PtError::NotAligned),
+            (
+                usize::MAX - PAGE_SIZE_4K + 1,
+                PAGE_SIZE_4K,
+                crate::PtError::InvalidAddress,
+            ),
+            (
+                (1usize << 48) - PAGE_SIZE_4K,
+                2 * PAGE_SIZE_4K,
+                crate::PtError::InvalidAddress,
+            ),
+        ] {
+            assert_eq!(
+                modify.unmap_sparse_region(vaddr(start), size, PageSize::Size4K),
+                Err(expected)
+            );
+        }
+        assert_eq!(modify.sparse_entries_visited, 0);
+        assert!(modify.query(vaddr(0)).is_ok());
+        assert!(!modify.finish().had_pending());
+    }
+
+    #[def_test]
+    fn sparse_unmap_error_preserves_huge_leaf_and_prefix_flush() {
+        let mut table = TestPageTable::try_new().unwrap();
+        let mut modify = table.modify();
+        modify
+            .map(
+                vaddr(0),
+                paddr(0x500_0000),
+                PageSize::Size4K,
+                PagingFlags::READ,
+            )
+            .unwrap();
+        modify
+            .map(
+                vaddr(1 << 21),
+                paddr(0x600_0000),
+                PageSize::Size2M,
+                PagingFlags::READ,
+            )
+            .unwrap();
+        modify.finish();
+        assert_eq!(
+            modify.unmap_sparse_region(vaddr(0), 2 << 21, PageSize::Size4K),
+            Err(crate::PtError::MappedToHugePage)
+        );
+        assert_eq!(modify.query(vaddr(0)), Err(crate::PtError::NotMapped));
+        assert_eq!(modify.query(vaddr(1 << 21)).unwrap().2, PageSize::Size2M);
+        assert!(modify.finish().had_pending());
+    }
+
+    #[def_test]
+    fn sparse_unmap_supports_three_levels_and_high_addresses() {
+        struct ThreeLevelMeta;
+        impl PagingMetaData for ThreeLevelMeta {
+            type VirtAddr = VirtAddr;
+
+            const LEVELS: usize = 3;
+            const PA_MAX_BITS: usize = 48;
+            const VA_MAX_BITS: usize = 39;
+
+            fn flush_tlb(_vaddr: Option<VirtAddr>) {}
+        }
+        let mut table = PageTable64::<ThreeLevelMeta, TestEntry, TestHandler>::try_new().unwrap();
+        let mut modify = table.modify();
+        let start = usize::MAX - (1usize << 30) + 1;
+        modify
+            .map(
+                vaddr(start),
+                paddr(0x400_0000),
+                PageSize::Size4K,
+                PagingFlags::READ,
+            )
+            .unwrap();
+        modify.finish();
+        assert_eq!(
+            modify.unmap_sparse_region(vaddr(1 << 39), PAGE_SIZE_4K, PageSize::Size4K),
+            Err(crate::PtError::InvalidAddress)
+        );
+        modify
+            .unmap_sparse_region(vaddr(start), PAGE_SIZE_4K, PageSize::Size4K)
+            .unwrap();
+        assert_eq!(modify.sparse_entries_visited, 3);
+        assert!(modify.finish().had_pending());
+        assert_eq!(modify.query(vaddr(start)), Err(crate::PtError::NotMapped));
     }
 
     /// Verifies that an installed CPU-residency provider is consulted exactly

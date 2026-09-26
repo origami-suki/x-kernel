@@ -152,6 +152,18 @@ needed.
 
 ## Thread Safety
 
+`unmap_sparse_region` requires a uniform leaf size and validates address/length
+alignment, checked end arithmetic, canonical endpoints, and root-table coverage
+before clearing entries. Missing subtrees and non-present leaf entries are
+skipped without allocation or invalidation. A different present leaf size
+returns `MappedToHugePage` instead of clearing outside the requested range.
+On traversal error, a cleared prefix remains pending in the guard; callers must
+not release backing frames as if the whole range succeeded. No intermediate
+table frame is reclaimed by this API, so it introduces no table-walk-cache
+reclamation boundary. All cleared leaves retain the normal flush-before-free
+obligation. Tests cover sparse/dense boundaries, high addresses, three-level
+tables, huge leaves, invalid ranges, and deferred flush state.
+
 | Type | `Send` condition | `Sync` condition |
 |------|------------------|------------------|
 | `PageTable64<M, PTE, H>` | Automatically `Send` when `M, PTE, H: Send`. | Automatically `Sync` when `M, PTE, H: Sync`; there is no internal lock. |
