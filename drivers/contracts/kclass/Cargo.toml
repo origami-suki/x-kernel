@@ -23,6 +23,8 @@ net = { workspace = true, optional = true }
 virtio = { workspace = true, optional = true }
 vsock = { workspace = true, optional = true }
 
+unittest.workspace = true
+
 [features]
 default = []
 block = ["dep:block"]

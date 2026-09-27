@@ -34,8 +34,8 @@ drivers that can scan out guest memory directly.
   trait only describes flushing.
 - No mode setting, multi-monitor topology, or EDID handling: one visible
   geometry, no mode enumeration.
-- No rendering, compositing, or damage tracking: `need_flush`/`flush` is
-  the whole frame-level contract.
+- No rendering submission, compositing, or damage tracking. Optional immutable
+  virgl capability discovery describes the device protocol only.
 - No user-space exposure: `/dev/dri`-style interfaces belong to the
   drmdevice/fbdevice layers, which consume implementers of this trait.
 
@@ -123,3 +123,18 @@ All fallible operations return `driver_base::DriverResult`:
 - Re-export `driver_base` types: consistent with the sibling contract
   crates (`char`, `input`, `net`, `block`), one error vocabulary and one
   import root for implementers.
+
+## Virgl Capability Discovery
+
+`has_virgl`, `virgl_capsets`, and `virgl_capset` provide an OS-neutral
+query boundary for negotiated device capability and opaque protocol data.
+The metadata and returned bytes remain immutable for the device lifetime;
+queries do not wait, allocate, or change device state. Existing drivers default
+to no virgl capability. An implementation may negotiate virgl without exposing
+any render context or submission API: consumers must not equate this metadata
+with a working DRM render node, Mesa renderer, or acceleration for an application.
+
+`VirglCapsetInfo` describes queryable versions and maximum response size.
+Capability bytes remain untrusted protocol data; consumers validate their
+format separately. Context/resource/fence ownership is deliberately outside
+this initial discovery contract.

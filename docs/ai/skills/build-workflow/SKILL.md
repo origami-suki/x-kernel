@@ -312,6 +312,13 @@ coverage.info
 coverage.xml
 ```
 
+Coverage extraction first requires complete `ALL_TESTS_PASSED` and
+`COVERAGE_PERSISTED` lines from the new QEMU log, and rejects a complete
+`TESTS_FAILED` line. Only numeric/semicolon ANSI SGR sequences at line edges
+are ignored before exact trimmed-line comparison; embedded escapes, terminal
+control sequences and ordinary text cannot turn a partial line into a marker.
+No existing profile substitutes for missing completion evidence.
+
 Extraction or report-generation failures fail the run. Old coverage artifacts
 are removed before processing so they cannot be mistaken for current output.
 

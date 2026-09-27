@@ -243,7 +243,8 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoBlkDev<H, T> {}
 **不变量**：设备类型可以安全地跨线程传递（Send）和共享引用（Sync）。
 
 **为何安全**：
-- blk / gpu / input / socket / virtio_9p：所有操作通过 `&mut self` 独占访问，
+- gpu：只读 capability cache；2D queue 由内部 `SpinNoIrq` 串行化。
+- blk / input / socket / virtio_9p：所有操作通过 `&mut self` 独占访问，
   `Sync` 仅允许共享不可变引用，不会导致数据竞争。
 - net：内部使用 `SpinNoIrq` 保护共享状态，`Send`/`Sync` 安全。
 
@@ -269,7 +270,7 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoBlkDev<H, T> {}
 | `VirtIo9pDev<H, T>` | `H: Hal, T: Transport`（手动 impl） | `H: Hal, T: Transport`（手动 impl） |
 
 **说明**：所有设备类型的手动 `Send`/`Sync` impl 依赖以下保证：
-- blk 使用内部 SpinNoIrq 保护设备和请求状态；其他非 net 设备通过 `&mut self` 独占访问，无内部可变性。
+- blk 使用内部 SpinNoIrq 保护设备和请求状态；gpu 用内部 SpinNoIrq 串行化 2D 请求，capability cache 发布后只读。
 - net 设备通过 `SpinNoIrq` 保护共享的 `InnerDev`，中断回调和正常路径互斥。
 
 ## 威胁分析
@@ -341,3 +342,32 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoBlkDev<H, T> {}
 - [ ] 新增原子操作的内存序不低于已有要求
 - [ ] Drop 实现正确处理所有状态（已实现 net 设备 Drop，其他设备无需自定义 Drop）
 - [ ] 新增 panic 路径有对应的 PanicGuard 或等效保护
+
+## GPU capability cache and protocol reuse
+
+`VirtIoGpuDev` uses local wire carriers over the locked dependency transport/virtqueue, with all
+mutable post-publication access serialized by its inner lock. Its manual
+Send/Sync implementations retain the pre-existing transport boundary; capability cache fields
+are immutable after initialization. The HAL remains a type-level provider.
+
+Device-controlled capset counts, versions and byte sizes are bounded before
+query/allocation (16 sets, versions 0 through 32, 64 KiB per blob, 1 MiB total).
+Only virgl IDs 1 and 2 are cached. Duplicate IDs, empty/oversized responses and
+invalid metadata fail initialization, dropping the device and its queues.
+Opaque data is returned by immutable Arc snapshot and requires consumer-side format
+validation. No guest userspace pointer enters this adapter.
+
+The pre-existing 2D backing lifetime contract remains: the caller retains valid
+backing until successful detach/unref. On attach failure the driver attempts
+unref and reports the original error; rollback failure is logged. No 3D
+resource or fence API is added. In particular, cached `has_virgl` and capset
+metadata must not cause an upper layer to advertise an implemented DRM UAPI.
+
+Known limitations: legacy 2D queue I/O still uses the adapter spinlock and the
+dependency's unbounded synchronous completion wait. Initialization queries
+also have no device timeout, but run before acquiring that lock. Long-running
+3D fence submission is deferred until the portable driver waiting/ownership
+boundary exists. The local display response checks both the scanout enabled bit and nonzero
+dimensions. Fixed replies reject truncated used lengths; capset payloads reject
+short headers and overlong used lengths. Fake-device tests cover disabled
+nonzero scanouts, capability bounds, cache-only queries and attach rollback.

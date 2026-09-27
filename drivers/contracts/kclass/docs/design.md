@@ -387,3 +387,16 @@ path (device already freed).
   up in LIFO order.
 - The runtime trait object is dropped by its `Box<T>` when
   `ClassDeviceInner` drops.
+
+## Display virgl capability forwarding
+
+The display class forwards all three immutable virgl queries to its runtime
+implementer. Metadata and opaque bytes are returned as reference-counted
+immutable snapshots, so their validity does not depend on the class access
+scope or subsequent device removal. Query forwarding performs no device I/O.
+Protocol negotiation is not proof of DRM/render-submission support.
+
+A private, registry-free unit fixture exercises the real ClassDevice forwarding
+implementation: capability presence, Arc snapshot identity/lifetime, unsupported
+non-virgl errors, and invalid set/version errors. It does not install global
+device event subscriptions or depend on test order.

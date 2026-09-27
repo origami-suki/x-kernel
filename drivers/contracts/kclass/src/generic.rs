@@ -301,3 +301,121 @@ impl<T> Default for ClassRegistry<T> {
         Self::new()
     }
 }
+
+#[cfg(all(unittest, feature = "display"))]
+mod display_tests {
+    use alloc::{boxed::Box, vec};
+
+    use display::{DisplayDevice, DisplayInfo, VirglCapsetInfo};
+    use kdevice::{DeviceIdentity, DiscoveryOrigin, PlatformIdentity, ResourceSet};
+    use unittest::{assert, assert_eq, def_test};
+
+    use super::*;
+    use crate::DisplayDeviceImpl;
+
+    struct CachedDisplay {
+        caps: Option<Arc<[VirglCapsetInfo]>>,
+        bytes: Arc<[u8]>,
+    }
+
+    impl Device for CachedDisplay {
+        fn name(&self) -> &str {
+            "cached-display-test"
+        }
+
+        fn device_kind(&self) -> DeviceKind {
+            DeviceKind::Display
+        }
+    }
+
+    impl DisplayDevice for CachedDisplay {
+        fn info(&self) -> DisplayInfo {
+            DisplayInfo {
+                width: 640,
+                height: 480,
+            }
+        }
+
+        fn need_flush(&self) -> bool {
+            false
+        }
+
+        fn flush(&self) -> DriverResult {
+            Ok(())
+        }
+
+        fn has_virgl(&self) -> bool {
+            self.caps.is_some()
+        }
+
+        fn virgl_capsets(&self) -> Option<Arc<[VirglCapsetInfo]>> {
+            self.caps.clone()
+        }
+
+        fn virgl_capset(&self, id: u32, version: u32) -> DriverResult<Arc<[u8]>> {
+            if self.caps.is_none() {
+                return Err(DriverError::Unsupported);
+            }
+            if id != 2 || version != 1 {
+                return Err(DriverError::InvalidInput);
+            }
+            Ok(self.bytes.clone())
+        }
+    }
+
+    #[def_test]
+    fn test_display_capability_forwarding_retains_snapshots_and_errors() {
+        for enabled in [false, true] {
+            let caps: Arc<[VirglCapsetInfo]> = vec![VirglCapsetInfo {
+                id: 2,
+                max_version: 1,
+                max_size: 4,
+            }]
+            .into();
+            let bytes: Arc<[u8]> = vec![0x12, 0x34, 0x56, 0x78].into();
+            let runtime: DisplayDeviceImpl = Box::new(CachedDisplay {
+                caps: enabled.then(|| caps.clone()),
+                bytes: bytes.clone(),
+            });
+            // A private fixture avoids installing global devices/events. The
+            // methods under test are the real ClassDevice forwarding impl.
+            let parent = Arc::new(DeviceObject::new(
+                DeviceId::new(u64::MAX),
+                BusId::new(u64::MAX),
+                DeviceLocation::PlatformStatic { id: 0 },
+                DiscoveryOrigin::PlatformStatic,
+                DeviceIdentity::Platform(PlatformIdentity {
+                    alias: None,
+                    firmware_id: None,
+                }),
+                None,
+                ResourceSet::new(),
+            ));
+            let device = ClassDevice {
+                inner: Arc::new(ClassDeviceInner {
+                    parent,
+                    runtime,
+                    name: "cached-display-test".into(),
+                    device_kind: DeviceKind::Display,
+                    irq: None,
+                    metadata: ClassDeviceMetadata::empty(),
+                }),
+            };
+            assert_eq!(device.has_virgl(), enabled);
+            if enabled {
+                let snapshot = device.virgl_capsets().unwrap();
+                let data = device.virgl_capset(2, 1).unwrap();
+                assert!(Arc::ptr_eq(&snapshot, &caps));
+                assert!(Arc::ptr_eq(&data, &bytes));
+                assert_eq!(device.virgl_capset(2, 2), Err(DriverError::InvalidInput));
+                assert_eq!(device.virgl_capset(1, 1), Err(DriverError::InvalidInput));
+                drop(device);
+                assert_eq!(data.as_ref(), &[0x12, 0x34, 0x56, 0x78]);
+                assert_eq!(snapshot[0].id, 2);
+            } else {
+                assert!(device.virgl_capsets().is_none());
+                assert_eq!(device.virgl_capset(2, 1), Err(DriverError::Unsupported));
+            }
+        }
+    }
+}

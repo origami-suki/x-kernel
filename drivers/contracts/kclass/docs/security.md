@@ -212,3 +212,11 @@ When modifying this module, verify:
 - Registry-lock critical sections still call no external callbacks (deadlock
   prevention).
 - Framebuffer changes respect the `Arc<DeviceObject>` lifetime guarantee.
+
+## Display virgl capability forwarding
+
+The display class forwards all three immutable virgl queries to its runtime
+implementer. Metadata and opaque bytes are returned as reference-counted
+immutable snapshots, so their validity does not depend on the class access
+scope or subsequent device removal. Query forwarding performs no device I/O.
+Protocol negotiation is not proof of DRM/render-submission support.

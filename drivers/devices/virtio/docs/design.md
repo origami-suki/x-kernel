@@ -79,7 +79,7 @@ Feature flags 控制编译哪些设备适配器：
 |------|------|
 | `lib.rs` | 设备探测（`probe_mmio_device` / `probe_pci_device`）、VirtIO 错误到 `DriverError` 的转换、公共类型 re-export |
 | `blk.rs` / `blk/requests.rs` | `VirtIoBlkDev` 实现 `BlockDeviceOperations`，管理准入、请求及 DMA 回收 |
-| `gpu.rs` | 将 `VirtIOGpu` 封装为实现 `DisplayDevice` 的 `VirtIoGpuDev` |
+| `gpu.rs` | 将 `VirtIoGpuProtocol` 封装为实现 `DisplayDevice` 的 `VirtIoGpuDev` |
 | `input.rs` | 将 `VirtIOInput` 封装为实现 `InputDevice` 的 `VirtIoInputDev` |
 | `net.rs` | 将 `VirtIONetRaw` 封装为实现 `NetDevice` 的 `VirtIoNetDev`，管理收发缓冲区、IRQ ack 和网络 RX scheduler 调度 |
 | `socket.rs` | 将 `VirtIOSocket` 封装为实现 `VsockDevice` 的原始包收发适配器 `VirtIoVsockDev`；连接状态由 `net/knet` 的 `VSOCK_CONN_MANAGER` 持有 |
@@ -456,7 +456,8 @@ headers and allocator overhead. The logical sector size is the protocol's fixed
 - **blk**: shared synchronous callers use one device SpinNoIrq for queue/state;
   all task waits and notifications occur outside it. IRQ acknowledgement uses
   the same lock; the host serializes per-device completion passes.
-- **gpu / input / socket / virtio_9p**：所有操作通过 `&mut self` 独占访问，
+- **gpu**：capset 查询只读初始化缓存；2D control queue 操作由内部 `SpinNoIrq` 串行化。
+- **input / socket / virtio_9p**：所有操作通过 `&mut self` 独占访问，
   调用者负责串行化，模块内部无锁。
 - **net**：`InnerDev` 被 `Arc<SpinNoIrq<...>>` 包裹，因为 IRQ 回调在中断上下文中
   访问设备（`ack_interrupt`），与正常收发路径并发。全局静态变量
@@ -510,3 +511,37 @@ No concrete driver imports ktask/kirq.
 Request tests live in blk/tests/requests.rs and remain a child of the requests
 module through #[path]. The blk directory holds runtime request code; requests
 does not need a separate directory solely to contain tests.
+
+## GPU protocol adapter and capability discovery
+
+The adapter retains its local depth-two control/cursor queues and 2D wire
+commands over the locked `kvirtiodrivers` 0.13.3 transport/virtqueue contracts.
+The dependency's resolution API discards the enabled bit; retaining the local
+response carrier preserves rejection of a disabled scanout with nonzero geometry.
+Creation, attach, transfer-to-host, scanout, flush, detach and unref retain
+their order. An attach failure attempts unref of the resource already created.
+Capset responses use a single writable descriptor, including header and payload,
+so queries also work without indirect descriptors. Fixed replies reject short
+used lengths; reused response buffers are cleared before requests.
+
+Initialization reads `num_capsets` from the transport configuration, initializes
+the device, rejects a disabled scanout or zero display dimensions, and caches virgl/virgl2 metadata
+and all versions from zero to each set's maximum. Other capset protocols are
+not exposed through the virgl contract. Discovery bounds are 16 device capsets,
+version 32, 64 KiB per blob and 1 MiB total reserved blob bytes. A duplicate,
+invalid or excessive virgl entry fails initialization; partial capability data
+is never published. Queries use the immutable cache without queue I/O or locks.
+
+Negotiation adds VIRGL to the existing ring/version feature mask. No
+CONTEXT_INIT or RESOURCE_BLOB feature is negotiated. Only VIRGL and its capability data are exposed here; no 3D
+context, resource, submit or fence API is added, and no DRM identity or render
+node changes. Device capability does not demonstrate application acceleration.
+
+Discovery runs before publication and without the adapter lock. The existing
+2D calls still serialize synchronous device requests under `SpinNoIrq`; that
+legacy execution model is retained, not extended to a long 3D fence wait.
+A future submission module must first provide a portable ownership/waiting
+contract that leaves interrupts enabled while waiting for GPU completion.
+The dependency's synchronous wait has no timeout; an unresponsive device can
+still stall initialization or a scanout operation. Capability queries after
+initialization do not have this failure mode.

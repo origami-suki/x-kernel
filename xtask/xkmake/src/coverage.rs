@@ -66,7 +66,7 @@ pub(crate) fn generate(bundle: &Bundle, args: &RunArgs) -> Result<()> {
 // QEMU can exit successfully after a guest error, and debugfs may read a valid
 // profile left by an earlier run. Require evidence from the newly captured log.
 fn validate_guest_completion(output: &str) -> Result<()> {
-    let has_status = |status| output.lines().any(|line| line.trim() == status);
+    let has_status = |status| output.lines().any(|line| status_line_matches(line, status));
     if !has_status("=== UNITTEST_STATUS: ALL_TESTS_PASSED ===")
         || has_status("=== UNITTEST_STATUS: TESTS_FAILED ===")
     {
@@ -79,6 +79,31 @@ fn validate_guest_completion(output: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+// Logger color resets can remain at either edge of a kprintln status line.
+// Strip only complete SGR sequences there: never repair a marker's contents
+// or accept terminal cursor/control escapes as evidence of guest completion.
+fn status_line_matches(line: &str, status: &str) -> bool {
+    let mut line = line.trim();
+    while let Some(rest) = strip_sgr_prefix(line) {
+        line = rest.trim_start();
+    }
+    while let Some(start) = line.rfind("\x1b[") {
+        if strip_sgr_prefix(&line[start..]) != Some("") {
+            break;
+        }
+        line = line[..start].trim_end();
+    }
+    line == status
+}
+
+fn strip_sgr_prefix(line: &str) -> Option<&str> {
+    let parameters = line.strip_prefix("\x1b[")?;
+    let end = parameters
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit() && byte != b';')?;
+    (parameters.as_bytes()[end] == b'm').then(|| &parameters[end + 1..])
 }
 
 struct CoverageArtifacts {
@@ -279,7 +304,7 @@ fn debugfs_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{debugfs_quote, validate_guest_completion};
+    use super::{debugfs_quote, status_line_matches, validate_guest_completion};
 
     #[test]
     fn coverage_requires_passing_tests_and_persisted_guest_output() {
@@ -289,12 +314,85 @@ mod tests {
         assert!(validate_guest_completion(passed).is_err());
         assert!(validate_guest_completion(persisted).is_err());
         assert!(validate_guest_completion(&format!("{passed}\r\n{persisted}\r\n")).is_ok());
-        assert!(validate_guest_completion(&format!(
-            "{passed}\n=== UNITTEST_STATUS: TESTS_FAILED ===\n{persisted}\n"
-        )).is_err());
-        assert!(validate_guest_completion(&format!(
-            "{passed}\nFailed to write coverage data: Io\nFailed to flush filesystem: Io\n"
-        )).is_err());
+        assert!(
+            validate_guest_completion(&format!(
+                "{passed}\n=== UNITTEST_STATUS: TESTS_FAILED ===\n{persisted}\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_guest_completion(&format!(
+                "{passed}\nFailed to write coverage data: Io\nFailed to flush filesystem: Io\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coverage_accepts_actual_capset_run_status_lines() {
+        // Exact raw lines from the module-1 QEMU unittest log. The reset
+        // following the preceding info message shares the persisted line.
+        let raw = "=== UNITTEST_STATUS: ALL_TESTS_PASSED ===\r\n\x1b[m\x1b[37m[ 19.330283 \
+                   0:18446462599840671760 entry:355] \x1b[32mCoverage data successfully written! \
+                   Size: 7578632 bytes\x1b[m\r\n\x1b[m=== UNITTEST_STATUS: COVERAGE_PERSISTED \
+                   ===\r\n";
+        assert!(validate_guest_completion(raw).is_ok());
+    }
+
+    #[test]
+    fn coverage_accepts_only_sgr_at_status_line_edges() {
+        let passed = "=== UNITTEST_STATUS: ALL_TESTS_PASSED ===";
+        let persisted = "=== UNITTEST_STATUS: COVERAGE_PERSISTED ===";
+        for marker in [passed, persisted] {
+            for decoration in [
+                format!("\x1b[m{marker}"),
+                format!("{marker}\x1b[0m"),
+                format!(" \x1b[1;32m\x1b[m {marker} \x1b[0m\x1b[m "),
+            ] {
+                assert!(status_line_matches(&decoration, marker));
+            }
+            for invalid in [
+                format!("\x1b[2J{marker}"),
+                format!("{marker}\x1b[K"),
+                format!("\x1b[?25m{marker}"),
+                format!("\x1b[1:32m{marker}"),
+                format!("\x1b[32{marker}"),
+                format!("prefix {marker}"),
+                format!("{marker} suffix"),
+                marker.replace("STATUS", "STA\x1b[mTUS"),
+                marker.replace("STATUS", "STA\nTUS"),
+            ] {
+                assert!(!status_line_matches(&invalid, marker), "{invalid:?}");
+                let output = if marker == passed {
+                    format!("{invalid}\n{persisted}\n")
+                } else {
+                    format!("{passed}\n{invalid}\n")
+                };
+                assert!(validate_guest_completion(&output).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_keeps_failure_and_persistence_gates_with_sgr() {
+        let passed = "\x1b[m=== UNITTEST_STATUS: ALL_TESTS_PASSED ===\x1b[0m";
+        let persisted = "\x1b[32m=== UNITTEST_STATUS: COVERAGE_PERSISTED ===\x1b[m";
+        assert!(validate_guest_completion(passed).is_err());
+        assert!(validate_guest_completion(persisted).is_err());
+        for failed in [
+            "=== UNITTEST_STATUS: TESTS_FAILED ===",
+            "\x1b[m=== UNITTEST_STATUS: TESTS_FAILED ===",
+            "=== UNITTEST_STATUS: TESTS_FAILED ===\x1b[0m",
+            " \x1b[31;1m=== UNITTEST_STATUS: TESTS_FAILED ===\x1b[m ",
+        ] {
+            assert!(
+                validate_guest_completion(&format!("{passed}\n{failed}\n{persisted}\n")).is_err()
+            );
+        }
+        assert!(
+            validate_guest_completion(&format!("{passed}\nFailed to write coverage data: Io\n"))
+                .is_err()
+        );
     }
 
     #[test]

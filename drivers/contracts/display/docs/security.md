@@ -66,3 +66,12 @@ None. The crate contains no `unsafe`, no FFI, and no inline assembly.
   programming.
 - New trait methods that hand memory to a host document the required
   lifetime discipline.
+
+## Virgl Discovery Boundary
+
+Virgl metadata and bytes originate in the device, not in userspace. Implementers
+must bound device-controlled counts, sizes, and versions before caching data.
+Callers receive immutable Arc snapshots and cannot mutate the cache. Consumers
+must still validate the wire format before interpreting the opaque bytes.
+A true `has_virgl()` value reports protocol negotiation only; it grants no
+submission capability and must not be used alone to advertise DRM support.

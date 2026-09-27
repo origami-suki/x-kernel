@@ -338,6 +338,18 @@ impl DisplayDevice for ClassDevice<DisplayDeviceImpl> {
         self.with(|device| device.flush())
     }
 
+    fn has_virgl(&self) -> bool {
+        self.with(|device| device.has_virgl())
+    }
+
+    fn virgl_capsets(&self) -> Option<Arc<[display::VirglCapsetInfo]>> {
+        self.with(|device| device.virgl_capsets())
+    }
+
+    fn virgl_capset(&self, id: u32, version: u32) -> DriverResult<Arc<[u8]>> {
+        self.with(|device| device.virgl_capset(id, version))
+    }
+
     fn create_scanout_resource(
         &self,
         resource: display::ScanoutResource,
