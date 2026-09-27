@@ -1627,6 +1627,7 @@ dependencies = [
  "memfs",
  "pipefs",
  "procfs",
+ "unittest",
  "v9fs",
 ]
 

@@ -36,6 +36,40 @@ use kvfs::{
     SuperBlock, SuperBlockFlags, path::PathBuf,
 };
 
+/// Compute a sysfs link relative to its parent, for trusted boot policy paths.
+fn relative_symlink(source: &str, target: &str) -> String {
+    let source_parent = source.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let source_components: Vec<&str> = source_parent
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let target_components: Vec<&str> = target
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let common_components = source_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(source, target)| source == target)
+        .count();
+
+    let mut result = String::new();
+    for _ in common_components..source_components.len() {
+        result.push_str("../");
+    }
+    let target_remainder = target_components[common_components..].join("/");
+    if target_remainder.is_empty() {
+        result.pop();
+    } else {
+        result.push_str(&target_remainder);
+    }
+    if result.is_empty() {
+        ".".to_string()
+    } else {
+        result
+    }
+}
+
 const PSEUDO_FS_MOUNT_FLAGS: MountFlags = MountFlags::NOSUID
     .union(MountFlags::NODEV)
     .union(MountFlags::NOEXEC)
@@ -355,12 +389,18 @@ impl BootVfs {
             let bus_path = format!("/sys/bus/{bus}");
             let driver_path = format!("{bus_path}/drivers/{}", snapshot.driver_name);
             self.ensure_directory_path(&driver_path)?;
-            Filename::new(format!("{hardware}/subsystem"))
-                .symlink_at(&self.root, &self.root, &bus_path, &cred)?;
-            Filename::new(format!("{hardware}/driver")).symlink_at(
+            let subsystem_link = format!("{hardware}/subsystem");
+            Filename::new(subsystem_link.as_str()).symlink_at(
                 &self.root,
                 &self.root,
-                &driver_path,
+                &relative_symlink(&subsystem_link, &bus_path),
+                &cred,
+            )?;
+            let driver_link = format!("{hardware}/driver");
+            Filename::new(driver_link.as_str()).symlink_at(
+                &self.root,
+                &self.root,
+                &relative_symlink(&driver_link, &driver_path),
                 &cred,
             )?;
         }
@@ -401,7 +441,12 @@ impl BootVfs {
             )?;
             let bus_device = format!("/sys/bus/pci/devices/{slot}");
             self.ensure_directory_path("/sys/bus/pci/devices")?;
-            Filename::new(bus_device).symlink_at(&self.root, &self.root, hardware, &cred)?;
+            Filename::new(bus_device.as_str()).symlink_at(
+                &self.root,
+                &self.root,
+                &relative_symlink(&bus_device, hardware),
+                &cred,
+            )?;
         }
         for name in ["card0", "renderD128"] {
             let node = match self.lookup(format!("/dev/dri/{name}")) {
@@ -436,7 +481,12 @@ impl BootVfs {
                     device,
                 ),
             ] {
-                Filename::new(path).symlink_at(&self.root, &self.root, &target, &cred)?;
+                Filename::new(path.as_str()).symlink_at(
+                    &self.root,
+                    &self.root,
+                    &relative_symlink(&path, &target),
+                    &cred,
+                )?;
             }
         }
         Ok(())
@@ -600,4 +650,73 @@ fn for_each_lexical_component<E>(
         }
     }
     Ok(())
+}
+
+#[cfg(unittest)]
+mod tests {
+    use unittest::def_test;
+
+    use super::relative_symlink;
+
+    #[def_test]
+    fn drm_class_and_character_links_use_linux_relative_targets() {
+        let device = "/sys/devices/pci0000:00/0000:00:03.0/drm/card0";
+        for link in ["/sys/class/drm/card0", "/sys/dev/char/226:0"] {
+            assert_eq!(
+                relative_symlink(link, device),
+                "../../devices/pci0000:00/0000:00:03.0/drm/card0"
+            );
+        }
+    }
+
+    #[def_test]
+    fn drm_device_subsystem_and_pci_links_resolve_to_existing_parents() {
+        assert_eq!(
+            relative_symlink(
+                "/sys/devices/pci0000:00/0000:00:03.0/drm/card0/device",
+                "/sys/devices/pci0000:00/0000:00:03.0"
+            ),
+            "../.."
+        );
+        assert_eq!(
+            relative_symlink(
+                "/sys/devices/pci0000:00/0000:00:03.0/drm/card0/subsystem",
+                "/sys/class/drm"
+            ),
+            "../../../../../class/drm"
+        );
+        assert_eq!(
+            relative_symlink(
+                "/sys/devices/pci0000:00/0000:00:03.0/subsystem",
+                "/sys/bus/pci"
+            ),
+            "../../../bus/pci"
+        );
+        assert_eq!(
+            relative_symlink(
+                "/sys/devices/pci0000:00/0000:00:03.0/driver",
+                "/sys/bus/pci/drivers/virtio_gpu"
+            ),
+            "../../../bus/pci/drivers/virtio_gpu"
+        );
+        assert_eq!(
+            relative_symlink(
+                "/sys/bus/pci/devices/0000:00:03.0",
+                "/sys/devices/pci0000:00/0000:00:03.0"
+            ),
+            "../../../devices/pci0000:00/0000:00:03.0"
+        );
+    }
+
+    #[def_test]
+    fn relative_links_handle_ancestor_and_same_directory_targets() {
+        assert_eq!(
+            relative_symlink("/sys/class/drm/subsystem", "/sys"),
+            "../.."
+        );
+        assert_eq!(
+            relative_symlink("/sys/class/drm/subsystem", "/sys/class/drm"),
+            "."
+        );
+    }
 }

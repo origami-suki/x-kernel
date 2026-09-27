@@ -115,3 +115,7 @@ numbers, actual physical PCI BDF and verified configuration-space IDs, and the
 registered bound driver. The host renderer's hardware identity is not substituted
 for the virtual guest PCI device. Namespace attributes are read-only boot-time
 snapshots; device removal/hotplug and full udev emulation remain separate work.
+
+## Relative sysfs link compatibility
+
+相对链接只从 boot policy 构造的可信 sysfs 路径计算；不接受用户提供的链接目标。class/devchar/subsystem/device/PCI 索引须解析到同一既有设备目录，避免路径深度变化造成设备发现失败；链接格式不赋予设备打开或 seat/DRM master 权限。

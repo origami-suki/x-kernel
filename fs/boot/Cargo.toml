@@ -35,4 +35,5 @@ macros = { workspace = true, optional = true }
 memfs.workspace = true
 procfs.workspace = true
 pipefs.workspace = true
+unittest.workspace = true
 v9fs = { workspace = true, optional = true }
