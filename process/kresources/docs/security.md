@@ -71,3 +71,22 @@ file release.
 is installed on failure. The owner guard prevents detachment during the
 operation and the write guard serializes source lookup with insertion. Other
 insertion and fixed-slot duplication policies are unchanged.
+
+## Exact descriptor installation identity
+
+Each fd slot installation owns a unique Arc token independent of the VfsFile.
+Reading/cloning a token or ordinary snapshot preserves identity. New installation,
+dup and non-noop dup2 create a fresh identity even for the same cached file;
+oldfd==newfd remains a true no-op. Fork copying recreates each child's descriptor
+identity while sharing VfsFile and retaining CLOEXEC/limits. CLONE_FILES shares the
+same table and identities. Tokens do not own files and allocation identity cannot
+wrap like a scalar generation counter.
+
+ProcessResources::install_file returns a FileInstallation capturing the original
+fd table, fd number and token. Faultable user copying holds no table writer guard.
+Explicit commit publishes success; explicit rollback removes only the matching
+original installation and closes after unlocking. A same-file replacement survives,
+as do fork/unshare copies in other tables. The ticket has no implicit Drop rollback.
+The ordinary fd insertion/duplication/limit APIs retain their existing behavior.
+Deterministic regressions cover same-Arc dup2, no-op dup2, fork/shared tables, table
+unshare during publication and exact-slot rollback at the descriptor limit.

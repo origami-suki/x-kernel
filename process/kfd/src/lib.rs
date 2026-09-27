@@ -28,7 +28,7 @@ mod stat;
 
 pub use self::{
     fd_table::FdTable,
-    file_descriptor::{FdSnapshot, FileDescriptor},
+    file_descriptor::{DescriptorToken, FdSnapshot, FileDescriptor},
     stat::Kstat,
 };
 
@@ -286,5 +286,39 @@ mod tests {
 
         assert_eq!(failed_flushes.load(Ordering::Relaxed), 1);
         assert_eq!(successful_flushes.load(Ordering::Relaxed), 1);
+    }
+    #[def_test]
+    fn installation_token_preserves_same_file_dup2_replacement_and_noop_identity() {
+        let file = snapshot_test_file();
+        let mut table = FdTable::default();
+        let source = table.add_file(16, file.clone(), false).unwrap();
+        let (target, token) = table.add_file_with_token(16, file.clone(), true).unwrap();
+        let (_, retired) = table.duplicate_to(source, target, false).unwrap();
+        drop(retired);
+        assert!(table.remove_if_token(target, &token).is_none());
+        assert!(Arc::ptr_eq(&table.get_file(target).unwrap(), &file));
+        assert!(!table.cloexec(target).unwrap());
+        let token = table.installation_token(target).unwrap();
+        table.duplicate_to(target, target, true).unwrap();
+        assert!(!table.cloexec(target).unwrap());
+        assert!(table.remove_if_token(target, &token).is_some());
+    }
+
+    #[def_test]
+    fn fork_tokens_are_fresh_but_clone_files_shares_installation_table() {
+        let table = FdTable::new_shared();
+        let file = snapshot_test_file();
+        let (fd, token) = table
+            .write()
+            .add_file_with_token(16, file.clone(), true)
+            .unwrap();
+        let child = FdTable::clone_shared_from(&table);
+        assert!(child.write().remove_if_token(fd, &token).is_none());
+        assert!(Arc::ptr_eq(&child.read().get_file(fd).unwrap(), &file));
+        let shared = table.clone();
+        assert!(shared.write().remove_if_token(fd, &token).is_some());
+        assert!(table.read().get_file(fd).is_err());
+        assert!(child.read().get_file(fd).is_ok());
+        assert!(child.read().cloexec(fd).unwrap());
     }
 }

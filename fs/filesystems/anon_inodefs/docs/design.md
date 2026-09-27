@@ -97,3 +97,13 @@ state，不需要文件系统级 mutex。VFS 对象内部同步由 KVFS 负责�
 全局 filesystem 对象不在运行期释放。每个 `VfsFile` 释放时由自身 operation table 完成
 kernel object cleanup，随后释放 per-file private `Arc`、dentry 和 file 引用；共享 inode
 与 hidden mount 仍由 `AnonInodeFs` 持有。
+
+## Sized private anonymous files
+
+`get_file_with_size` creates a distinct anonymous inode with fixed size and
+normal access flags, plus LSEEK permission. DMA-buffer exporters use it to
+report each backing allocation's truthful fstat/SEEK_END size. The existing
+shared `get_file` inode and its metadata are unchanged. Type-erased private
+state is attached only to the returned VfsFile; duplicate descriptors and
+SCM_RIGHTS retain the existing Arc description. Exporters supply their own
+mmap/ioctl operations and must enforce ownership and synchronization there.

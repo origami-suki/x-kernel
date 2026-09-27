@@ -26,11 +26,50 @@ use alloc::sync::Arc;
 use core::{any::Any, ffi::c_int};
 
 use kerrno::{KError, KResult};
-use kfd::{FdSnapshot, FdTable, FileDescriptor};
+use kfd::{DescriptorToken, FdSnapshot, FdTable, FileDescriptor};
 use krlimit::{Rlimit, Rlimits};
 use ksync::RwLock;
 use kvfs::VfsFile;
 use linux_raw_sys::general::{RLIM_NLIMITS, RLIMIT_NOFILE};
+
+/// Ticket for exactly one descriptor installation in its original table.
+///
+/// The table/token remain fixed across process table replacement. Shared files
+/// keep shared VfsFile identity; dup/fork installs new slot identities. This
+/// ticket has no implicit Drop action: callers explicitly commit or roll back.
+/// No fd-table lock is held while a caller performs faultable user copying.
+pub struct FileInstallation {
+    fd: c_int,
+    table: Arc<RwLock<FdTable>>,
+    token: DescriptorToken,
+}
+
+impl FileInstallation {
+    /// Returns the installed descriptor number for publishing to the caller.
+    pub fn fd(&self) -> c_int {
+        self.fd
+    }
+
+    /// Completes publication without changing this or any replacement entry.
+    pub fn commit(self) -> c_int {
+        self.fd
+    }
+
+    /// Removes only this exact installation, then closes outside the table lock.
+    /// A replaced/reused/dup2-installed slot survives even for the same VfsFile.
+    /// Requires task context; closing may invoke the file's flush callback.
+    /// # Errors
+    /// Propagates close/flush errors after the original descriptor was removed.
+    pub fn rollback(self) -> KResult<bool> {
+        let removed = self.table.write().remove_if_token(self.fd, &self.token);
+        if let Some(descriptor) = removed {
+            descriptor.close()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
 
 /// Process-owned resource state.
 ///
@@ -188,6 +227,19 @@ impl ProcessResources {
     /// `KError::TooManyOpenFiles` if occupied count reaches the soft cap or the table is full.
     pub fn add_file(&self, file: Arc<VfsFile>, cloexec: bool) -> kerrno::KResult<c_int> {
         self.with_fd_table(|fd_table| fd_table.write().add_file(self.max_nofile(), file, cloexec))
+    }
+
+    /// Installs a file with an exact-slot rollback ticket under normal limits.
+    /// The ticket captures the original table; no locks escape this method.
+    /// # Errors
+    /// Returns NoSuchProcess after detachment or TooManyOpenFiles at the limit.
+    pub fn install_file(&self, file: Arc<VfsFile>, cloexec: bool) -> KResult<FileInstallation> {
+        let owner = self.fd_table.read();
+        let table = owner.as_ref().cloned().ok_or(KError::NoSuchProcess)?;
+        let (fd, token) = table
+            .write()
+            .add_file_with_token(self.max_nofile(), file, cloexec)?;
+        Ok(FileInstallation { fd, table, token })
     }
 
     /// Duplicates a descriptor into a newly allocated slot.
@@ -481,5 +533,65 @@ mod tests {
 
         second.exit_files();
         assert!(weak.upgrade().is_none());
+    }
+    struct InstallationTestOperations;
+    impl kvfs::FileOperations for InstallationTestOperations {}
+
+    fn installation_test_file() -> Arc<kvfs::VfsFile> {
+        anon_inodefs::init_anon_inodefs();
+        anon_inodefs::AnonInodeFs::global()
+            .get_file(
+                "install-test",
+                Arc::new(InstallationTestOperations),
+                Arc::new(()),
+                kvfs::FMode::READ,
+                kvfs::OpenFlags::empty(),
+                kcred::initial_cred(),
+            )
+            .unwrap()
+    }
+
+    #[def_test]
+    fn scoped_install_rollback_preserves_same_arc_replacement_and_limit_policy() {
+        let resources = ProcessResources::new(0x80000);
+        let file = installation_test_file();
+        let source = resources.add_file(file.clone(), false).unwrap();
+        let failed = resources.install_file(file.clone(), true).unwrap();
+        let target = failed.fd();
+        resources.duplicate_file_to(source, target, false).unwrap();
+        assert!(!failed.rollback().unwrap());
+        assert!(Arc::ptr_eq(&resources.get_file(target).unwrap(), &file));
+        assert!(!resources.cloexec(target).unwrap());
+        resources.close_file(source).unwrap();
+        resources.close_file(target).unwrap();
+        resources
+            .set_rlimit_values(linux_raw_sys::general::RLIMIT_NOFILE, 1, 1)
+            .unwrap();
+        let failed = resources.install_file(file.clone(), true).unwrap();
+        let fd = failed.fd();
+        assert_eq!(
+            resources.install_file(file, false).err(),
+            Some(kerrno::KError::TooManyOpenFiles)
+        );
+        // Faultable copyout occurs outside any descriptor-table writer guard.
+        assert!(resources.fd_table().unwrap().try_write().is_some());
+        assert!(failed.rollback().unwrap());
+        assert!(resources.get_file(fd).is_err());
+        assert_eq!(resources.fd_table().unwrap().read().count(), 0);
+    }
+
+    #[def_test]
+    fn install_ticket_tracks_original_table_across_unshare_and_shared_files() {
+        let first = ProcessResources::new(0x80000);
+        let peer = ProcessResources::new(0x80000);
+        let file = installation_test_file();
+        let shared = first.fd_table().unwrap();
+        drop(peer.replace_fd_table(shared).unwrap());
+        let failed = first.install_file(file.clone(), false).unwrap();
+        let fd = failed.fd();
+        first.unshare_fd_table().unwrap();
+        assert!(failed.rollback().unwrap());
+        assert!(peer.get_file(fd).is_err());
+        assert!(Arc::ptr_eq(&first.get_file(fd).unwrap(), &file));
     }
 }

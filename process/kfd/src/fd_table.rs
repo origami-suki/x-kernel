@@ -12,7 +12,7 @@ use kerrno::{KError, KResult};
 use ksync::RwLock;
 use kvfs::VfsFile;
 
-use crate::{FdSnapshot, FileDescriptor};
+use crate::{DescriptorToken, FdSnapshot, FileDescriptor};
 
 /// Process-local file descriptor table.
 pub struct FdTable {
@@ -82,7 +82,16 @@ impl FdTable {
 
     /// Clones the table contents from another descriptor table.
     pub(crate) fn clone_from(&mut self, other: &Self) {
-        self.entries.clone_from(&other.entries);
+        self.entries = FlattenObjects::new();
+        for fd in other.ids() {
+            let descriptor = other
+                .get(fd)
+                .expect("iterated descriptor exists")
+                .new_installation();
+            self.add_at(fd, descriptor)
+                .ok()
+                .expect("same-sized cloned fd table has capacity");
+        }
     }
 
     /// Returns the open file stored in the given descriptor.
@@ -121,13 +130,51 @@ impl FdTable {
         file: Arc<VfsFile>,
         cloexec: bool,
     ) -> KResult<c_int> {
+        self.add_file_with_token(max_nofile, file, cloexec)
+            .map(|(fd, _)| fd)
+    }
+
+    /// Installs an open file and returns the exact installation identity.
+    /// # Errors
+    /// Returns TooManyOpenFiles under the same limit/capacity policy as add_file.
+    pub fn add_file_with_token(
+        &mut self,
+        max_nofile: u64,
+        file: Arc<VfsFile>,
+        cloexec: bool,
+    ) -> KResult<(c_int, DescriptorToken)> {
         if self.count() as u64 >= max_nofile {
             return Err(KError::TooManyOpenFiles);
         }
-
-        self.add(FileDescriptor::new(file, cloexec))
-            .map(|fd| fd as c_int)
+        let descriptor = FileDescriptor::new(file, cloexec);
+        let token = descriptor.token();
+        self.add(descriptor)
+            .map(|fd| (fd as c_int, token))
             .map_err(|_| KError::TooManyOpenFiles)
+    }
+
+    /// Removes only the exact installation, preserving replacements at the same fd.
+    /// The returned descriptor must be closed outside the table lock.
+    pub fn remove_if_token(
+        &mut self,
+        fd: c_int,
+        token: &DescriptorToken,
+    ) -> Option<FileDescriptor> {
+        if self
+            .get(fd as usize)
+            .is_some_and(|entry| entry.token().matches(token))
+        {
+            self.remove(fd as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Returns a token for the current installation without replacing it.
+    pub fn installation_token(&self, fd: c_int) -> KResult<DescriptorToken> {
+        self.get(fd as usize)
+            .map(FileDescriptor::token)
+            .ok_or(KError::BadFileDescriptor)
     }
 
     /// Inserts an open file without applying a resource-limit policy.
@@ -243,7 +290,7 @@ impl FdTable {
 
         let mut descriptor = self
             .get(old_fd as usize)
-            .cloned()
+            .map(FileDescriptor::new_installation)
             .ok_or(KError::BadFileDescriptor)?;
         descriptor.set_cloexec(cloexec);
 

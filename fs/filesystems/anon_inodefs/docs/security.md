@@ -73,3 +73,13 @@ file operation object、typed private object、名称、flags 和 credential 都
 - name 是否为固定 class label，未包含用户秘密？
 - 新 flags 是否在 syscall 边界类型化，且未绕过 `get_file()` 的 mask？
 - 是否错误增加 per-file inode、mount 或 dentry-operation owner？
+
+## Sized private anonymous files
+
+`get_file_with_size` creates a distinct anonymous inode with fixed size and
+normal access flags, plus LSEEK permission. DMA-buffer exporters use it to
+report each backing allocation's truthful fstat/SEEK_END size. The existing
+shared `get_file` inode and its metadata are unchanged. Type-erased private
+state is attached only to the returned VfsFile; duplicate descriptors and
+SCM_RIGHTS retain the existing Arc description. Exporters supply their own
+mmap/ioctl operations and must enforce ownership and synchronization there.

@@ -89,6 +89,41 @@ impl AnonInodeFs {
         file.set_private_data(private_data);
         Ok(file)
     }
+
+    /// Creates an anonymous file with a distinct inode and fixed reported size.
+    ///
+    /// DMA-buffer exporters use this to give each allocation truthful `fstat`
+    /// metadata without changing the shared anonymous inode used by other APIs.
+    /// Access mode is derived from `open_flags`; descriptor CLOEXEC remains the
+    /// caller's responsibility when installing the returned file.
+    ///
+    /// # Errors
+    /// Returns VFS errors if the private pseudo-file cannot be allocated.
+    pub fn get_file_with_size<T>(
+        &self,
+        name: &str,
+        file_operations: Arc<dyn FileOperations>,
+        private_data: Arc<T>,
+        size: u64,
+        open_flags: OpenFlags,
+        cred: Arc<Cred>,
+    ) -> VfsResult<Arc<VfsFile>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let flags =
+            open_flags & (OpenFlags::WRITE_ONLY | OpenFlags::READ_WRITE | OpenFlags::NONBLOCK);
+        let file = self.mount.alloc_file_pseudo(
+            new_anon_inode_with_size(size),
+            name,
+            FMode::from_open_flags(flags) | FMode::LSEEK,
+            flags,
+            file_operations,
+            cred,
+        )?;
+        file.set_private_data(private_data);
+        Ok(file)
+    }
 }
 
 /// Initializes the hidden anonymous-inode filesystem during boot.
@@ -113,6 +148,10 @@ impl InodeOperations for AnonInodeOperations {
 }
 
 fn new_anon_inode() -> Arc<VfsInode> {
+    new_anon_inode_with_size(0)
+}
+
+fn new_anon_inode_with_size(size: u64) -> Arc<VfsInode> {
     let timestamp = ktime::realtime();
     let init = VfsInodeInit::new(
         get_next_ino(),
@@ -123,6 +162,7 @@ fn new_anon_inode() -> Arc<VfsInode> {
         ),
     )
     .with_owner_links_and_rdev(0, 0, 1, Default::default())
+    .with_size(size)
     .with_stat_data(PAGE_SIZE_4K as u64, 0, timestamp, timestamp, timestamp);
     VfsInode::new_file_with_inode_operations(
         Arc::new(()),
@@ -186,5 +226,28 @@ mod tests {
             first.path().filesystem_stat().unwrap().fs_type,
             ANON_INODE_FS_MAGIC
         );
+    }
+    #[def_test]
+    fn sized_anonymous_files_have_distinct_inodes_and_metadata() {
+        init_anon_inodefs();
+        let open = |size| {
+            AnonInodeFs::global()
+                .get_file_with_size(
+                    "dma-buf",
+                    Arc::new(TestFileOperations),
+                    Arc::new(()),
+                    size,
+                    OpenFlags::READ_WRITE,
+                    kcred::initial_cred(),
+                )
+                .unwrap()
+        };
+        let first = open(4096);
+        let second = open(8192);
+        assert!(!Arc::ptr_eq(&first.path().inode(), &second.path().inode()));
+        assert_eq!(first.path().getattr().unwrap().size, 4096);
+        assert_eq!(second.path().getattr().unwrap().size, 8192);
+        assert_eq!(AnonInodeFs::global().singleton_inode.size(), 0);
+        assert!(first.mode().contains(FMode::LSEEK));
     }
 }

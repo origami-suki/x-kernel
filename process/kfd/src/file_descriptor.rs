@@ -10,17 +10,47 @@ use core::ffi::c_int;
 use kerrno::KResult;
 use kvfs::{OpenFlags, Path, VfsFile};
 
+/// Identity of one descriptor installation, independent of its open file.
+///
+/// Cloning a token/snapshot preserves identity; installing via dup/fork creates
+/// a fresh identity even when the same VfsFile is shared. Tokens do not own files.
+#[derive(Clone)]
+pub struct DescriptorToken(Arc<()>);
+
+impl DescriptorToken {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// A file descriptor entry in the file descriptor table.
 #[derive(Clone)]
 pub struct FileDescriptor {
     file: Arc<VfsFile>,
     cloexec: bool,
+    token: DescriptorToken,
 }
 
 impl FileDescriptor {
     /// Creates a new descriptor entry.
     pub(crate) fn new(file: Arc<VfsFile>, cloexec: bool) -> Self {
-        Self { file, cloexec }
+        Self {
+            file,
+            cloexec,
+            token: DescriptorToken::new(),
+        }
+    }
+
+    pub(crate) fn new_installation(&self) -> Self {
+        Self::new(self.file.clone(), self.cloexec)
+    }
+
+    pub(crate) fn token(&self) -> DescriptorToken {
+        self.token.clone()
     }
 
     /// Returns the underlying open file.

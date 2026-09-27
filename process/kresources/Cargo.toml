@@ -17,3 +17,6 @@ krlimit.workspace = true
 ksync.workspace = true
 linux-raw-sys = { workspace = true, features = ["general"] }
 unittest.workspace = true
+
+anon_inodefs.workspace = true
+kcred.workspace = true
