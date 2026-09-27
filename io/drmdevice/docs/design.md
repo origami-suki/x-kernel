@@ -78,7 +78,7 @@ primary ClassDevice<DisplayDeviceImpl> (display scanout backend, via kclass)
 ## Execution Context
 
 - All entry points run in process syscall context through `kvfs`
-  `DeviceFileOps`; blocking is not performed — poll integration is
+  `DeviceFileOps`; vblank waits and device submission may block in task context, while poll integration is
   non-blocking readiness via `kpoll`.
 - `read` copies queued vblank events to user buffers; the event queue is
   bounded (`MAX_EVENTS`).
@@ -135,7 +135,7 @@ primary ClassDevice<DisplayDeviceImpl> (display scanout backend, via kclass)
   same `ModesetState` so the two interfaces cannot diverge.
 - Dumb buffers with retained backing pages: user-space may keep a
   mapping after removing the framebuffer; retention turns that from a
-  use-after-free hazard into a bounded memory cost.
+  use-after-free hazard into a retained memory cost; repeated creation is unbounded until fenced reclamation exists.
 - Build-once system blobs behind double-checked atomics: the IN-FORMATS
   blob is read on every atomic check but must be allocated once; the
   atomic fast path keeps per-frame ioctls lock-free on the hot path.
@@ -153,3 +153,36 @@ Linux per-open master or SET_VERSION-dependent bus-id lifetime.
 Reference: Linux v6.12 drivers/gpu/drm/drm_ioctl.c (drm_copy_field, drm_getunique).
 Regression: the same AArch64 ioctl probe on the supplied Linux and x-kernel,
 including zero buffers, short-buffer canaries, full values and bad pointers.
+
+## Per-open DRM state and intermediate lifetime boundary
+
+`DeviceFileOps::open` installs a typed `Arc<DrmFile>` in `VfsFile` private
+state. Independent opens have independent dumb/GEM handle namespaces, event
+queues, PollSets, and client capabilities. Existing dup/fork semantics share
+one `Arc<VfsFile>` and therefore the same state. Client capabilities 2
+(universal planes) and 3 (atomic) accept boolean values; unsupported requests
+return EINVAL. Capabilities are recorded, while the existing minimal KMS
+visibility policy is unchanged. GEM_CLOSE and DESTROY_DUMB remove only the
+calling file's handle; unknown handles return EINVAL. Device resource IDs,
+framebuffer IDs, offsets, modeset state and property blobs remain device-wide.
+
+Framebuffers and the last attempted active scanout hold an `Arc<DumbBuffer>`.
+Removing a handle cannot invalidate either. Present copies the reference out
+of the framebuffer lock before the device call; mmap copies the object out
+of the file lock before entering the mapper. Event delivery targets only the
+requesting description and wakes that description's PollSet after unlocking.
+Final file release clears handles/events/caps and does no device I/O or wait.
+
+This is an intermediate safety boundary, **not resource reclamation**.
+All buffers submitted for creation now retain backing in the device-wide
+`retained_pages` table, including never-mapped buffers and failed backend commands whose partial host
+attachment cannot be disproved. Neither GEM_CLOSE nor
+DESTROY_DUMB sends host detach/unref. Host resource teardown is deliberately
+pending a fenced, explicit cleanup path that owns backing until completion;
+no synchronous GPU waits occur in Drop or under file/framebuffer/MmSpace
+locks. Physical mappings still depend on device-lifetime retention until the
+separate owned-mapping module is integrated. Repeated create/close consumes
+memory and host resources until device/kernel lifetime ends; there is no
+bounded reclamation claim. DRM master/access control, PRIME/DMA-BUF, 3D UAPI
+and context ownership are outside this change; existing PRIME behavior is not
+real DMA-BUF support.

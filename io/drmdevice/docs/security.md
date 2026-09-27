@@ -125,3 +125,36 @@ copies only a complete value. Both ioctls retain UserPtr copying and EFAULT for
 invalid destinations. Guest canaries verify bytes beyond the advertised capacity
 remain unchanged. Fixed identity/master-state limitations are not resolved by
 this buffer-safety correction.
+
+## Per-open DRM state and intermediate lifetime boundary
+
+`DeviceFileOps::open` installs a typed `Arc<DrmFile>` in `VfsFile` private
+state. Independent opens have independent dumb/GEM handle namespaces, event
+queues, PollSets, and client capabilities. Existing dup/fork semantics share
+one `Arc<VfsFile>` and therefore the same state. Client capabilities 2
+(universal planes) and 3 (atomic) accept boolean values; unsupported requests
+return EINVAL. Capabilities are recorded, while the existing minimal KMS
+visibility policy is unchanged. GEM_CLOSE and DESTROY_DUMB remove only the
+calling file's handle; unknown handles return EINVAL. Device resource IDs,
+framebuffer IDs, offsets, modeset state and property blobs remain device-wide.
+
+Framebuffers and the last attempted active scanout hold an `Arc<DumbBuffer>`.
+Removing a handle cannot invalidate either. Present copies the reference out
+of the framebuffer lock before the device call; mmap copies the object out
+of the file lock before entering the mapper. Event delivery targets only the
+requesting description and wakes that description's PollSet after unlocking.
+Final file release clears handles/events/caps and does no device I/O or wait.
+
+This is an intermediate safety boundary, **not resource reclamation**.
+All buffers submitted for creation now retain backing in the device-wide
+`retained_pages` table, including never-mapped buffers and failed backend commands whose partial host
+attachment cannot be disproved. Neither GEM_CLOSE nor
+DESTROY_DUMB sends host detach/unref. Host resource teardown is deliberately
+pending a fenced, explicit cleanup path that owns backing until completion;
+no synchronous GPU waits occur in Drop or under file/framebuffer/MmSpace
+locks. Physical mappings still depend on device-lifetime retention until the
+separate owned-mapping module is integrated. Repeated create/close consumes
+memory and host resources until device/kernel lifetime ends; there is no
+bounded reclamation claim. DRM master/access control, PRIME/DMA-BUF, 3D UAPI
+and context ownership are outside this change; existing PRIME behavior is not
+real DMA-BUF support.

@@ -329,3 +329,13 @@ pub struct DrmModeGetBlob {
     pub length: u32,
     pub data: UserPtr<u8>,
 }
+
+/// Deletes a GEM handle from the calling open file description.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, UserRead, UserWrite)]
+pub struct DrmGemClose {
+    /// Handle in the calling open file description.
+    pub handle: u32,
+    /// ABI padding; ignored.
+    pub pad: u32,
+}

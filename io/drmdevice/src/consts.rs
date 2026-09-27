@@ -169,3 +169,8 @@ pub const CVT_RB_VFRONT_PORCH: u16 = 3;
 pub const CVT_RB_VSYNC_WIDTH: u16 = 8;
 pub const CVT_RB_VBACK_PORCH: u16 = 6;
 pub const DEFAULT_VREFRESH: u32 = 60;
+
+/// Expose universal planes to this open file description.
+pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+/// Enable atomic KMS for this open file description.
+pub const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
