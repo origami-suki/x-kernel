@@ -13,9 +13,11 @@
 extern crate alloc;
 mod card0;
 mod consts;
+mod discovery;
 mod drm;
 
-pub use card0::Card0;
+pub use card0::{Card0, RenderNode};
+pub use discovery::{DrmDiscovery, DrmPciInfo, discovery, render_available};
 
 /// Returns whether a display device is available for DRM to use.
 pub fn available() -> bool {

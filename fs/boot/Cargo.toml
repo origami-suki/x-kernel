@@ -22,6 +22,7 @@ block.workspace = true
 bpffs = { workspace = true, optional = true }
 cgroup2fs = { workspace = true, optional = true }
 devfs.workspace = true
+drmdevice.workspace = true
 fs_context.workspace = true
 kclass = { workspace = true, optional = true }
 kbuild_config.workspace = true

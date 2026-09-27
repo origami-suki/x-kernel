@@ -105,3 +105,13 @@ libudev/Weston 随后仍须打开 `/dev/dri/card0` 并经过原有 VFS/设备操
 本次不引入 unsafe 或具体 PCI 驱动依赖。sysfs 沿用 memfs，0444 防止普通用户更改
 属性，但不宣称具有完整 kernfs 的不可修改属性及热插拔生命周期。GPU 移除场景仍需
 后续同步注册机制，不能把启动快照当作实时设备清单。
+
+## Physical DRM primary/render discovery
+
+DRM devfs nodes share one registered physical adapter with separate per-open
+state. renderD128 exists only for a healthy implemented rendering backend and
+rejects KMS/master operations. Boot sysfs links publish actual devfs device
+numbers, actual physical PCI BDF and verified configuration-space IDs, and the
+registered bound driver. The host renderer's hardware identity is not substituted
+for the virtual guest PCI device. Namespace attributes are read-only boot-time
+snapshots; device removal/hotplug and full udev emulation remain separate work.

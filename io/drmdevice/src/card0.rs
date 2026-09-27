@@ -12,7 +12,7 @@ use alloc::{
     collections::{BTreeMap, VecDeque},
     format,
     string::String,
-    sync::Arc,
+    sync::{Arc, Weak},
     vec,
     vec::Vec,
 };
@@ -35,8 +35,18 @@ use posix_types::{UserPtr, UserRead, UserWrite};
 
 use super::{consts::*, drm::*};
 
+#[path = "render.rs"]
+mod render;
+#[path = "sharing.rs"]
+mod sharing;
+pub use render::RenderNode;
 #[path = "virtgpu.rs"]
 mod virtgpu;
+
+static NEXT_RESOURCE_ID: AtomicU32 = AtomicU32::new(0x1000);
+static NEXT_CONTEXT_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_OFFSET: AtomicU64 = AtomicU64::new(DUMB_BUFFER_OFFSET_STRIDE);
+static REGISTERED_CARDS: LazyInit<Mutex<BTreeMap<kdevice::DeviceId, Arc<Card0>>>> = LazyInit::new();
 
 static DISPLAY_DEVICES: LazyInit<Mutex<Vec<ClassDevice<DisplayDeviceImpl>>>> = LazyInit::new();
 
@@ -54,10 +64,19 @@ fn ensure_scanout_registry() {
     register_display_devices(class_display_devices());
     kclass::subscribe_display_available(Arc::new(register_display_device));
     subscribe_device_removed(Arc::new(|id| {
-        let mut devices = DISPLAY_DEVICES.lock();
-        if let Some(pos) = devices.iter().position(|device| device.id() == id) {
-            devices.swap_remove(pos);
+        {
+            let mut devices = DISPLAY_DEVICES.lock();
+            if let Some(pos) = devices.iter().position(|device| device.id() == id) {
+                devices.swap_remove(pos);
+            }
         }
+        let retired = if REGISTERED_CARDS.is_inited() {
+            REGISTERED_CARDS.lock().remove(&id)
+        } else {
+            None
+        };
+        // Resource/context Drops may queue work, so run outside registry locks.
+        drop(retired);
     }));
 }
 
@@ -84,7 +103,7 @@ pub(crate) fn scanout_available() -> bool {
     !DISPLAY_DEVICES.lock().is_empty()
 }
 
-fn primary_scanout() -> VfsResult<ClassDevice<DisplayDeviceImpl>> {
+pub(super) fn primary_scanout() -> VfsResult<ClassDevice<DisplayDeviceImpl>> {
     ensure_scanout_registry();
     DISPLAY_DEVICES
         .lock()
@@ -141,13 +160,27 @@ fn copy_version_field(ptr: UserPtr<u8>, capacity: &mut usize, value: &[u8]) -> V
 impl DrmIoctl for DrmVersion {
     const CMD: u32 = iowr::<DrmVersion>(DRM_TYPE, 0x00);
 
-    fn handle(_dev: &Card0, _file: &DrmFile, version: &mut Self) -> VfsResult<usize> {
-        version.version_major = DRIVER_VERSION_MAJOR;
-        version.version_minor = DRIVER_VERSION_MINOR;
-        version.version_patchlevel = DRIVER_VERSION_PATCHLEVEL;
-        copy_version_field(version.name, &mut version.name_len, DRIVER_NAME.as_bytes())?;
-        copy_version_field(version.date, &mut version.date_len, DRIVER_DATE.as_bytes())?;
-        copy_version_field(version.desc, &mut version.desc_len, DRIVER_DESC.as_bytes())?;
+    fn handle(dev: &Card0, _file: &DrmFile, version: &mut Self) -> VfsResult<usize> {
+        (
+            version.version_major,
+            version.version_minor,
+            version.version_patchlevel,
+        ) = dev.driver_identity.version();
+        copy_version_field(
+            version.name,
+            &mut version.name_len,
+            dev.driver_identity.name().as_bytes(),
+        )?;
+        copy_version_field(
+            version.date,
+            &mut version.date_len,
+            dev.driver_identity.date().as_bytes(),
+        )?;
+        copy_version_field(
+            version.desc,
+            &mut version.desc_len,
+            dev.driver_identity.description().as_bytes(),
+        )?;
         Ok(0)
     }
 }
@@ -155,15 +188,16 @@ impl DrmIoctl for DrmVersion {
 impl DrmIoctl for DrmSetVersion {
     const CMD: u32 = iowr::<DrmSetVersion>(DRM_TYPE, 0x07);
 
-    fn handle(_dev: &Card0, _file: &DrmFile, set_version: &mut Self) -> VfsResult<usize> {
+    fn handle(dev: &Card0, _file: &DrmFile, set_version: &mut Self) -> VfsResult<usize> {
         if set_version.drm_di_major < 0 {
             set_version.drm_di_major = 1;
         }
         if set_version.drm_di_minor < 0 {
             set_version.drm_di_minor = 4;
         }
-        set_version.drm_dd_major = DRIVER_VERSION_MAJOR;
-        set_version.drm_dd_minor = DRIVER_VERSION_MINOR;
+        let (major, minor, _) = dev.driver_identity.version();
+        set_version.drm_dd_major = major;
+        set_version.drm_dd_minor = minor;
         Ok(0)
     }
 }
@@ -172,7 +206,15 @@ impl DrmIoctl for DrmUnique {
     const CMD: u32 = iowr::<DrmUnique>(DRM_TYPE, 0x01);
 
     fn handle(_dev: &Card0, _file: &DrmFile, unique: &mut Self) -> VfsResult<usize> {
-        let unique_str: String = format!("{}:0", DRIVER_NAME);
+        let unique_str: String = match primary_scanout().map(|device| device.location()) {
+            Ok(kdevice::DeviceLocation::Pci {
+                segment,
+                bus,
+                device,
+                function,
+            }) => format!("pci:{segment:04x}:{bus:02x}:{device:02x}.{function}"),
+            _ => format!("{}:0", DRIVER_NAME),
+        };
         // Unlike VERSION, Linux GET_UNIQUE copies only when the whole value
         // fits. A short buffer is a size query and must remain untouched.
         if unique.unique_len >= unique_str.len() {
@@ -192,6 +234,7 @@ impl DrmIoctl for DrmGetCap {
     fn handle(_dev: &Card0, _file: &DrmFile, cap: &mut Self) -> VfsResult<usize> {
         cap.value = match cap.capability {
             DRM_CAP_DUMB_BUFFER => 1,
+            DRM_CAP_PRIME => 3,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
             DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
             DRM_CAP_ADDFB2_MODIFIERS => 1,
@@ -252,18 +295,24 @@ impl DrmIoctl for DrmModeDirtyFB {
 impl DrmIoctl for DrmPrimeHandle {
     const CMD: u32 = iowr::<DrmPrimeHandle>(DRM_TYPE, 0x2d);
 
-    fn handle(_dev: &Card0, _file: &DrmFile, prime: &mut Self) -> VfsResult<usize> {
-        prime.fd = prime.handle as i32;
-        Ok(0)
+    fn handle_raw(dev: &Card0, file: &DrmFile, arg: UserPtr<Self>) -> VfsResult<usize> {
+        sharing::export_raw(dev, file, arg)
+    }
+
+    fn handle(_dev: &Card0, _file: &DrmFile, _arg: &mut Self) -> VfsResult<usize> {
+        Err(VfsError::OperationNotSupported)
     }
 }
 
 impl DrmIoctl for DrmPrimeFdToHandle {
     const CMD: u32 = iowr::<DrmPrimeHandle>(DRM_TYPE, 0x2e);
 
-    fn handle(_dev: &Card0, _file: &DrmFile, prime: &mut Self) -> VfsResult<usize> {
-        prime.0.handle = prime.0.fd as u32;
-        Ok(0)
+    fn handle_raw(dev: &Card0, file: &DrmFile, arg: UserPtr<Self>) -> VfsResult<usize> {
+        sharing::import_raw(dev, file, arg)
+    }
+
+    fn handle(_dev: &Card0, _file: &DrmFile, _arg: &mut Self) -> VfsResult<usize> {
+        Err(VfsError::OperationNotSupported)
     }
 }
 
@@ -293,33 +342,41 @@ impl DrmIoctl for DrmModeCrtc {
         if crtc.crtc_id != CRTC_ID {
             return Err(VfsError::InvalidInput);
         }
+        let state = *dev.state.lock();
         let legacy = dev.legacy_crtc.lock().clone();
         crtc.gamma_size = 0;
-        if legacy.fb_id != 0 {
-            crtc.x = legacy.x;
-            crtc.y = legacy.y;
-            crtc.fb_id = legacy.fb_id;
-            crtc.mode_valid = legacy.mode_valid;
-            crtc.mode = if legacy.mode_valid != 0 {
+        crtc.x = (state.plane_src_x >> 16) as u32;
+        crtc.y = (state.plane_src_y >> 16) as u32;
+        crtc.fb_id = if state.crtc_active != 0 {
+            state.plane_fb_id
+        } else {
+            0
+        };
+        crtc.mode_valid = u32::from(state.crtc_active != 0 && crtc.fb_id != 0);
+        crtc.mode = if crtc.mode_valid != 0 {
+            if state.crtc_mode_id != 0 {
+                let bytes = dev
+                    .mode_id_blob_ref
+                    .lock()
+                    .clone()
+                    .ok_or(VfsError::InvalidInput)?;
+                bytemuck::try_pod_read_unaligned::<DrmModeModeInfo>(&bytes)
+                    .map_err(|_| VfsError::InvalidInput)?
+            } else if legacy.mode_valid != 0 {
                 legacy.mode
             } else {
-                DrmModeModeInfo::default()
-            };
-            crtc.count_connectors = report_user_array(
-                crtc.set_connectors_ptr,
-                crtc.count_connectors,
-                &legacy.connectors,
-            )?;
+                current_mode()
+            }
         } else {
-            crtc.x = 0;
-            crtc.y = 0;
-            crtc.fb_id = 0;
-            crtc.mode_valid = 1;
-            crtc.mode = current_mode();
-            let empty: &[u32] = &[];
-            crtc.count_connectors =
-                report_user_array(crtc.set_connectors_ptr, crtc.count_connectors, empty)?;
-        }
+            DrmModeModeInfo::default()
+        };
+        let connectors = if state.conn_crtc_id != 0 && state.crtc_active != 0 {
+            &[CONNECTOR_ID][..]
+        } else {
+            &[][..]
+        };
+        crtc.count_connectors =
+            report_user_array(crtc.set_connectors_ptr, crtc.count_connectors, connectors)?;
         Ok(0)
     }
 }
@@ -336,11 +393,16 @@ struct DumbBuffer {
     device: Option<ClassDevice<DisplayDeviceImpl>>,
     pages: Arc<GlobalPage>,
     reservation: Mutex<()>,
+    completion_poll: PollSet,
+    exported: Mutex<Weak<VfsFile>>,
     virgl: Option<virtgpu::VirglObject>,
 }
 
 #[derive(Clone)]
 struct Framebuffer {
+    fb_id: u32,
+    owner: Weak<DrmFile>,
+    pending_owner_close: bool,
     object: Arc<DumbBuffer>,
     width: u32,
     height: u32,
@@ -349,11 +411,8 @@ struct Framebuffer {
 #[derive(Debug, Default, Clone)]
 struct LegacyCrtcState {
     fb_id: u32,
-    connectors: Vec<u32>,
     mode: DrmModeModeInfo,
     mode_valid: u32,
-    x: u32,
-    y: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -377,21 +436,27 @@ struct ModesetState {
 struct DrmFile {
     events: Mutex<VecDeque<DrmEventVblank>>,
     poll_rx: PollSet,
-    dumbs: Mutex<BTreeMap<u32, Arc<DumbBuffer>>>,
+    dumbs: Mutex<sharing::GemHandles>,
     next_dumb_handle: AtomicU32,
     client_caps: Mutex<BTreeMap<u64, u64>>,
     context: Mutex<Option<Arc<virtgpu::VirglContext>>>,
+    prime_publication: Mutex<()>,
+    owned_fbs: Mutex<alloc::collections::BTreeSet<u32>>,
+    self_ref: Weak<DrmFile>,
 }
 
 impl DrmFile {
     fn new() -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_ref| Self {
             events: Mutex::new(VecDeque::with_capacity(MAX_EVENTS)),
             poll_rx: PollSet::new(),
-            dumbs: Mutex::new(BTreeMap::new()),
+            dumbs: Mutex::new(sharing::GemHandles::default()),
             next_dumb_handle: AtomicU32::new(FIRST_DUMB_HANDLE),
             client_caps: Mutex::new(BTreeMap::new()),
             context: Mutex::new(None),
+            prime_publication: Mutex::new(()),
+            owned_fbs: Mutex::new(alloc::collections::BTreeSet::new()),
+            self_ref: self_ref.clone(),
         })
     }
 
@@ -401,6 +466,11 @@ impl DrmFile {
     }
 
     fn close_handle(&self, handle: u32) -> VfsResult<()> {
+        let _publication = self.prime_publication.lock();
+        self.close_handle_unpublished(handle)
+    }
+
+    fn close_handle_unpublished(&self, handle: u32) -> VfsResult<()> {
         self.dumbs
             .lock()
             .remove(&handle)
@@ -416,14 +486,16 @@ pub struct Card0 {
     sequence: AtomicU32,
     state: Mutex<ModesetState>,
     legacy_crtc: Mutex<LegacyCrtcState>,
-    next_offset: AtomicU64,
+    next_offset: &'static AtomicU64,
     fbs: Mutex<BTreeMap<u32, Framebuffer>>,
     active_scanout: Mutex<Option<Framebuffer>>,
     next_fb_id: AtomicU32,
-    next_resource_id: AtomicU32,
-    next_context_id: AtomicU32,
+    next_resource_id: &'static AtomicU32,
+    next_context_id: &'static AtomicU32,
+    driver_identity: super::discovery::DriverIdentity,
     context_admission: Mutex<()>,
     kms_reservation: Mutex<()>,
+    fb_cleanup_work: kwork::ScheduledWork,
     blobs: Mutex<BTreeMap<u32, Arc<Vec<u8>>>>,
     mode_id_blob_ref: Mutex<Option<Arc<Vec<u8>>>>,
     next_blob_id: AtomicU32,
@@ -435,18 +507,27 @@ pub struct Card0 {
 impl Card0 {
     /// Create a new DRM device instance.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_ref: &Weak<Self>| Self {
             sequence: AtomicU32::new(0),
             state: Mutex::new(ModesetState::default()),
             legacy_crtc: Mutex::new(LegacyCrtcState::default()),
-            next_offset: AtomicU64::new(DUMB_BUFFER_OFFSET_STRIDE),
+            next_offset: &NEXT_OFFSET,
             fbs: Mutex::new(BTreeMap::new()),
             active_scanout: Mutex::new(None),
             next_fb_id: AtomicU32::new(FIRST_FB_ID),
-            next_resource_id: AtomicU32::new(0x1000),
-            next_context_id: AtomicU32::new(1),
+            next_resource_id: &NEXT_RESOURCE_ID,
+            next_context_id: &NEXT_CONTEXT_ID,
+            driver_identity: super::discovery::DriverIdentity::detected(),
             context_admission: Mutex::new(()),
             kms_reservation: Mutex::new(()),
+            fb_cleanup_work: {
+                let card = self_ref.clone();
+                kwork::ScheduledWork::new(move |_| {
+                    if let Some(card) = card.upgrade() {
+                        card.drain_closed_framebuffers();
+                    }
+                })
+            },
             blobs: Mutex::new(BTreeMap::new()),
             mode_id_blob_ref: Mutex::new(None),
             next_blob_id: AtomicU32::new(FIRST_BLOB_ID),
@@ -454,6 +535,27 @@ impl Card0 {
             in_formats_blob: AtomicU32::new(0),
             system_blobs_init: Mutex::new(()),
         })
+    }
+
+    /// Returns the physical primary device's shared DRM adapter across mounts.
+    ///
+    /// Primary and render nodes and separate devfs mounts use one KMS namespace.
+    /// The registry owns it until device removal, when references are dropped
+    /// outside registry locks. GEM/host owners do not point back at this registry.
+    /// # Errors
+    /// Returns ENODEV when no display is registered.
+    pub fn registered() -> VfsResult<Arc<Self>> {
+        let id = primary_scanout()?.id();
+        REGISTERED_CARDS.call_once(|| Mutex::new(BTreeMap::new()));
+        if let Some(card) = REGISTERED_CARDS.lock().get(&id).cloned() {
+            return Ok(card);
+        }
+        let candidate = Self::new();
+        Ok(REGISTERED_CARDS
+            .lock()
+            .entry(id)
+            .or_insert(candidate)
+            .clone())
     }
 
     fn ensure_in_formats_blob(&self) -> u32 {
@@ -543,11 +645,12 @@ impl DeviceFileOps for Card0 {
 
     fn release(&self, _inode: &VfsInode, file: &VfsFile) -> VfsResult<()> {
         let state = DrmFile::from_file(file)?;
+        let retirement = self.queue_owned_framebuffers(&state);
         state.dumbs.lock().clear();
         state.events.lock().clear();
         state.client_caps.lock().clear();
         state.context.lock().take();
-        Ok(())
+        retirement
     }
 
     fn supports_read(&self) -> bool {
@@ -781,7 +884,10 @@ impl DrmIoctl for DrmModeSetCrtc {
             return Err(VfsError::InvalidInput);
         }
         if c.fb_id == 0 && c.count_connectors == 0 {
+            dev.disable_current_scanout()?;
             *dev.legacy_crtc.lock() = LegacyCrtcState::default();
+            *dev.state.lock() = ModesetState::default();
+            *dev.mode_id_blob_ref.lock() = None;
             return Ok(0);
         }
         if c.fb_id == 0 || !dev.fbs.lock().contains_key(&c.fb_id) {
@@ -803,14 +909,31 @@ impl DrmIoctl for DrmModeSetCrtc {
         }
         let proposed = LegacyCrtcState {
             fb_id: c.fb_id,
-            connectors,
             mode: c.mode,
             mode_valid: c.mode_valid,
-            x: c.x,
-            y: c.y,
         };
         dev.present_fb(c.fb_id)?;
         *dev.legacy_crtc.lock() = proposed;
+        let fb = dev
+            .fbs
+            .lock()
+            .get(&c.fb_id)
+            .cloned()
+            .ok_or(VfsError::InvalidInput)?;
+        *dev.state.lock() = ModesetState {
+            crtc_active: 1,
+            plane_fb_id: c.fb_id,
+            plane_crtc_id: CRTC_ID,
+            conn_crtc_id: CRTC_ID,
+            plane_src_x: u64::from(c.x) << 16,
+            plane_src_y: u64::from(c.y) << 16,
+            plane_src_w: u64::from(fb.width) << 16,
+            plane_src_h: u64::from(fb.height) << 16,
+            plane_crtc_w: u64::from(fb.width),
+            plane_crtc_h: u64::from(fb.height),
+            ..ModesetState::default()
+        };
+        *dev.mode_id_blob_ref.lock() = None;
         Ok(0)
     }
 }
@@ -862,13 +985,7 @@ impl DrmIoctl for DrmModeRmFb {
 
     fn handle(dev: &Card0, _file: &DrmFile, fb_id: &mut Self) -> VfsResult<usize> {
         let _kms_reservation = dev.kms_reservation.lock();
-        dev.fbs.lock().remove(&fb_id.0);
-        {
-            let mut legacy = dev.legacy_crtc.lock();
-            if legacy.fb_id == fb_id.0 {
-                *legacy = LegacyCrtcState::default();
-            }
-        }
+        dev.retire_framebuffer(fb_id.0)?;
         Ok(0)
     }
 }
@@ -882,6 +999,8 @@ impl DrmIoctl for DrmModeCrtcPageFlip {
             return Err(VfsError::InvalidInput);
         }
         dev.present_fb(f.fb_id)?;
+        dev.legacy_crtc.lock().fb_id = f.fb_id;
+        dev.state.lock().plane_fb_id = f.fb_id;
         if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             dev.queue_flip_event(file, f.user_data);
         }
@@ -926,6 +1045,7 @@ impl DrmIoctl for DrmModeCreateDumb {
         c.pitch = pitch;
         c.size = size;
         let size_aligned = (size as usize).next_multiple_of(PAGE_SIZE_4K);
+        c.size = size_aligned as u64;
         let pages = size_aligned / PAGE_SIZE_4K;
         let mut backing =
             GlobalPage::alloc_contiguous(pages, PAGE_SIZE_4K).map_err(|_| VfsError::NoMemory)?;
@@ -938,9 +1058,9 @@ impl DrmIoctl for DrmModeCreateDumb {
                 offset.checked_add(DUMB_BUFFER_OFFSET_STRIDE)
             })
             .map_err(|_| VfsError::NoMemory)?;
-        let resource_id = virtgpu::next_id(&dev.next_resource_id)?;
+        let resource_id = virtgpu::next_id(dev.next_resource_id)?;
         let handle = virtgpu::next_id(&file.next_dumb_handle)?;
-        let object = Arc::new(DumbBuffer {
+        let mut object = Arc::new(DumbBuffer {
             width: c.width,
             height: c.height,
             bpp: c.bpp,
@@ -948,9 +1068,11 @@ impl DrmIoctl for DrmModeCreateDumb {
             size: c.size,
             offset,
             resource_id,
-            device: Some(device.clone()),
+            device: None,
             pages: pages_arc.clone(),
             reservation: Mutex::new(()),
+            completion_poll: PollSet::new(),
+            exported: Mutex::new(Weak::new()),
             virgl: None,
         });
         // SAFETY: This allocation-only Arc pins the entire contiguous coherent
@@ -974,6 +1096,9 @@ impl DrmIoctl for DrmModeCreateDumb {
                 backing,
             )
             .map_err(virtgpu::driver_error)?;
+        Arc::get_mut(&mut object)
+            .expect("new dumb object is unpublished")
+            .device = Some(device);
         file.dumbs.lock().insert(handle, object);
         c.handle = handle;
         Ok(0)
@@ -1168,8 +1293,10 @@ impl DrmIoctl for DrmModeAtomic {
 
         let current_fb = proposed.plane_fb_id;
         drop(state);
-        if current_fb != 0 {
+        if current_fb != 0 && proposed.crtc_active != 0 {
             dev.present_fb(current_fb)?;
+        } else {
+            dev.disable_current_scanout()?;
         }
         *dev.state.lock() = proposed;
         if let Some(new_ref) = new_mode_blob {
@@ -1242,6 +1369,14 @@ impl DrmIoctl for DrmModeGetBlob {
 impl DrmIoctl for DrmModeFbCmd2 {
     const CMD: u32 = iowr::<DrmModeFbCmd2>(DRM_TYPE, 0xB8);
 
+    fn handle_raw(dev: &Card0, file: &DrmFile, arg: UserPtr<Self>) -> VfsResult<usize> {
+        let mut request = arg.read_vm().map_err(|_| VfsError::BadAddress)?;
+        publish_framebuffer(dev, file, &mut request, |request| {
+            arg.write_vm(*request).map_err(|_| VfsError::BadAddress)
+        })?;
+        Ok(0)
+    }
+
     fn handle(dev: &Card0, file: &DrmFile, f: &mut Self) -> VfsResult<usize> {
         let handle = f.handles[0];
         if handle == 0 || f.offsets[0] != 0 {
@@ -1262,10 +1397,8 @@ impl DrmIoctl for DrmModeFbCmd2 {
             };
             b.clone()
         };
-        // 3D scanout is a separately validated module: the legacy presenter
-        // uploads guest pages and must not overwrite host-rendered contents.
-        if object.virgl.is_some() {
-            return Err(VfsError::OperationNotSupported);
+        if let Some(virgl) = &object.virgl {
+            validate_virgl_scanout(virgl.params)?;
         }
         // The scanout resource is created at exactly the dumb buffer's size
         // and pitch (no ANY_LAYOUT negotiation), and TRANSFER_TO_HOST_2D reads
@@ -1286,21 +1419,147 @@ impl DrmIoctl for DrmModeFbCmd2 {
                 }
             }
         }
-        let fb_id = dev.next_fb_id.fetch_add(1, Ordering::Relaxed);
+        let fb_id = virtgpu::next_id(&dev.next_fb_id)?;
         dev.fbs.lock().insert(
             fb_id,
             Framebuffer {
+                fb_id,
+                owner: file.self_ref.clone(),
+                pending_owner_close: false,
                 object,
                 width: f.width,
                 height: f.height,
             },
         );
+        file.owned_fbs.lock().insert(fb_id);
         f.fb_id = fb_id;
         Ok(0)
     }
 }
 
+fn publish_framebuffer(
+    dev: &Card0,
+    file: &DrmFile,
+    request: &mut DrmModeFbCmd2,
+    copyout: impl FnOnce(&DrmModeFbCmd2) -> VfsResult<()>,
+) -> VfsResult<()> {
+    let _kms = dev.kms_reservation.lock();
+    DrmModeFbCmd2::handle(dev, file, request)?;
+    if let Err(error) = copyout(request) {
+        // No KMS effect can have acquired this unpublished FB while the
+        // dedicated gate is held; retirement therefore performs no GPU wait.
+        dev.retire_framebuffer(request.fb_id)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_virgl_scanout(params: display::VirglResourceCreate) -> VfsResult<()> {
+    if params.target != 2
+        || !matches!(params.format, 1 | 2)
+        || params.depth != 1
+        || params.array_size != 1
+        || params.last_level != 0
+        || params.nr_samples > 1
+    {
+        return Err(VfsError::InvalidInput);
+    }
+    Ok(())
+}
+
 impl Card0 {
+    fn retire_framebuffer(&self, fb_id: u32) -> VfsResult<()> {
+        // Caller owns the dedicated KMS reservation, never a framebuffer mutex.
+        let fb = self
+            .fbs
+            .lock()
+            .get(&fb_id)
+            .cloned()
+            .ok_or(VfsError::NotFound)?;
+        let is_active = self
+            .active_scanout
+            .lock()
+            .as_ref()
+            .is_some_and(|active| active.fb_id == fb_id)
+            || self.state.lock().plane_fb_id == fb_id;
+        if is_active {
+            self.disable_current_scanout()?;
+            *self.state.lock() = ModesetState::default();
+            *self.mode_id_blob_ref.lock() = None;
+        }
+        let retired = self.fbs.lock().remove(&fb_id);
+        if let Some(owner) = fb.owner.upgrade() {
+            owner.owned_fbs.lock().remove(&fb_id);
+        }
+        if self.legacy_crtc.lock().fb_id == fb_id {
+            *self.legacy_crtc.lock() = LegacyCrtcState::default();
+        }
+        drop(retired);
+        Ok(())
+    }
+
+    fn queue_owned_framebuffers(&self, file: &DrmFile) -> VfsResult<()> {
+        self.mark_owned_framebuffers(file);
+        if !self.fbs.lock().values().any(|fb| fb.pending_owner_close) {
+            return Ok(());
+        }
+        match self.fb_cleanup_work.schedule() {
+            kwork::QueueWorkResult::Queued | kwork::QueueWorkResult::AlreadyQueued => Ok(()),
+            error => {
+                log::warn!("drm: framebuffer retirement remains pending: {:?}", error);
+                Err(VfsError::WouldBlock)
+            }
+        }
+    }
+
+    fn mark_owned_framebuffers(&self, file: &DrmFile) -> bool {
+        let ids = core::mem::take(&mut *file.owned_fbs.lock());
+        let had_owned = !ids.is_empty();
+        let mut fbs = self.fbs.lock();
+        for id in ids {
+            if let Some(fb) = fbs.get_mut(&id) {
+                fb.pending_owner_close = true;
+            }
+        }
+        had_owned
+    }
+
+    fn drain_closed_framebuffers(&self) {
+        let _kms = self.kms_reservation.lock();
+        loop {
+            let next = self
+                .fbs
+                .lock()
+                .values()
+                .find(|fb| fb.pending_owner_close)
+                .map(|fb| fb.fb_id);
+            let Some(id) = next else {
+                break;
+            };
+            if let Err(error) = self.retire_framebuffer(id) {
+                log::warn!(
+                    "drm: framebuffer {} owner-close retirement pending: {:?}",
+                    id,
+                    error
+                );
+                break;
+            }
+        }
+    }
+
+    fn disable_current_scanout(&self) -> VfsResult<()> {
+        let active = self.active_scanout.lock().clone();
+        let device = if let Some(active) = &active {
+            active.object.device.clone().ok_or(VfsError::NoSuchDevice)?
+        } else {
+            primary_scanout()?
+        };
+        let _reservation = active.as_ref().map(|fb| fb.object.reserve());
+        device.disable_scanout().map_err(virtgpu::driver_error)?;
+        *self.active_scanout.lock() = None;
+        Ok(())
+    }
+
     fn present_fb(&self, fb_id: u32) -> VfsResult<()> {
         let fb = self
             .fbs
@@ -1308,8 +1567,8 @@ impl Card0 {
             .get(&fb_id)
             .cloned()
             .ok_or(VfsError::InvalidInput)?;
-        let device = primary_scanout()?;
-        let _reservation = fb.object.reservation.lock();
+        let device = fb.object.device.as_ref().ok_or(VfsError::NoSuchDevice)?;
+        let _reservation = fb.object.reserve();
         let resource_id = fb.object.resource_id;
         let rect = ScanoutRect {
             x: 0,
@@ -1320,9 +1579,14 @@ impl Card0 {
         // Keep an attempted scanout reference even on error: only the backend's
         // fenced reset/disable can prove that host scanout ownership has ended.
         *self.active_scanout.lock() = Some(fb.clone());
-        device
-            .present_scanout_resource(resource_id, rect)
-            .map_err(virtgpu::driver_error)
+        // A 3D resource already contains host-rendered pixels. The 2D path
+        // uploads guest pages and would corrupt those pixels, so never use it.
+        if fb.object.virgl.is_some() {
+            device.virgl_command(display::VirglCommand::Present { resource_id, rect })
+        } else {
+            device.present_scanout_resource(resource_id, rect)
+        }
+        .map_err(virtgpu::driver_error)
     }
 
     fn queue_flip_event(&self, file: &DrmFile, user_data: u64) {
@@ -1416,7 +1680,13 @@ impl Card0 {
                             None
                         }
                     });
-                    Some(arc.ok_or(VfsError::InvalidInput)?)
+                    let arc = arc.ok_or(VfsError::InvalidInput)?;
+                    let mode = bytemuck::try_pod_read_unaligned::<DrmModeModeInfo>(&arc)
+                        .map_err(|_| VfsError::InvalidInput)?;
+                    if mode.hdisplay == 0 || mode.vdisplay == 0 {
+                        return Err(VfsError::InvalidInput);
+                    }
+                    Some(arc)
                 };
                 s.crtc_mode_id = blob;
                 *new_mode_blob = Some(arc);
@@ -1661,6 +1931,8 @@ mod tests {
             device: None,
             pages: Arc::new(pages),
             reservation: Mutex::new(()),
+            completion_poll: PollSet::new(),
+            exported: Mutex::new(Weak::new()),
             virgl: None,
         })
     }
@@ -1720,6 +1992,128 @@ mod tests {
     }
 
     #[def_test]
+    fn failed_fb_copyout_and_owner_close_retire_global_resource_references() {
+        let card = Card0::new();
+        let file = DrmFile::new();
+        let object = object();
+        let weak = Arc::downgrade(&object);
+        file.dumbs.lock().insert(1, object.clone());
+        let mut fb = DrmModeFbCmd2 {
+            width: 1,
+            height: 1,
+            pixel_format: DRM_FORMAT_XRGB8888,
+            handles: [1, 0, 0, 0],
+            pitches: [4, 0, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(
+            publish_framebuffer(&card, &file, &mut fb, |_| Err(VfsError::BadAddress)),
+            Err(VfsError::BadAddress)
+        );
+        assert_eq!(card.fbs.lock().len(), 0);
+        assert_eq!(file.owned_fbs.lock().len(), 0);
+        publish_framebuffer(&card, &file, &mut fb, |_| Ok(())).unwrap();
+        assert_eq!(card.fbs.lock().len(), 1);
+        assert_eq!(card.mark_owned_framebuffers(&file), true);
+        // Production's prebuilt worker uses the same drain, outside Drop/MM locks.
+        card.drain_closed_framebuffers();
+        assert_eq!(card.fbs.lock().len(), 0);
+        file.close_handle(1).unwrap();
+        drop(object);
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[def_test]
+    fn failed_owner_close_disable_keeps_explicit_pending_active_refs() {
+        let card = Card0::new();
+        let file = DrmFile::new();
+        let object = object();
+        let fb = Framebuffer {
+            fb_id: 42,
+            owner: file.self_ref.clone(),
+            pending_owner_close: true,
+            object,
+            width: 1,
+            height: 1,
+        };
+        card.fbs.lock().insert(42, fb.clone());
+        *card.active_scanout.lock() = Some(fb);
+        // Fixture has no bound backend, so disabling fails before retirement.
+        card.drain_closed_framebuffers();
+        let pending = card.fbs.lock().get(&42).unwrap().pending_owner_close;
+        let active = card.active_scanout.lock().as_ref().unwrap().fb_id;
+        assert_eq!(pending, true);
+        assert_eq!(active, 42);
+    }
+
+    #[def_test]
+    fn virgl_scanout_accepts_only_single_plane_unmultisampled_bgra_textures() {
+        let mut params = display::VirglResourceCreate {
+            resource_id: 1,
+            target: 2,
+            format: 1,
+            bind: 2,
+            width: 64,
+            height: 64,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: 0,
+        };
+        assert_eq!(validate_virgl_scanout(params), Ok(()));
+        params.target = 0;
+        assert_eq!(validate_virgl_scanout(params), Err(VfsError::InvalidInput));
+        params.target = 2;
+        params.nr_samples = 4;
+        assert_eq!(validate_virgl_scanout(params), Err(VfsError::InvalidInput));
+        params.nr_samples = 0;
+        params.format = 64;
+        assert_eq!(validate_virgl_scanout(params), Err(VfsError::InvalidInput));
+    }
+
+    #[def_test]
+    fn independent_card_instances_do_not_reuse_host_ids_or_mmap_tokens() {
+        let first = Card0::new();
+        let second = Card0::new();
+        assert_eq!(
+            core::ptr::eq(first.next_resource_id, second.next_resource_id),
+            true
+        );
+        assert_eq!(
+            core::ptr::eq(first.next_context_id, second.next_context_id),
+            true
+        );
+        assert_eq!(core::ptr::eq(first.next_offset, second.next_offset), true);
+    }
+
+    #[def_test]
+    fn getcrtc_reports_committed_atomic_state_and_disabled_state() {
+        let dev = Card0::new();
+        let file = DrmFile::new();
+        *dev.state.lock() = ModesetState {
+            crtc_active: 1,
+            plane_fb_id: 99,
+            conn_crtc_id: CRTC_ID,
+            plane_src_x: 2 << 16,
+            plane_src_y: 3 << 16,
+            ..ModesetState::default()
+        };
+        let mut query = DrmModeCrtc {
+            crtc_id: CRTC_ID,
+            ..Default::default()
+        };
+        assert_eq!(DrmModeCrtc::handle(&dev, &file, &mut query), Ok(0));
+        assert_eq!(query.fb_id, 99);
+        assert_eq!(query.mode_valid, 1);
+        assert_eq!((query.x, query.y), (2, 3));
+        *dev.state.lock() = ModesetState::default();
+        assert_eq!(DrmModeCrtc::handle(&dev, &file, &mut query), Ok(0));
+        assert_eq!(query.fb_id, 0);
+        assert_eq!(query.mode_valid, 0);
+    }
+
+    #[def_test]
     fn framebuffer_and_scanout_retain_object_after_handle_close() {
         let state = DrmFile::new();
         let backing = object();
@@ -1729,6 +2123,9 @@ mod tests {
             .lock()
             .insert(FIRST_DUMB_HANDLE, backing.clone());
         let fb = Framebuffer {
+            fb_id: 1,
+            owner: Weak::new(),
+            pending_owner_close: false,
             object: backing,
             width: 1,
             height: 1,

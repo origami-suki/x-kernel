@@ -17,8 +17,13 @@ extern crate alloc;
 extern crate log;
 
 #[cfg(feature = "fs9p")]
-use alloc::{boxed::Box, string::String};
-use alloc::{format, sync::Arc, vec::Vec};
+use alloc::boxed::Box;
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 #[cfg(feature = "fs9p")]
 use kclass::{ClassDevice, Virtio9pDevice as _, Virtio9pDeviceImpl, virtio_9p_devices};
@@ -316,40 +321,22 @@ impl BootVfs {
         Ok(())
     }
 
-    /// Publish the existing virtual DRM adapter, not an invented PCI device.
-    /// libudev needs a /sys/devices path, subsystem/class links, and the same
-    /// device number/name exposed by devtmpfs. This is a boot-time snapshot;
-    /// dynamic hotplug and input enumeration are separate capabilities.
+    /// Publish the actual registered display parent and each existing DRM node.
+    /// PCI attributes come from configuration space verified against the device
+    /// registry; no host GPU identity or invented PCI endpoint is substituted.
     fn create_sys_drm_links(&self) -> kvfs::VfsResult<()> {
-        let card = match self.lookup("/dev/dri/card0") {
-            Ok(card) => card,
+        match self.lookup("/dev/dri/card0") {
+            Ok(_) => {}
             Err(error) if error.canonicalize() == kvfs::VfsError::NotFound => return Ok(()),
             Err(error) => return Err(error),
-        };
-        if card.node_type() != kvfs::NodeType::CharacterDevice {
-            return Err(kvfs::VfsError::NoSuchDevice);
         }
-        let number = card.inode().rdev();
-        let device = "/sys/devices/virtual/drm/card0";
-        for path in [device, "/sys/class/drm", "/sys/dev/char"] {
+        let snapshot = drmdevice::discovery()?;
+        let hardware = &snapshot.hardware_path;
+        for path in [hardware.as_str(), "/sys/class/drm", "/sys/dev/char"] {
             self.ensure_directory_path(path)?;
         }
         let cred = kcred::initial_cred();
-        let attributes = [
-            (
-                format!("{device}/dev"),
-                format!("{}:{}\n", number.major(), number.minor()),
-            ),
-            (
-                format!("{device}/uevent"),
-                format!(
-                    "MAJOR={}\nMINOR={}\nDEVNAME=dri/card0\n",
-                    number.major(),
-                    number.minor()
-                ),
-            ),
-        ];
-        for (path, value) in attributes {
+        let write_attribute = |path: String, value: String| -> kvfs::VfsResult<()> {
             let file = Filename::new(path).open_with_flags_at(
                 &self.root,
                 &self.root,
@@ -362,20 +349,95 @@ impl BootVfs {
             if file.write(value.as_bytes())? != value.len() {
                 return Err(kvfs::VfsError::Io);
             }
+            Ok(())
+        };
+        if let Some(bus) = snapshot.bus_subsystem {
+            let bus_path = format!("/sys/bus/{bus}");
+            let driver_path = format!("{bus_path}/drivers/{}", snapshot.driver_name);
+            self.ensure_directory_path(&driver_path)?;
+            Filename::new(format!("{hardware}/subsystem"))
+                .symlink_at(&self.root, &self.root, &bus_path, &cred)?;
+            Filename::new(format!("{hardware}/driver")).symlink_at(
+                &self.root,
+                &self.root,
+                &driver_path,
+                &cred,
+            )?;
         }
-        let links = [
-            (format!("{device}/subsystem"), "../../../../class/drm"),
-            (
-                "/sys/class/drm/card0".into(),
-                "../../devices/virtual/drm/card0",
-            ),
-            (
-                format!("/sys/dev/char/{}:{}", number.major(), number.minor()),
-                "../../devices/virtual/drm/card0",
-            ),
-        ];
-        for (path, target) in links {
-            Filename::new(path).symlink_at(&self.root, &self.root, target, &cred)?;
+        if let Some(pci) = snapshot.pci {
+            for (name, value) in [
+                ("vendor", format!("0x{:04x}\n", pci.vendor_id)),
+                ("device", format!("0x{:04x}\n", pci.device_id)),
+                (
+                    "subsystem_vendor",
+                    format!("0x{:04x}\n", pci.subsystem_vendor_id),
+                ),
+                (
+                    "subsystem_device",
+                    format!("0x{:04x}\n", pci.subsystem_device_id),
+                ),
+                ("revision", format!("0x{:02x}\n", pci.revision)),
+                ("class", format!("0x{:06x}\n", pci.class)),
+            ] {
+                write_attribute(format!("{hardware}/{name}"), value)?;
+            }
+            let slot = format!(
+                "{:04x}:{:02x}:{:02x}.{}",
+                pci.segment, pci.bus, pci.device, pci.function
+            );
+            write_attribute(
+                format!("{hardware}/uevent"),
+                format!(
+                    "DRIVER={}\nPCI_CLASS={:06X}\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:\
+                     04X}\nPCI_SLOT_NAME={}\n",
+                    snapshot.driver_name,
+                    pci.class,
+                    pci.vendor_id,
+                    pci.device_id,
+                    pci.subsystem_vendor_id,
+                    pci.subsystem_device_id,
+                    slot
+                ),
+            )?;
+            let bus_device = format!("/sys/bus/pci/devices/{slot}");
+            self.ensure_directory_path("/sys/bus/pci/devices")?;
+            Filename::new(bus_device).symlink_at(&self.root, &self.root, hardware, &cred)?;
+        }
+        for name in ["card0", "renderD128"] {
+            let node = match self.lookup(format!("/dev/dri/{name}")) {
+                Ok(node) => node,
+                Err(error) if error.canonicalize() == kvfs::VfsError::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if node.node_type() != kvfs::NodeType::CharacterDevice {
+                return Err(kvfs::VfsError::NoSuchDevice);
+            }
+            let number = node.inode().rdev();
+            let device = format!("{hardware}/drm/{name}");
+            self.ensure_directory_path(&device)?;
+            write_attribute(
+                format!("{device}/dev"),
+                format!("{}:{}\n", number.major(), number.minor()),
+            )?;
+            write_attribute(
+                format!("{device}/uevent"),
+                format!(
+                    "MAJOR={}\nMINOR={}\nDEVNAME=dri/{name}\n",
+                    number.major(),
+                    number.minor()
+                ),
+            )?;
+            for (path, target) in [
+                (format!("{device}/subsystem"), "/sys/class/drm".to_string()),
+                (format!("{device}/device"), hardware.clone()),
+                (format!("/sys/class/drm/{name}"), device.clone()),
+                (
+                    format!("/sys/dev/char/{}:{}", number.major(), number.minor()),
+                    device,
+                ),
+            ] {
+                Filename::new(path).symlink_at(&self.root, &self.root, &target, &cred)?;
+            }
         }
         Ok(())
     }

@@ -1261,6 +1261,7 @@ version = "0.2.0"
 name = "drmdevice"
 version = "0.2.0"
 dependencies = [
+ "anon_inodefs",
  "bytemuck",
  "display",
  "kalloc",
@@ -1268,14 +1269,17 @@ dependencies = [
  "kdevice",
  "khal",
  "kpoll",
+ "kprocess",
  "ksync",
  "ktask",
  "ktime_types",
  "kvfs",
+ "kwork",
  "lazyinit",
  "log",
  "macros",
  "memaddr",
+ "pci",
  "posix-types",
  "unittest",
 ]
@@ -1610,6 +1614,7 @@ dependencies = [
  "bpffs",
  "cgroup2fs",
  "devfs",
+ "drmdevice",
  "fs_context",
  "kbuild_config",
  "kclass",
@@ -2843,6 +2848,8 @@ dependencies = [
 name = "kresources"
 version = "0.2.0"
 dependencies = [
+ "anon_inodefs",
+ "kcred",
  "kerrno",
  "kfd",
  "krlimit",

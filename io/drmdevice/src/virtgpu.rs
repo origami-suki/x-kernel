@@ -118,11 +118,14 @@ const MAX_SUBMISSION_OBJECTS: usize = 1024;
 pub(super) struct VirglContext {
     id: u32,
     device: ClassDevice<DisplayDeviceImpl>,
+    is_created: bool,
 }
 
 impl Drop for VirglContext {
     fn drop(&mut self) {
-        if let Err(error) = self.device.enqueue_virgl_context_cleanup(self.id) {
+        if self.is_created
+            && let Err(error) = self.device.enqueue_virgl_context_cleanup(self.id)
+        {
             log::warn!(
                 "drm: deferred context {} cleanup failed: {:?}",
                 self.id,
@@ -133,7 +136,7 @@ impl Drop for VirglContext {
 }
 
 pub(super) struct VirglObject {
-    params: VirglResourceCreate,
+    pub(super) params: VirglResourceCreate,
     context: Arc<VirglContext>,
 }
 
@@ -194,8 +197,12 @@ fn context(dev: &Card0, file: &DrmFile) -> VfsResult<Arc<VirglContext>> {
         return Ok(context);
     }
     let device = device()?;
-    let id = next_id(&dev.next_context_id)?;
-    let context = Arc::new(VirglContext { id, device });
+    let id = next_id(dev.next_context_id)?;
+    let mut context = Arc::new(VirglContext {
+        id,
+        device,
+        is_created: false,
+    });
     context
         .device
         .virgl_command(VirglCommand::CreateContext {
@@ -203,6 +210,9 @@ fn context(dev: &Card0, file: &DrmFile) -> VfsResult<Arc<VirglContext>> {
             name: "xkernel-drm",
         })
         .map_err(driver_error)?;
+    Arc::get_mut(&mut context)
+        .expect("new context is unpublished")
+        .is_created = true;
     *file.context.lock() = Some(context.clone());
     Ok(context)
 }
@@ -351,12 +361,12 @@ fn validate_create(request: &VirtgpuResourceCreate) -> VfsResult<()> {
         || request.height > 16384
         || request.depth == 0
         || request.depth > 2048
-        || request.array_size == 0
+        || (request.target != 0 && request.array_size == 0)
         || request.array_size > 2048
         || request.last_level > 14
         || !matches!(request.nr_samples, 0 | 1 | 2 | 4 | 8 | 16)
         || request.flags & !1 != 0
-        || request.stride > request.size
+        || (request.target == 0 && request.stride > request.size)
     {
         return Err(VfsError::InvalidInput);
     }
@@ -388,7 +398,7 @@ impl DrmIoctl for VirtgpuResourceCreate {
         pages.zero();
         let pages = Arc::new(pages);
         let handle = next_id(&file.next_dumb_handle)?;
-        let resource_id = next_id(&dev.next_resource_id)?;
+        let resource_id = next_id(dev.next_resource_id)?;
         let params = VirglResourceCreate {
             resource_id,
             target: request.target,
@@ -413,11 +423,15 @@ impl DrmIoctl for VirtgpuResourceCreate {
                 pages.clone(),
             )
         };
-        let object = Arc::new(DumbBuffer {
+        let mut object = Arc::new(DumbBuffer {
             width: request.width,
             height: request.height,
             bpp: 32,
-            pitch: request.stride,
+            pitch: if request.stride == 0 && matches!(request.format, 1 | 2) {
+                request.width.checked_mul(4).ok_or(VfsError::InvalidInput)?
+            } else {
+                request.stride
+            },
             size: length as u64,
             offset: dev
                 .next_offset
@@ -426,9 +440,11 @@ impl DrmIoctl for VirtgpuResourceCreate {
                 })
                 .map_err(|_| VfsError::NoMemory)?,
             resource_id,
-            device: Some(context.device.clone()),
+            device: None,
             pages,
             reservation: Mutex::new(()),
+            completion_poll: PollSet::new(),
+            exported: Mutex::new(Weak::new()),
             virgl: Some(VirglObject {
                 params,
                 context: context.clone(),
@@ -438,11 +454,15 @@ impl DrmIoctl for VirtgpuResourceCreate {
             .device
             .virgl_command(VirglCommand::CreateResource { params, backing })
             .map_err(driver_error)?;
+        Arc::get_mut(&mut object)
+            .expect("new virgl object is unpublished")
+            .device = Some(context.device.clone());
         attach(&context, &object)?;
         file.dumbs.lock().insert(handle, object);
         request.bo_handle = handle;
         request.res_handle = resource_id;
-        request.size = length as u32;
+        // Linux legacy CREATE returns handles while preserving input size/stride.
+        // The GEM/mmap capacity remains the page-aligned allocation above.
         Ok(0)
     }
 }
@@ -478,9 +498,11 @@ fn validate_transfer(
     {
         return Err(VfsError::InvalidInput);
     }
-    // BGRA/XRGB protocol defaults are tightly packed mip rows. Other virgl
+    // BGRA/XRGB/RGBA8 protocol defaults are tightly packed mip rows. Other virgl
     // formats are bounded by the backend's attached iov and host format validation.
-    let extent = if matches!(params.format, 1 | 2) {
+    let extent = if params.target == 0 {
+        Some(u64::from(region.w))
+    } else if matches!(params.format, 1 | 2 | 67) {
         let stride = u64::from(width).checked_mul(4);
         let layer = stride.and_then(|stride| stride.checked_mul(u64::from(height)));
         stride.zip(layer).and_then(|(stride, layer)| {
@@ -508,7 +530,7 @@ fn transfer(
     let object = lookup(file, request.bo_handle)?;
     let params = &object.virgl.as_ref().ok_or(VfsError::InvalidInput)?.params;
     validate_transfer(params, object.size, request)?;
-    let _reservation = object.reservation.lock();
+    let _reservation = object.reserve();
     let _admission = dev.context_admission.lock();
     let context = context(dev, file)?;
     attach(&context, &object)?;
@@ -583,7 +605,7 @@ impl DrmIoctl for VirtgpuExecbuffer {
         objects.dedup_by_key(|object| object.resource_id);
         let _reservations = objects
             .iter()
-            .map(|object| object.reservation.lock())
+            .map(|object| object.reserve())
             .collect::<Vec<_>>();
         let _admission = dev.context_admission.lock();
         let context = context(dev, file)?;
@@ -611,12 +633,9 @@ impl DrmIoctl for VirtgpuWait {
         }
         let object = lookup(file, request.handle)?;
         let _reservation = if request.flags & 1 != 0 {
-            object
-                .reservation
-                .try_lock()
-                .ok_or(VfsError::ResourceBusy)?
+            object.try_reserve().ok_or(VfsError::ResourceBusy)?
         } else {
-            object.reservation.lock()
+            object.reserve()
         };
         if let Some(backend) = &object.device
             && backend.virgl_command_status().is_failed
@@ -700,6 +719,81 @@ mod tests {
         request = self::request();
         request.flags = 2;
         assert_eq!(validate_create(&request), Err(VfsError::InvalidInput));
+    }
+
+    #[def_test]
+    fn legacy_mesa_fence_buffer_accepts_zero_array_size_only_for_buffer_target() {
+        let mut request = request();
+        request.target = 0;
+        request.array_size = 0;
+        request.width = 8;
+        request.height = 1;
+        request.depth = 1;
+        request.size = 8;
+        request.stride = 0;
+        assert_eq!(validate_create(&request), Ok(()));
+        request.target = 2;
+        assert_eq!(validate_create(&request), Err(VfsError::InvalidInput));
+    }
+
+    #[def_test]
+    fn mesa_host_texture_geometry_is_independent_of_guest_backing_size() {
+        // Mesa 25.1.9 EGL RGBA8 texture: Linux v6.12 accepts size=1, stride=32.
+        let mut request = VirtgpuResourceCreate {
+            target: 2,
+            format: 67,
+            bind: 10,
+            width: 8,
+            height: 8,
+            depth: 1,
+            array_size: 1,
+            size: 1,
+            stride: 32,
+            ..Default::default()
+        };
+        assert_eq!(validate_create(&request), Ok(()));
+        request.flags = 2;
+        assert_eq!(validate_create(&request), Err(VfsError::InvalidInput));
+        request.flags = 0;
+        request.width = 16385;
+        assert_eq!(validate_create(&request), Err(VfsError::InvalidInput));
+        request.width = 8;
+        request.target = 0;
+        assert_eq!(validate_create(&request), Err(VfsError::InvalidInput));
+    }
+
+    #[def_test]
+    fn rgba8_cpu_transfer_is_bounded_by_actual_backing_capacity() {
+        let params = VirglResourceCreate {
+            resource_id: 1,
+            target: 2,
+            format: 67,
+            bind: 10,
+            width: 8,
+            height: 8,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: 0,
+        };
+        let mut request = VirtgpuTransfer {
+            box_: VirtgpuBox {
+                w: 8,
+                h: 8,
+                d: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(validate_transfer(&params, 4096, &request), Ok(()));
+        request.offset = 4096 - 255;
+        assert_eq!(
+            validate_transfer(&params, 4096, &request),
+            Err(VfsError::InvalidInput)
+        );
+        request.offset = 4096 - 256;
+        assert_eq!(validate_transfer(&params, 4096, &request), Ok(()));
     }
 
     #[def_test]

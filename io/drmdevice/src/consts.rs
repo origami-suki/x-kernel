@@ -50,6 +50,8 @@ pub const DRM_IOCTL_DROP_MASTER: u32 = io(DRM_TYPE, 0x1f);
 // ======== capability IDs ========
 
 pub const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
+/// Same-device DMA-buffer import/export capability.
+pub const DRM_CAP_PRIME: u64 = 0x5;
 pub const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
 pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 pub const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;

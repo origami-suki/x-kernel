@@ -105,3 +105,13 @@ registry，root 格式由 registry 探测结果决定。
 定位已有设备节点，再通过真实 ioctl 检查 KMS 能力。属性权限 0444；目录 0755。
 当前 sysfs 仍是既有 memfs，尚无 kernfs 或设备移除/热插拔更新能力；输入设备发现
 不在此改动内。对应故障是 Weston 的 no drm device found，后续协议和像素仍须实测。
+
+## Physical DRM primary/render discovery
+
+DRM devfs nodes share one registered physical adapter with separate per-open
+state. renderD128 exists only for a healthy implemented rendering backend and
+rejects KMS/master operations. Boot sysfs links publish actual devfs device
+numbers, actual physical PCI BDF and verified configuration-space IDs, and the
+registered bound driver. The host renderer's hardware identity is not substituted
+for the virtual guest PCI device. Namespace attributes are read-only boot-time
+snapshots; device removal/hotplug and full udev emulation remain separate work.

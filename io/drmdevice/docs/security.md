@@ -154,17 +154,16 @@ Mapping, framebuffer and active scanout references preserve the object. A
 framebuffer remains until RMFB, and the last attempted scanout remains until
 replacement; these live owners are distinct from leaked close-only backing.
 No synchronous GPU waits occur in Drop or under file/framebuffer/MmSpace locks.
-PRIME/DMA-BUF, render discovery and 3D KMS are subsequent execution modules;
-existing numeric PRIME behavior is not real DMA-BUF support.
+PRIME/DMA-BUF follows below; render discovery and 3D KMS are separate modules.
 
 ## Traditional virtgpu UAPI: first execution module
 
 `card0.rs::virtgpu` carries the fixed-width Linux virtgpu ABI and implements
 GETPARAM/CAPS, MAP, RESOURCE_CREATE/INFO, TRANSFER_TO/FROM_HOST, EXECBUFFER and
-WAIT. It is a separate execution module; PRIME/DMA-BUF, render discovery and
-3D KMS are subsequent modules. ADDFB2 rejects 3D objects in this intermediate
-state to prevent the legacy 2D upload path overwriting host-rendered pixels.
-No existing numeric PRIME placeholder is evidence of sharing support.
+WAIT. It is a separate execution module; same-device PRIME/DMA-BUF follows
+below, with render discovery and 3D KMS developed separately. The later scanout path below admits only supported 3D textures and prevents
+legacy 2D upload from overwriting host-rendered pixels.
+The former numeric PRIME placeholder is replaced by the real file implementation below.
 
 Each file lazily creates one legacy context, protected by a dedicated sleepable
 context-admission gate. Host context/resource IDs are device-global, while GEM
@@ -225,3 +224,138 @@ backend boundary for other host-validated formats.
 
 Reference: https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/virtio/virtgpu_ioctl.c
 Actual source snapshots, line references and hashes are retained with module evidence.
+
+## Same-device PRIME and DMA-buffer files
+
+PRIME export now installs a real anonymous VfsFile descriptor holding a typed
+DMA-buffer private object and an Arc GEM resource. CLOEXEC is installed through
+the process fd table. Export copyout failure removes only that unpublished fd
+when it still refers to the original file, preserving a concurrent close/reuse.
+The GEM export cache is weak, preventing GEM/file reference cycles. The first
+export establishes immutable file access mode, as in Linux dma_buf export.
+
+Import rejects non-DMA-buffer descriptors and a different physical device.
+An indexed resource-to-handle table atomically deduplicates repeated imports;
+GEM_CLOSE prunes the reverse entry so re-import creates a fresh local handle.
+New-handle copyout failure removes the new handle without destroying an existing
+one. Same-device imported objects keep their original allocation/host resource,
+so MAP_DUMB and GEM mmap remain valid after sender handle/file close. This
+matches Linux v6.12 virtgpu PRIME's same-device fastpath (virtgpu_prime.c145–160)
+and GEM mmap-offset lookup (virtgpu_gem.c102–114). Cross-device sharing remains
+unsupported; no UUID/blob/PRIME external attachment capabilities are advertised.
+
+Anonymous DMA-buffer fstat/SEEK_END report the real page-aligned allocation size.
+DMA-buffer mmap treats its offset as a byte offset into the actual allocation
+and retains the GEM through owned physical mapping. Generic mmap checks enforce
+file read/write access before dispatch; mappings survive descriptor close and
+SCM_RIGHTS uses the existing shared Arc<VfsFile> transport, without network edits.
+
+DMA_BUF_IOCTL_SYNC validates direction/START/END flags, waits for the object's
+prior fenced reservation, reports a poisoned backend as I/O failure, and orders
+coherent QEMU AArch64 RAM with a full memory barrier. It does not retain a kernel
+lock over userspace CPU access, and does not synthesize host-rendered readback:
+clients still use TRANSFER_FROM_HOST where required by the resource protocol.
+Poll waits share each GEM's completion PollSet and are woken after resource
+reservation unlock; readiness represents completed synchronous fenced work,
+with backend failure reported as ERR. It is the client's responsibility to
+coordinate overlapping CPU/GPU access and bracket CPU writes before submission.
+BLOB, cross-device imports, explicit sync_file/syncobj and fence flags remain
+unsupported, rather than fabricating descriptors or signaling nonexistent work.
+
+Primary references: Linux v6.12 virtgpu_prime.c, virtgpu_gem.c and dma-buf.c;
+https://docs.kernel.org/driver-api/dma-buf.html#cpu-access-to-dma-buffer-objects
+Actual immutable source snapshots and verified hashes are retained in evidence.
+
+## Render discovery and host-rendered scanout
+
+Primary/render devfs nodes use the same registered Card0 per actual physical
+device, including separate devfs mounts. Their VfsFile private state remains
+independent. Host resource IDs, context IDs and mmap lookup tokens use checked
+kernel-global allocators, so a fresh adapter or imported resource cannot reuse
+a still-live host ID/token. The registry is retired on device removal and drops
+its adapter outside registry locks; backing owners never point back to it.
+
+RenderNode whitelists rendering/query/PRIME/GEM operations and denies all KMS,
+authentication and master requests before touching user memory. A healthy actual
+command backend is required to publish renderD128. VERSION identifies the actual
+virtio GPU transport/backend as virtio_gpu compatibility 0.0: explicit fence-fd
+flags remain unsupported. This matches Mesa 25.1.9's real legacy path (driver
+major must be zero; minor >=1 enables explicit fences). Other minimal 2D adapters
+retain their prior simpledrm version. Identity is captured when the adapter is
+constructed, so later device poisoning does not rename an existing description.
+Legacy Mesa fence buffers legitimately use target=PIPE_BUFFER and array_size=0;
+textures keep a positive array-size requirement. Resource/context cleanup is
+armed only after successful registration, avoiding an unaccepted creation's
+Drop targeting another existing host ID. Failed creation ownership remains the
+backend's explicit responsibility under the owned-create contract.
+
+Discovery obtains BDF and matching identity from kdevice, reads actual PCI vendor,
+device, revision, class and subsystem IDs through the safe PCI configuration
+mapping provider, and verifies those words against the registered identity.
+It publishes the real physical parent, bound-driver and bus links, plus both
+existing device numbers and class/dev/char links. It does not label the virtual
+guest GPU with the host NVIDIA identity. The current project's segment-zero
+AArch64 ECAM configuration is the supported PCI snapshot; unsupported mappings
+or identity mismatches fail closed. Publication is a boot-time snapshot rather
+than full sysfs/hotplug/udev emulation.
+
+ADDFB2 accepts supported single-level, single-layer, nonmultisampled BGRA/XRGB
+3D textures with matching geometry/pitch and retains their GEM Arc. A missing
+traditional row stride uses the real tightly packed 32-bit resource layout.
+Presentation reserves that object and calls the actual object's backend.
+VirglCommand::Present never invokes the legacy 2D guest-page upload, which would
+overwrite host-rendered pixels. Errors propagate; KMS state and requested flip
+events are published only after successful fenced presentation. Attempted
+scanout references survive uncertainty and host cleanup retains backing on error.
+
+These frontend snapshots still require the independently accepted final driver
+revision and real unit/lifetime/PRIME/3D/renderer runs. Compilation alone does not
+prove DMA ordering, scanout pixels or Mesa/Weston/Chromium acceptance.
+
+Primary KMS disable is a real fenced backend operation: SETCRTC with no FB,
+atomic inactive/zero-FB, and RMFB of the active framebuffer blank host scanout
+before clearing committed state or dropping active object references. Timeout
+retains prior state/refs and returns the error without a successful event.
+Legacy SETCRTC/page flip updates the same committed state read by GETCRTC;
+GETCRTC reports disabled with no FB/mode after disable and reads retained mode
+blob bytes for atomic modes. MODE_ID rejects a malformed/zero-dimension mode
+blob before GPU side effects. RMFB rejects unknown IDs and drops retired
+references outside the framebuffer mutex.
+
+## Failed-copyout transactions and framebuffer file ownership
+
+ADDFB2 publication holds a dedicated sleepable KMS transaction gate through
+copyout, without holding the framebuffer/state mutex. Failure removes the
+unpublished FB and its per-file owner entry before releasing the gate, so no
+other KMS operation can activate a guessed unpublished ID. A successful FB is
+owned by the creating open description, even though IDs remain device-global.
+RMFB removes that owner entry. Final description release marks its surviving
+FBs pending and schedules a prebuilt weak-Card work item: it performs no GPU wait
+from VfsFile Drop or under an MmSpace lock. Task-context retirement fences a
+real active scanout disable before removing global/active references. Failed
+schedule/disable leaves explicit pending FB ownership/backing and emits an error;
+it never silently drops a host DMA owner or claims reclaimed memory. Later
+owner-close scheduling retries pending entries. Copyout rollback of an
+unpublished FB requires no GPU transaction because the KMS gate prevented use.
+
+PRIME import has a dedicated per-description publication gate through
+lookup/insert/copyout/rollback. The GEM namespace mutex is released before
+faultable copying. Other imports and GEM_CLOSE cannot publish/remove a handle
+across that boundary; a failed duplicate import preserves an earlier committed
+winner. PRIME export uses ProcessResources::install_file's exact installation
+ticket, not Arc<VfsFile> equality. Failed copyout cannot close a replacement
+created by dup2/re-export of the same cached file or a fork/table-unshare copy.
+All fd rollback closes occur outside the table writer guard. Source-reproven
+failures are fixed with deterministic transaction/token tests; guest fault/race
+and framebuffer retirement acceptance remains separate pending execution.
+
+## PRIME open-flag ABI correction
+
+Linux drm.h defines DRM_CLOEXEC as O_CLOEXEC, not FD_CLOEXEC. Export validation
+now derives DRM_CLOEXEC and DRM_RDWR from the repository's OpenFlags: AArch64
+0x80000 and 2. Standard 0x80002 requests produce a writable descriptor with
+CLOEXEC installation; former bit 1 and unrelated open flags are rejected.
+The parsed CLOEXEC boolean is passed to the existing exact-installation ticket,
+so the fd limit/rollback policy is unchanged. The independent original probe's
+EINVAL at standard flags is retained as a real failed guest result; C callers,
+backend sources and prior failed evidence were not modified to conceal it.
