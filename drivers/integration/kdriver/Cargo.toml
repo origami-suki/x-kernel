@@ -36,7 +36,7 @@ virtio = ["dep:virtio", "dep:kalloc"]
 
 virtio-blk = ["block", "virtio", "virtio/block"]
 virtio-net = ["net", "virtio", "virtio/net"]
-virtio-gpu = ["display", "virtio", "virtio/gpu"]
+virtio-gpu = ["display", "virtio", "virtio/gpu", "dep:ktask", "dep:ksync", "dep:kwork"]
 virtio-input = ["input", "virtio", "virtio/input"]
 virtio-socket = ["vsock", "virtio", "virtio/socket"]
 virtio-9p = ["virtio", "virtio/virtio-9p", "kclass/virtio-9p"]
@@ -108,3 +108,8 @@ smallvec = { version = "1.15", features = ["const_generics", "union"] }
 unittest.workspace = true
 
 kbuild_config = { workspace = true }
+
+kwork = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+aarch64-cpu.workspace = true

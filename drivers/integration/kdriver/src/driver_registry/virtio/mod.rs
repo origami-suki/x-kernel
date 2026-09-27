@@ -12,6 +12,8 @@ pub(crate) mod ids;
 
 #[cfg(feature = "virtio")]
 mod glue;
+#[cfg(all(unittest, feature = "virtio-gpu"))]
+pub(crate) use glue::VirtIoHalImpl;
 
 #[cfg(feature = "virtio-blk")]
 mod block;
@@ -217,7 +219,7 @@ fn activate_virtio_mmio(device: Arc<DeviceObject>, device_kind: DeviceKind) -> D
 }
 
 #[cfg(feature = "virtio")]
-fn dispatch_virtio_try_new<T: virtio::Transport + 'static>(
+fn dispatch_virtio_try_new<T: virtio::Transport + Send + 'static>(
     parent: Arc<DeviceObject>,
     kind: DeviceKind,
     transport: T,

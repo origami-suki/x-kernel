@@ -160,7 +160,7 @@ scratch. Software backlog follows calling concurrency, not a 16-call cap.
 
 ```
 Uninit ──probe/query resolution──> Ready
-Ready ──create_scanout_resource──> ResourceAttached
+Ready ──create_scanout_resource_owned──> ResourceAttached
 ResourceAttached ──present_scanout_resource──> ScanningOut
 ScanningOut ──present_scanout_resource(new resource)──> ScanningOut
 ResourceAttached / ScanningOut ──destroy_scanout_resource──> Ready
@@ -329,18 +329,18 @@ headers and allocator overhead. The logical sector size is the protocol's fixed
 1. `try_new(transport)`：协商 feature、分配 control/cursor virtqueue
 2. `GET_DISPLAY_INFO`：查询显示分辨率 `(width, height)`
 3. 将 `width`、`height` 封装为 `DisplayInfo { width, height }`。
-   virtio-gpu 是 scanout-only 设备，不暴露直接 framebuffer 映射——`DisplayDevice`
+   virtio-gpu 不暴露直接 framebuffer 映射——`DisplayDevice`
    trait 不再包含 `fb()` / 直接映射字段，所有像素输出经 scanout resource 路径
    （由 `fbdevice` 的 fbdev emulation 和 `drmdevice` 共享使用）。
 
 **resource-backed 显示流程**：
 
-1. DRM `CREATE_DUMB` 分配连续 guest pages，并调用 `create_scanout_resource()`
+1. DRM `CREATE_DUMB` 分配连续 guest pages，并调用 `create_scanout_resource_owned()`
 2. virtio-gpu 发送 `RESOURCE_CREATE_2D` 和 `RESOURCE_ATTACH_BACKING`
 3. 用户态 mmap dumb buffer 并写入像素
 4. DRM modeset/page-flip 调用 `present_scanout_resource()`
 5. virtio-gpu 发送 `TRANSFER_TO_HOST_2D`、`SET_SCANOUT` 和 `RESOURCE_FLUSH`
-6. DRM `DESTROY_DUMB` 调用 `destroy_scanout_resource()`，发送 detach/unref
+6. 最后对象引用释放时仅标记 cleanup，host task 工作完成 fenced detach/unref 后释放 DMA owner
 
 > resource ID 由 DRM 层分配并随 dumb buffer 生命周期释放；virtio-gpu 驱动负责把这些
 > resource 命令串行提交到 control virtqueue。
@@ -456,7 +456,7 @@ headers and allocator overhead. The logical sector size is the protocol's fixed
 - **blk**: shared synchronous callers use one device SpinNoIrq for queue/state;
   all task waits and notifications occur outside it. IRQ acknowledgement uses
   the same lock; the host serializes per-device completion passes.
-- **gpu**：capset 查询只读初始化缓存；2D control queue 操作由内部 `SpinNoIrq` 串行化。
+- **gpu**：capset 查询只读初始化缓存；runtime 2D/3D transaction 由 host sleepable gate 串行化，仅队列/登记短操作持 `SpinNoIrq`，等待时允许调度。
 - **input / socket / virtio_9p**：所有操作通过 `&mut self` 独占访问，
   调用者负责串行化，模块内部无锁。
 - **net**：`InnerDev` 被 `Arc<SpinNoIrq<...>>` 包裹，因为 IRQ 回调在中断上下文中
@@ -533,15 +533,77 @@ invalid or excessive virgl entry fails initialization; partial capability data
 is never published. Queries use the immutable cache without queue I/O or locks.
 
 Negotiation adds VIRGL to the existing ring/version feature mask. No
-CONTEXT_INIT or RESOURCE_BLOB feature is negotiated. Only VIRGL and its capability data are exposed here; no 3D
-context, resource, submit or fence API is added, and no DRM identity or render
-node changes. Device capability does not demonstrate application acceleration.
+CONTEXT_INIT or RESOURCE_BLOB feature is negotiated. Legacy context/resource
+commands are available only with a host execution provider. DRM identity and
+render nodes remain upper-layer integration responsibilities. Capability
+queries are nonblocking; unpublished metadata discovery still uses synchronous
+polling. Runtime 2D and 3D commands use the owned engine below.
 
-Discovery runs before publication and without the adapter lock. The existing
-2D calls still serialize synchronous device requests under `SpinNoIrq`; that
-legacy execution model is retained, not extended to a long 3D fence wait.
-A future submission module must first provide a portable ownership/waiting
-contract that leaves interrupts enabled while waiting for GPU completion.
-The dependency's synchronous wait has no timeout; an unresponsive device can
-still stall initialization or a scanout operation. Capability queries after
-initialization do not have this failure mode.
+## GPU owned command engine
+
+`gpu/commands.rs` implements traditional CTX, 3D resource, backing, transfer,
+submit and scanout transactions. `gpu/queue.rs` owns a minimal depth-two split
+queue because the locked queue helper cannot reject failed HAL mappings or
+cancel them after reset. Both bootstrap and runtime requests use one contiguous
+header/payload and one response. Neither INDIRECT_DESC nor EVENT_IDX is
+negotiated; no indirect allocations exist. The queue has legacy-compatible
+coherent ring layout and suppresses completion interrupts while polling.
+Every runtime command is fenced; replies validate length, type, FENCE and ID.
+3D present performs SET_SCANOUT/FLUSH without a guest 2D upload.
+
+The host `GpuExecution` serializes a whole transaction with a sleepable lock.
+`Engine::state` is held only for descriptor publication/consumption and bounded
+registry mutations, also used by non-sleeping destructor enqueue. Mapping,
+unmapping, potentially large bounce copies, waiting and owner destructors
+execute outside it. Both maps must succeed before descriptor/avail publication;
+zero mapping failure returns NoMemory and rolls back any mapped prefix. Boot discovery remains an unpublished,
+synchronous metadata-only path; it cannot submit user 3D work. The constructor
+without an execution provider only exposes cached metadata.
+
+Resources (limit 4096) pin allocation owners before attach; contexts (limit
+1024) track attachment membership. Resource teardown disables an active
+scanout, detaches contexts/backing, then unrefs, each with fenced completion.
+Context teardown removes all corresponding memberships. Destructor enqueue
+marks existing records without allocation; a preallocated host work item
+captures only Weak<Engine>. Failed teardown retains records and can be retried
+by enqueueing again. The status snapshot makes retention explicit.
+
+A 30-second per-command timeout poisons admission and leaves its owned request
+and resource backing intact. Later calls may consume a late used descriptor,
+but never replay the uncertain operation. At final engine Drop, device reset
+must be observed acknowledged before queue/backing deallocation. An outstanding
+transaction then explicitly unshares both original maps without inventing a
+used event; copied-back bytes are discarded, never returned as success. If reset is
+not immediately acknowledged, bounded DMA state is intentionally quarantined
+and logged; runtime recovery/reset/re-enable is not implemented.
+
+## GPU transport ownership
+
+GPU types, constructors and host dispatch require `Transport + Send`. Engine
+uses automatic Send/Sync derivation through its state lock; no generic unsafe
+Send/Sync implementations remain. The concrete `mmio::MmioTransport` wrapper
+owns only the unsafe probe's unique static device-register mapping and integer
+metadata. Its concrete Send implementation cannot bless a user-supplied
+Rc/Cell-bearing Transport. Tests compile-check both selected PCI/MMIO types and
+reject an otherwise valid Rc<Cell>-backed transport at the GPU constructor.
+
+Legacy PIPE_BUFFER resources (target 0) accept array_size 0, used by Mesa's
+resource-backed fence fallback. Other targets retain nonzero array-size
+validation. The value is forwarded unchanged; no resource/context is fabricated.
+
+## DMA publication ordering
+
+The local unsafe `GpuHal` extension adds required non-sleeping DMA write/read
+barriers to the locked allocation HAL without changing third-party traits.
+`Queue::publish` orders descriptor/payload/avail-slot writes, then avail.idx,
+then the doorbell boundary using two host device-domain barriers. Bootstrap and
+runtime share this function; neither calls notify before the second barrier.
+`Queue::pop` observes used.idx, invokes the host DMA read barrier, and only then
+reads the used entry or allows payload unmapping/consumption. Portable code
+contains neither platform assembly nor host-kernel calls.
+
+Explicit `disable_scanout` and active-resource teardown share the same fenced
+SET_SCANOUT(resource=0, zero rectangle) helper. Only successful completion sets
+active_scanout to zero. Disabling neither uploads nor releases backing; known
+host errors retain the previous active ID for retry, and timeout retains DMA
+and owners under the existing poisoned-admission rule.

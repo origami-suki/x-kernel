@@ -35,6 +35,9 @@ use posix_types::{UserPtr, UserRead, UserWrite};
 
 use super::{consts::*, drm::*};
 
+#[path = "virtgpu.rs"]
+mod virtgpu;
+
 static DISPLAY_DEVICES: LazyInit<Mutex<Vec<ClassDevice<DisplayDeviceImpl>>>> = LazyInit::new();
 
 fn ensure_scanout_registry() {
@@ -235,12 +238,13 @@ impl DrmIoctl for DrmModeDirtyFB {
     const CMD: u32 = iowr::<DrmModeDirtyFB>(DRM_TYPE, 0xB1);
 
     fn handle(dev: &Card0, _file: &DrmFile, dirty: &mut Self) -> VfsResult<usize> {
+        let _kms_reservation = dev.kms_reservation.lock();
         // Linux's drm_mode_dirtyfb_ioctl() rejects an unknown fb_id with
-        // -EINVAL; present_fb is best-effort, so validate before calling it.
+        // -EINVAL; validate the framebuffer before attempting scanout.
         if !dev.fbs.lock().contains_key(&dirty.fb_id) {
             return Err(VfsError::InvalidInput);
         }
-        dev.present_fb(dirty.fb_id);
+        dev.present_fb(dirty.fb_id)?;
         Ok(0)
     }
 }
@@ -329,7 +333,10 @@ struct DumbBuffer {
     size: u64,
     offset: u64,
     resource_id: u32,
+    device: Option<ClassDevice<DisplayDeviceImpl>>,
     pages: Arc<GlobalPage>,
+    reservation: Mutex<()>,
+    virgl: Option<virtgpu::VirglObject>,
 }
 
 #[derive(Clone)]
@@ -373,6 +380,7 @@ struct DrmFile {
     dumbs: Mutex<BTreeMap<u32, Arc<DumbBuffer>>>,
     next_dumb_handle: AtomicU32,
     client_caps: Mutex<BTreeMap<u64, u64>>,
+    context: Mutex<Option<Arc<virtgpu::VirglContext>>>,
 }
 
 impl DrmFile {
@@ -383,6 +391,7 @@ impl DrmFile {
             dumbs: Mutex::new(BTreeMap::new()),
             next_dumb_handle: AtomicU32::new(FIRST_DUMB_HANDLE),
             client_caps: Mutex::new(BTreeMap::new()),
+            context: Mutex::new(None),
         })
     }
 
@@ -396,8 +405,8 @@ impl DrmFile {
             .lock()
             .remove(&handle)
             .ok_or(VfsError::InvalidInput)?;
-        // Host teardown is deliberately deferred: the device retention owns
-        // backing until a fenced cleanup contract exists. Never wait in Drop.
+        // The final object reference queues owned fenced cleanup. Host DMA
+        // allocation ownership survives deferred cleanup errors; no waits here.
         Ok(())
     }
 }
@@ -412,13 +421,15 @@ pub struct Card0 {
     active_scanout: Mutex<Option<Framebuffer>>,
     next_fb_id: AtomicU32,
     next_resource_id: AtomicU32,
+    next_context_id: AtomicU32,
+    context_admission: Mutex<()>,
+    kms_reservation: Mutex<()>,
     blobs: Mutex<BTreeMap<u32, Arc<Vec<u8>>>>,
     mode_id_blob_ref: Mutex<Option<Arc<Vec<u8>>>>,
     next_blob_id: AtomicU32,
     system_blobs: Mutex<BTreeMap<u32, Arc<Vec<u8>>>>,
     in_formats_blob: AtomicU32,
     system_blobs_init: Mutex<()>,
-    retained_pages: Mutex<BTreeMap<u64, Arc<GlobalPage>>>,
 }
 
 impl Card0 {
@@ -433,13 +444,15 @@ impl Card0 {
             active_scanout: Mutex::new(None),
             next_fb_id: AtomicU32::new(FIRST_FB_ID),
             next_resource_id: AtomicU32::new(0x1000),
+            next_context_id: AtomicU32::new(1),
+            context_admission: Mutex::new(()),
+            kms_reservation: Mutex::new(()),
             blobs: Mutex::new(BTreeMap::new()),
             mode_id_blob_ref: Mutex::new(None),
             next_blob_id: AtomicU32::new(FIRST_BLOB_ID),
             system_blobs: Mutex::new(BTreeMap::new()),
             in_formats_blob: AtomicU32::new(0),
             system_blobs_init: Mutex::new(()),
-            retained_pages: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -533,6 +546,7 @@ impl DeviceFileOps for Card0 {
         state.dumbs.lock().clear();
         state.events.lock().clear();
         state.client_caps.lock().clear();
+        state.context.lock().take();
         Ok(())
     }
 
@@ -567,6 +581,9 @@ impl DeviceFileOps for Card0 {
 
     fn ioctl(&self, file: &VfsFile, cmd: u32, arg: usize) -> VfsResult<usize> {
         let drm_file = DrmFile::from_file(file)?;
+        if let Some(result) = virtgpu::dispatch(self, &drm_file, cmd, arg) {
+            return result;
+        }
         match cmd {
             DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
             <DrmVersion as DrmIoctl>::CMD => {
@@ -710,12 +727,8 @@ impl DeviceFileOps for Card0 {
         };
         let phys = v2p(b.pages.start_va());
         let size = b.pages.size();
-        self.retained_pages.lock().insert(offset, b.pages.clone());
-        let range = PhysAddrRange::from_start_size(
-            memaddr::PhysAddr::from(phys.as_usize().wrapping_sub(offset as usize)),
-            size + offset as usize,
-        );
-        mapper.map_physical(range)
+        let range = PhysAddrRange::from_start_size(phys, size);
+        mapper.map_physical_owned(range, 0, b)
     }
 
     fn flags(&self) -> NodeFlags {
@@ -762,6 +775,7 @@ impl DrmIoctl for DrmModeSetCrtc {
     const CMD: u32 = iowr::<DrmModeCrtc>(DRM_TYPE, 0xA2);
 
     fn handle(dev: &Card0, _file: &DrmFile, crtc: &mut Self) -> VfsResult<usize> {
+        let _kms_reservation = dev.kms_reservation.lock();
         let c = &crtc.0;
         if c.crtc_id != CRTC_ID {
             return Err(VfsError::InvalidInput);
@@ -787,7 +801,7 @@ impl DrmIoctl for DrmModeSetCrtc {
                 return Err(VfsError::InvalidInput);
             }
         }
-        *dev.legacy_crtc.lock() = LegacyCrtcState {
+        let proposed = LegacyCrtcState {
             fb_id: c.fb_id,
             connectors,
             mode: c.mode,
@@ -795,7 +809,8 @@ impl DrmIoctl for DrmModeSetCrtc {
             x: c.x,
             y: c.y,
         };
-        dev.present_fb(c.fb_id);
+        dev.present_fb(c.fb_id)?;
+        *dev.legacy_crtc.lock() = proposed;
         Ok(0)
     }
 }
@@ -846,6 +861,7 @@ impl DrmIoctl for DrmModeRmFb {
     const CMD: u32 = iowr::<u32>(DRM_TYPE, 0xAF);
 
     fn handle(dev: &Card0, _file: &DrmFile, fb_id: &mut Self) -> VfsResult<usize> {
+        let _kms_reservation = dev.kms_reservation.lock();
         dev.fbs.lock().remove(&fb_id.0);
         {
             let mut legacy = dev.legacy_crtc.lock();
@@ -861,10 +877,11 @@ impl DrmIoctl for DrmModeCrtcPageFlip {
     const CMD: u32 = iowr::<DrmModeCrtcPageFlip>(DRM_TYPE, 0xB0);
 
     fn handle(dev: &Card0, file: &DrmFile, f: &mut Self) -> VfsResult<usize> {
+        let _kms_reservation = dev.kms_reservation.lock();
         if f.crtc_id != CRTC_ID || !dev.fbs.lock().contains_key(&f.fb_id) {
             return Err(VfsError::InvalidInput);
         }
-        dev.present_fb(f.fb_id);
+        dev.present_fb(f.fb_id)?;
         if f.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             dev.queue_flip_event(file, f.user_data);
         }
@@ -874,6 +891,16 @@ impl DrmIoctl for DrmModeCrtcPageFlip {
 
 impl DrmIoctl for DrmModeCreateDumb {
     const CMD: u32 = iowr::<DrmModeCreateDumb>(DRM_TYPE, 0xB2);
+
+    fn handle_raw(dev: &Card0, file: &DrmFile, arg: UserPtr<Self>) -> VfsResult<usize> {
+        let mut request = arg.read_vm().map_err(|_| VfsError::BadAddress)?;
+        Self::handle(dev, file, &mut request)?;
+        if arg.write_vm(request).is_err() {
+            let _ = file.close_handle(request.handle);
+            return Err(VfsError::BadAddress);
+        }
+        Ok(0)
+    }
 
     fn handle(dev: &Card0, file: &DrmFile, c: &mut Self) -> VfsResult<usize> {
         // Only BGRA8888 (32bpp) is supported, so the bpp == 0 / bpp > 64 /
@@ -904,17 +931,39 @@ impl DrmIoctl for DrmModeCreateDumb {
             GlobalPage::alloc_contiguous(pages, PAGE_SIZE_4K).map_err(|_| VfsError::NoMemory)?;
         backing.zero();
         let device = primary_scanout()?;
-        let paddr = v2p(backing.start_va()).as_usize() as u64;
         let pages_arc = Arc::new(backing);
         let offset = dev
             .next_offset
-            .fetch_add(DUMB_BUFFER_OFFSET_STRIDE, Ordering::Relaxed);
-        // A failed backend command may have partially attached backing.
-        // Retain before submission until fenced cleanup can prove detachment.
-        dev.retained_pages.lock().insert(offset, pages_arc.clone());
-        let resource_id = dev.next_resource_id.fetch_add(1, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |offset| {
+                offset.checked_add(DUMB_BUFFER_OFFSET_STRIDE)
+            })
+            .map_err(|_| VfsError::NoMemory)?;
+        let resource_id = virtgpu::next_id(&dev.next_resource_id)?;
+        let handle = virtgpu::next_id(&file.next_dumb_handle)?;
+        let object = Arc::new(DumbBuffer {
+            width: c.width,
+            height: c.height,
+            bpp: c.bpp,
+            pitch: c.pitch,
+            size: c.size,
+            offset,
+            resource_id,
+            device: Some(device.clone()),
+            pages: pages_arc.clone(),
+            reservation: Mutex::new(()),
+            virgl: None,
+        });
+        // SAFETY: This allocation-only Arc pins the entire contiguous coherent
+        // guest RAM range; it cannot form a cycle back to the display device.
+        let backing = unsafe {
+            display::GpuBacking::new(
+                v2p(pages_arc.start_va()).as_usize() as u64,
+                size_aligned as u32,
+                pages_arc,
+            )
+        };
         device
-            .create_scanout_resource(
+            .create_scanout_resource_owned(
                 ScanoutResource {
                     id: resource_id,
                     width: c.width,
@@ -922,25 +971,10 @@ impl DrmIoctl for DrmModeCreateDumb {
                     pitch: c.pitch,
                     format: ScanoutFormat::Bgra8888,
                 },
-                paddr,
-                size_aligned as u32,
+                backing,
             )
-            .map_err(|_| VfsError::Io)?;
-        let handle = file.next_dumb_handle.fetch_add(1, Ordering::Relaxed);
-
-        file.dumbs.lock().insert(
-            handle,
-            Arc::new(DumbBuffer {
-                width: c.width,
-                height: c.height,
-                bpp: c.bpp,
-                pitch: c.pitch,
-                size: c.size,
-                offset,
-                resource_id,
-                pages: pages_arc.clone(),
-            }),
-        );
+            .map_err(virtgpu::driver_error)?;
+        file.dumbs.lock().insert(handle, object);
         c.handle = handle;
         Ok(0)
     }
@@ -1089,6 +1123,7 @@ impl DrmIoctl for DrmModeAtomic {
     const CMD: u32 = iowr::<DrmModeAtomic>(DRM_TYPE, 0xBC);
 
     fn handle(dev: &Card0, file: &DrmFile, a: &mut Self) -> VfsResult<usize> {
+        let _kms_reservation = dev.kms_reservation.lock();
         let known = DRM_MODE_ATOMIC_TEST_ONLY
             | DRM_MODE_ATOMIC_NONBLOCK
             | DRM_MODE_ATOMIC_ALLOW_MODESET
@@ -1104,7 +1139,7 @@ impl DrmIoctl for DrmModeAtomic {
         let props: Vec<u32> = a.props_ptr.load_vm_vec(total_props)?;
         let values: Vec<u64> = a.prop_values_ptr.load_vm_vec(total_props)?;
 
-        let mut state = dev.state.lock();
+        let state = dev.state.lock();
         let mut proposed = *state;
         let mut new_mode_blob: Option<Option<Arc<Vec<u8>>>> = None;
         let mut idx = 0;
@@ -1132,13 +1167,13 @@ impl DrmIoctl for DrmModeAtomic {
         }
 
         let current_fb = proposed.plane_fb_id;
-        *state = proposed;
         drop(state);
+        if current_fb != 0 {
+            dev.present_fb(current_fb)?;
+        }
+        *dev.state.lock() = proposed;
         if let Some(new_ref) = new_mode_blob {
             *dev.mode_id_blob_ref.lock() = new_ref;
-        }
-        if current_fb != 0 {
-            dev.present_fb(current_fb);
         }
         if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             dev.queue_flip_event(file, a.user_data);
@@ -1227,6 +1262,11 @@ impl DrmIoctl for DrmModeFbCmd2 {
             };
             b.clone()
         };
+        // 3D scanout is a separately validated module: the legacy presenter
+        // uploads guest pages and must not overwrite host-rendered contents.
+        if object.virgl.is_some() {
+            return Err(VfsError::OperationNotSupported);
+        }
         // The scanout resource is created at exactly the dumb buffer's size
         // and pitch (no ANY_LAYOUT negotiation), and TRANSFER_TO_HOST_2D reads
         // the backing row-by-row with the resource pitch. A sub-size
@@ -1261,30 +1301,28 @@ impl DrmIoctl for DrmModeFbCmd2 {
 }
 
 impl Card0 {
-    fn present_fb(&self, fb_id: u32) {
-        let Some(fb) = self.fbs.lock().get(&fb_id).cloned() else {
-            return;
-        };
-        let (resource_id, width, height) = (fb.object.resource_id, fb.width, fb.height);
-        let Ok(device) = primary_scanout() else {
-            return;
-        };
+    fn present_fb(&self, fb_id: u32) -> VfsResult<()> {
+        let fb = self
+            .fbs
+            .lock()
+            .get(&fb_id)
+            .cloned()
+            .ok_or(VfsError::InvalidInput)?;
+        let device = primary_scanout()?;
+        let _reservation = fb.object.reservation.lock();
+        let resource_id = fb.object.resource_id;
         let rect = ScanoutRect {
             x: 0,
             y: 0,
-            width,
-            height,
+            width: fb.width,
+            height: fb.height,
         };
-        // Retain the attempted scanout even on backend error: partial host
-        // completion cannot be disproved without a fence/reset contract.
-        *self.active_scanout.lock() = Some(fb);
-        if let Err(err) = device.present_scanout_resource(resource_id, rect) {
-            log::warn!(
-                "drm: failed to present scanout resource {}: {:?}",
-                resource_id,
-                err
-            );
-        }
+        // Keep an attempted scanout reference even on error: only the backend's
+        // fenced reset/disable can prove that host scanout ownership has ended.
+        *self.active_scanout.lock() = Some(fb.clone());
+        device
+            .present_scanout_resource(resource_id, rect)
+            .map_err(virtgpu::driver_error)
     }
 
     fn queue_flip_event(&self, file: &DrmFile, user_data: u64) {
@@ -1609,7 +1647,7 @@ mod tests {
 
     use super::*;
 
-    fn object() -> Arc<DumbBuffer> {
+    pub(super) fn object() -> Arc<DumbBuffer> {
         let mut pages = GlobalPage::alloc_contiguous(1, PAGE_SIZE_4K).unwrap();
         pages.zero();
         Arc::new(DumbBuffer {
@@ -1620,7 +1658,10 @@ mod tests {
             size: 4,
             offset: DUMB_BUFFER_OFFSET_STRIDE,
             resource_id: 0x1000,
+            device: None,
             pages: Arc::new(pages),
+            reservation: Mutex::new(()),
+            virgl: None,
         })
     }
 

@@ -10,8 +10,10 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
+mod virgl;
 #[doc(no_inline)]
 pub use driver_base::{Device, DeviceKind, DriverError, DriverResult};
+pub use virgl::*;
 
 /// The information of the graphics display device.
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +108,40 @@ pub trait DisplayDevice: Device {
         Err(DriverError::Unsupported)
     }
 
+    /// Whether the traditional virgl command backend is implemented and operational.
+    fn has_virgl_commands(&self) -> bool {
+        false
+    }
+
+    /// Execute a typed command synchronously through a sleepable execution gate.
+    /// On error the driver may retain DMA backing; callers must not infer cancellation.
+    fn virgl_command(&self, _command: VirglCommand<'_>) -> DriverResult {
+        Err(DriverError::Unsupported)
+    }
+
+    /// Mark a resource for deferred fenced teardown without waiting.
+    /// No driver entry is allocated; the host scheduler may allocate bookkeeping.
+    /// Safe from object Drop while MM locks are held; retained owners survive failure.
+    fn enqueue_virgl_cleanup(&self, _resource_id: u32) -> DriverResult {
+        Err(DriverError::Unsupported)
+    }
+
+    /// Mark a context for deferred teardown without waiting.
+    fn enqueue_virgl_context_cleanup(&self, _context_id: u32) -> DriverResult {
+        Err(DriverError::Unsupported)
+    }
+
+    /// Drain marked teardown in sleepable task context; retry after scheduling failure.
+    /// Must never be called from object Drop or while holding MM/state locks.
+    fn flush_virgl_cleanup(&self) -> DriverResult {
+        Err(DriverError::Unsupported)
+    }
+
+    /// Return a nonblocking snapshot of owned objects and command failure state.
+    fn virgl_command_status(&self) -> GpuCommandStatus {
+        GpuCommandStatus::default()
+    }
+
     /// Create a host-visible 2D resource backed by guest memory.
     fn create_scanout_resource(
         &self,
@@ -116,8 +152,27 @@ pub trait DisplayDevice: Device {
         Err(DriverError::Unsupported)
     }
 
+    /// Create a 2D resource with owned backing retained through host teardown.
+    /// Uses the same bounded, sleepable command lifecycle as virgl resources.
+    fn create_scanout_resource_owned(
+        &self,
+        _resource: ScanoutResource,
+        _backing: GpuBacking,
+    ) -> DriverResult {
+        Err(DriverError::Unsupported)
+    }
+
     /// Destroy a previously created scanout resource.
     fn destroy_scanout_resource(&self, _resource_id: u32) -> DriverResult {
+        Err(DriverError::Unsupported)
+    }
+
+    /// Disable the active scanout after synchronous fenced device completion.
+    ///
+    /// Requires sleepable task context. Success commits the disabled state;
+    /// errors leave resource owners intact and do not imply DMA cancellation.
+    /// Disabling scanout does not destroy the resource or its backing allocation.
+    fn disable_scanout(&self) -> DriverResult {
         Err(DriverError::Unsupported)
     }
 

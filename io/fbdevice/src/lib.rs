@@ -9,7 +9,7 @@
 //! device's scanout interface. At [`fb_init`] the primary display device is
 //! asked for its resolution, a contiguous shadow buffer is allocated in guest
 //! memory, and that buffer is bound to the host as a 2D scanout resource via
-//! [`DisplayDevice::create_scanout_resource`]. Userspace reads and writes land
+//! [`DisplayDevice::create_scanout_resource_owned`]. Userspace reads and writes land
 //! in the shadow; the shadow can be pushed to the visible scanout on demand
 //! via [`fb_present`].
 //!
@@ -33,7 +33,9 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
-use display::{DisplayDevice, DisplayInfo, ScanoutFormat, ScanoutRect, ScanoutResource};
+use display::{
+    DisplayDevice, DisplayInfo, GpuBacking, ScanoutFormat, ScanoutRect, ScanoutResource,
+};
 use kalloc::GlobalPage;
 use kclass::{ClassDevice, DisplayDeviceImpl, display_devices as class_display_devices};
 use khal::mem::v2p;
@@ -60,7 +62,7 @@ struct FbEmulation {
     /// Guest-mapped shadow buffer; userspace reads/writes land here. Kept alive
     /// for the framebuffer lifetime, so the host scanout resource's backing
     /// memory stays valid.
-    shadow: GlobalPage,
+    shadow: Arc<GlobalPage>,
 }
 
 static FB: LazyInit<SpinNoIrq<Option<Arc<FbEmulation>>>> = LazyInit::new();
@@ -120,8 +122,17 @@ fn try_setup() -> Result<(), ()> {
         pitch: (info.width as usize * BYTES_PER_PIXEL) as u32,
         format: ScanoutFormat::Bgra8888,
     };
-    if let Err(e) = device.create_scanout_resource(resource, paddr, (pages * PAGE_SIZE_4K) as u32) {
-        warn!("create_scanout_resource failed on primary display: {:?}", e);
+    let length = u32::try_from(pages.checked_mul(PAGE_SIZE_4K).ok_or(())?).map_err(|_| ())?;
+    let shadow = Arc::new(shadow);
+    // SAFETY: GlobalPage owns the coherent, physically contiguous allocation.
+    // Its Arc pins the entire range through fenced teardown or device reset;
+    // it does not retain the display device. fbdev keeps its own Arc as well.
+    let backing = unsafe { GpuBacking::new(paddr, length, shadow.clone()) };
+    if let Err(e) = device.create_scanout_resource_owned(resource, backing) {
+        warn!(
+            "create_scanout_resource_owned failed on primary display: {:?}",
+            e
+        );
         return Err(());
     }
 

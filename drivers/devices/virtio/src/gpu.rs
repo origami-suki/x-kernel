@@ -2,22 +2,28 @@
 // Copyright 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
 // See LICENSES for license details.
 
-//! VirtIO GPU scanout and immutable virgl capability discovery.
+//! VirtIO GPU owned scanout/virgl commands and cached capability discovery.
 
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::mem::ManuallyDrop;
 
-use display::{DisplayDevice, DisplayInfo, ScanoutRect, ScanoutResource, VirglCapsetInfo};
+use display::{
+    DisplayDevice, DisplayInfo, GpuCommandStatus, GpuExecution, ScanoutRect, ScanoutResource,
+    VirglCapsetInfo, VirglCommand,
+};
+mod commands;
+mod queue;
+use commands::Engine;
 use driver_base::{Device, DeviceKind, DriverError, DriverResult};
 use kspin::SpinNoIrq;
+use queue::{Queue, Transaction};
 use virtio_drivers::{
     Hal, PAGE_SIZE,
     config::{ReadOnly, WriteOnly, read_config},
-    queue::VirtQueue,
     transport::{InterruptStatus, Transport},
 };
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-const QUEUE_SIZE: u16 = 2;
 const QUEUE_TRANSMIT: u16 = 0;
 const QUEUE_CURSOR: u16 = 1;
 const SCANOUT_ID: u32 = 0;
@@ -34,33 +40,51 @@ struct CapsetData {
     bytes: Arc<[u8]>,
 }
 
-/// VirtIO GPU adapter with the existing 2D scanout operations.
+/// GPU DMA/device ordering in addition to the locked allocation/mapping HAL.
 ///
-/// Virgl negotiation and capset discovery are exposed as immutable metadata.
-/// This adapter does not yet expose 3D contexts, submissions or fences.
-pub struct VirtIoGpuDev<H: Hal, T: Transport> {
+/// # Safety
+/// Implementations must order compiler and hardware accesses across the actual
+/// coherent DMA and MMIO domains. CPU-only atomic fences are insufficient when
+/// device memory has a wider visibility domain. These operations must not sleep,
+/// allocate or panic, and must work during bootstrap and IRQ-disabled queue work.
+pub unsafe trait GpuHal: Hal {
+    /// Order all prior DMA writes before subsequent DMA publication/MMIO writes.
+    /// Called before avail.idx and again after idx, before any doorbell accessor.
+    fn dma_write_barrier();
+    /// Order an observed device completion index before DMA entry/payload reads.
+    fn dma_read_barrier();
+}
+
+/// VirtIO GPU adapter with cached metadata and owned fenced runtime commands.
+pub struct VirtIoGpuDev<H: GpuHal, T: Transport + Send> {
     info: DisplayInfo,
     has_virgl: bool,
     capsets: Arc<[VirglCapsetInfo]>,
     capset_data: Vec<CapsetData>,
-    inner: SpinNoIrq<VirtIoGpuProtocol<H, T>>,
+    engine: Arc<Engine<H, T>>,
 }
 
-// SAFETY: all mutable transport/queue access is serialized by inner. The HAL
-// parameter is a type-level provider, and transport ownership moves with the
-// device. Capset metadata and bytes are immutable after publication.
-unsafe impl<H: Hal, T: Transport> Send for VirtIoGpuDev<H, T> {}
-// SAFETY: shared callers only read immutable cached values or acquire inner;
-// no reference to the enclosed transport or queue escapes the lock.
-unsafe impl<H: Hal, T: Transport> Sync for VirtIoGpuDev<H, T> {}
-
-impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
+impl<H: GpuHal + 'static, T: Transport + Send + 'static> VirtIoGpuDev<H, T> {
     /// Initializes scanout and caches the device's virgl capability sets.
     ///
+    /// Without an execution provider only metadata queries are available.
     /// Must run before publishing the device. Discovery performs synchronous
     /// device I/O without holding the adapter's spinlock. Malformed or excessive
     /// host metadata fails initialization instead of publishing partial caps.
     pub fn try_new(transport: T) -> DriverResult<Self> {
+        Self::initialize(transport, None)
+    }
+
+    /// Discover capabilities and install the host's sleepable command runtime.
+    /// Initialization uses only unpublished boot-time metadata requests.
+    pub fn try_new_with_execution(
+        transport: T,
+        execution: Arc<dyn GpuExecution>,
+    ) -> DriverResult<Self> {
+        Self::initialize(transport, Some(execution))
+    }
+
+    fn initialize(transport: T, execution: Option<Arc<dyn GpuExecution>>) -> DriverResult<Self> {
         let mut device = VirtIoGpuProtocol::new(transport).map_err(crate::as_driver_error)?;
         let num_capsets = device.num_capsets;
         let (width, height) = device.resolution().map_err(crate::as_driver_error)?;
@@ -133,12 +157,12 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
             has_virgl,
             capsets: capsets.into(),
             capset_data,
-            inner: SpinNoIrq::new(device),
+            engine: Engine::new(device, execution),
         })
     }
 }
 
-impl<H: Hal, T: Transport> Device for VirtIoGpuDev<H, T> {
+impl<H: GpuHal, T: Transport + Send> Device for VirtIoGpuDev<H, T> {
     fn name(&self) -> &str {
         "virtio-gpu"
     }
@@ -148,7 +172,7 @@ impl<H: Hal, T: Transport> Device for VirtIoGpuDev<H, T> {
     }
 }
 
-impl<H: Hal, T: Transport> DisplayDevice for VirtIoGpuDev<H, T> {
+impl<H: GpuHal + 'static, T: Transport + Send + 'static> DisplayDevice for VirtIoGpuDev<H, T> {
     fn info(&self) -> DisplayInfo {
         self.info
     }
@@ -180,76 +204,78 @@ impl<H: Hal, T: Transport> DisplayDevice for VirtIoGpuDev<H, T> {
             .ok_or(DriverError::InvalidInput)
     }
 
-    fn create_scanout_resource(
+    fn create_scanout_resource_owned(
         &self,
         resource: ScanoutResource,
-        paddr: u64,
-        length: u32,
+        backing: display::GpuBacking,
     ) -> DriverResult {
-        if length == 0 || resource.pitch == 0 || resource.format != display::ScanoutFormat::Bgra8888
+        if backing.length() == 0
+            || resource.id == 0
+            || resource.width == 0
+            || resource.height == 0
+            || resource.width.checked_mul(4) != Some(resource.pitch)
+            || u64::from(resource.pitch) * u64::from(resource.height) > u64::from(backing.length())
+            || resource.format != display::ScanoutFormat::Bgra8888
         {
             return Err(DriverError::InvalidInput);
         }
-        let mut device = self.inner.lock();
-        device
-            .resource_create_2d(resource.id, resource.width, resource.height)
-            .map_err(crate::as_driver_error)?;
-        if let Err(error) = device.resource_attach_backing(resource.id, paddr, length) {
-            // Creation already succeeded, so an attach failure must not leave
-            // an unreachable host resource behind.
-            if let Err(cleanup) = device.resource_unref(resource.id) {
-                log::warn!("virtio-gpu: attach rollback failed: {:?}", cleanup);
-            }
-            return Err(crate::as_driver_error(error));
-        }
-        Ok(())
+        self.engine.create_2d(resource, backing)
     }
 
     fn destroy_scanout_resource(&self, resource_id: u32) -> DriverResult {
-        let mut device = self.inner.lock();
-        device
-            .resource_detach_backing(resource_id)
-            .map_err(crate::as_driver_error)?;
-        device
-            .resource_unref(resource_id)
-            .map_err(crate::as_driver_error)
+        self.engine.destroy_2d(resource_id)
+    }
+
+    fn disable_scanout(&self) -> DriverResult {
+        self.engine.disable_scanout()
     }
 
     fn present_scanout_resource(&self, resource_id: u32, rect: ScanoutRect) -> DriverResult {
-        let rect = Rect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-        };
-        let mut device = self.inner.lock();
-        device
-            .transfer_to_host_2d(rect, 0, resource_id)
-            .map_err(crate::as_driver_error)?;
-        device
-            .set_scanout(rect, SCANOUT_ID, resource_id)
-            .map_err(crate::as_driver_error)?;
-        device
-            .resource_flush(rect, resource_id)
-            .map_err(crate::as_driver_error)
+        self.engine.present_2d(resource_id, rect)
+    }
+
+    fn has_virgl_commands(&self) -> bool {
+        self.has_virgl && self.engine.available()
+    }
+
+    fn virgl_command(&self, command: VirglCommand<'_>) -> DriverResult {
+        if !self.has_virgl {
+            return Err(DriverError::Unsupported);
+        }
+        self.engine.command(command)
+    }
+
+    fn enqueue_virgl_cleanup(&self, id: u32) -> DriverResult {
+        self.engine.enqueue(id, false)
+    }
+
+    fn enqueue_virgl_context_cleanup(&self, id: u32) -> DriverResult {
+        self.engine.enqueue(id, true)
+    }
+
+    fn flush_virgl_cleanup(&self) -> DriverResult {
+        self.engine.reclaim()
+    }
+
+    fn virgl_command_status(&self) -> GpuCommandStatus {
+        self.engine.status()
     }
 }
 
 // The locked dependency's resolution accessor discards the enabled bit.
 // Retain the existing local scanout protocol so disabled scanouts (including
 // nonzero geometry) cannot be published. Capset discovery shares this queue;
-// no third-party code is changed and no 3D submission API is exposed.
-struct VirtIoGpuProtocol<H: Hal, T: Transport> {
+// runtime commands share this queue through the owned command engine.
+struct VirtIoGpuProtocol<H: GpuHal, T: Transport + Send> {
     transport: T,
     has_virgl: bool,
     num_capsets: u32,
-    control_queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
-    _cursor_queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
-    queue_buf_send: Box<[u8]>,
-    queue_buf_recv: Box<[u8]>,
+    control_queue: ManuallyDrop<Queue<H>>,
+    cursor_queue: ManuallyDrop<Queue<H>>,
+    is_reset: bool,
 }
 
-impl<H: Hal, T: Transport> VirtIoGpuProtocol<H, T> {
+impl<H: GpuHal, T: Transport + Send> VirtIoGpuProtocol<H, T> {
     fn new(mut transport: T) -> virtio_drivers::Result<Self> {
         let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
 
@@ -262,23 +288,8 @@ impl<H: Hal, T: Transport> VirtIoGpuProtocol<H, T> {
         );
 
         let num_capsets = read_config!(transport, Config, num_capsets)?;
-        let control_queue = VirtQueue::new(
-            &mut transport,
-            QUEUE_TRANSMIT,
-            negotiated_features.contains(Features::RING_INDIRECT_DESC),
-            negotiated_features.contains(Features::RING_EVENT_IDX),
-            negotiated_features.contains(Features::ACCESS_PLATFORM),
-        )?;
-        let cursor_queue = VirtQueue::new(
-            &mut transport,
-            QUEUE_CURSOR,
-            negotiated_features.contains(Features::RING_INDIRECT_DESC),
-            negotiated_features.contains(Features::RING_EVENT_IDX),
-            negotiated_features.contains(Features::ACCESS_PLATFORM),
-        )?;
-
-        let queue_buf_send = FromZeros::new_box_zeroed_with_elems(PAGE_SIZE).unwrap();
-        let queue_buf_recv = FromZeros::new_box_zeroed_with_elems(PAGE_SIZE).unwrap();
+        let control_queue = Queue::<H>::new(&mut transport, QUEUE_TRANSMIT)?;
+        let cursor_queue = Queue::<H>::new(&mut transport, QUEUE_CURSOR)?;
 
         transport.finish_init();
 
@@ -286,10 +297,9 @@ impl<H: Hal, T: Transport> VirtIoGpuProtocol<H, T> {
             transport,
             has_virgl: negotiated_features.contains(Features::VIRGL),
             num_capsets,
-            control_queue,
-            _cursor_queue: cursor_queue,
-            queue_buf_send,
-            queue_buf_recv,
+            control_queue: ManuallyDrop::new(control_queue),
+            cursor_queue: ManuallyDrop::new(cursor_queue),
+            is_reset: false,
         })
     }
 
@@ -312,23 +322,49 @@ impl<H: Hal, T: Transport> VirtIoGpuProtocol<H, T> {
         &mut self,
         req: Req,
     ) -> virtio_drivers::Result<Rsp> {
-        // The send buffer is PAGE_SIZE while every request here is a fixed
-        // ~32-byte struct, so the conversion cannot fail in practice; still,
-        // propagate instead of panicking on malformed device-side data.
-        req.write_to_prefix(&mut self.queue_buf_send)
-            .map_err(|_| virtio_drivers::Error::IoError)?;
-        self.queue_buf_recv.fill(0);
-        let used_len = self.control_queue.add_notify_wait_pop(
-            &[&self.queue_buf_send],
-            &mut [&mut self.queue_buf_recv],
-            &mut self.transport,
-        )?;
-        if (used_len as usize) < core::mem::size_of::<Rsp>() {
-            return Err(virtio_drivers::Error::IoError);
-        }
-        Rsp::read_from_prefix(&self.queue_buf_recv)
-            .map(|(rsp, _)| rsp)
+        // GET_DISPLAY_INFO contains all 16 scanouts although this adapter
+        // decodes only the first. Preserve capacity for the complete wire reply.
+        let bytes = self.bootstrap_request(req.as_bytes().to_vec(), PAGE_SIZE)?;
+        Rsp::read_from_prefix(&bytes)
+            .map(|(response, _)| response)
             .map_err(|_| virtio_drivers::Error::IoError)
+    }
+
+    fn bootstrap_request(
+        &mut self,
+        request: Vec<u8>,
+        response_size: usize,
+    ) -> virtio_drivers::Result<Vec<u8>> {
+        let mut transaction = Transaction::<H>::prepare(request, response_size)?;
+        self.control_queue.publish(&mut transaction)?;
+        self.transport.notify(QUEUE_TRANSMIT);
+        loop {
+            match self.control_queue.pop() {
+                Ok(Some(length)) => {
+                    // SAFETY: bootstrap owns this sole published transaction;
+                    // pop returned its chain, so DMA no longer owns its maps.
+                    return unsafe { transaction.finish(length) };
+                }
+                Ok(None) => core::hint::spin_loop(),
+                Err(error) => {
+                    if self.reset() {
+                        // SAFETY: acknowledged reset stops DMA on all queues.
+                        unsafe { transaction.cancel_after_reset() };
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) -> bool {
+        if !self.is_reset {
+            self.transport
+                .set_status(virtio_drivers::transport::DeviceStatus::empty());
+            self.is_reset =
+                self.transport.get_status() == virtio_drivers::transport::DeviceStatus::empty();
+        }
+        self.is_reset
     }
 
     fn has_virgl(&self) -> bool {
@@ -352,15 +388,10 @@ impl<H: Hal, T: Transport> VirtIoGpuProtocol<H, T> {
             version,
         };
         let header_size = core::mem::size_of::<CtrlHeader>();
-        // One writable descriptor preserves the original depth-two queue even
-        // when INDIRECT_DESC was not negotiated.
-        let mut response = vec![0; header_size + size as usize];
-        let used = self.control_queue.add_notify_wait_pop(
-            &[request.as_bytes()],
-            &mut [&mut response],
-            &mut self.transport,
-        )? as usize;
-        if used < header_size || used > response.len() {
+        let response =
+            self.bootstrap_request(request.as_bytes().to_vec(), header_size + size as usize)?;
+        let used = response.len();
+        if used < header_size {
             return Err(virtio_drivers::Error::IoError);
         }
         let (header, _) =
@@ -376,104 +407,22 @@ impl<H: Hal, T: Transport> VirtIoGpuProtocol<H, T> {
         info.header.check_type(Command::OK_DISPLAY_INFO)?;
         Ok(info)
     }
-
-    fn resource_create_2d(
-        &mut self,
-        resource_id: u32,
-        width: u32,
-        height: u32,
-    ) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(ResourceCreate2D {
-            header: CtrlHeader::with_type(Command::RESOURCE_CREATE_2D),
-            resource_id,
-            format: Format::B8G8R8A8UNORM,
-            width,
-            height,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
-
-    fn set_scanout(
-        &mut self,
-        rect: Rect,
-        scanout_id: u32,
-        resource_id: u32,
-    ) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(SetScanout {
-            header: CtrlHeader::with_type(Command::SET_SCANOUT),
-            rect,
-            scanout_id,
-            resource_id,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
-
-    fn resource_flush(&mut self, rect: Rect, resource_id: u32) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(ResourceFlush {
-            header: CtrlHeader::with_type(Command::RESOURCE_FLUSH),
-            rect,
-            resource_id,
-            _padding: 0,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
-
-    fn transfer_to_host_2d(
-        &mut self,
-        rect: Rect,
-        offset: u64,
-        resource_id: u32,
-    ) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(TransferToHost2D {
-            header: CtrlHeader::with_type(Command::TRANSFER_TO_HOST_2D),
-            rect,
-            offset,
-            resource_id,
-            _padding: 0,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
-
-    fn resource_attach_backing(
-        &mut self,
-        resource_id: u32,
-        paddr: u64,
-        length: u32,
-    ) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(ResourceAttachBacking {
-            header: CtrlHeader::with_type(Command::RESOURCE_ATTACH_BACKING),
-            resource_id,
-            nr_entries: 1,
-            addr: paddr,
-            length,
-            _padding: 0,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
-
-    fn resource_detach_backing(&mut self, resource_id: u32) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(ResourceDetachBacking {
-            header: CtrlHeader::with_type(Command::RESOURCE_DETACH_BACKING),
-            resource_id,
-            _padding: 0,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
-
-    fn resource_unref(&mut self, resource_id: u32) -> virtio_drivers::Result {
-        let rsp: CtrlHeader = self.request(ResourceUnref {
-            header: CtrlHeader::with_type(Command::RESOURCE_UNREF),
-            resource_id,
-            _padding: 0,
-        })?;
-        rsp.check_type(Command::OK_NODATA)
-    }
 }
 
-impl<H: Hal, T: Transport> Drop for VirtIoGpuProtocol<H, T> {
+impl<H: GpuHal, T: Transport + Send> Drop for VirtIoGpuProtocol<H, T> {
     fn drop(&mut self) {
-        self.transport.queue_unset(QUEUE_TRANSMIT);
-        self.transport.queue_unset(QUEUE_CURSOR);
+        if self.reset() {
+            self.transport.queue_unset(QUEUE_TRANSMIT);
+            self.transport.queue_unset(QUEUE_CURSOR);
+            // SAFETY: reset is acknowledged, so neither coherent ring can be
+            // accessed by the device. Both fields are dropped exactly once.
+            unsafe {
+                ManuallyDrop::drop(&mut self.control_queue);
+                ManuallyDrop::drop(&mut self.cursor_queue);
+            }
+        } else {
+            log::error!("virtio-gpu: reset unacknowledged; retaining coherent rings");
+        }
     }
 }
 
@@ -505,10 +454,9 @@ bitflags::bitflags! {
     }
 }
 
-const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX
-    .union(Features::RING_INDIRECT_DESC)
-    .union(Features::VERSION_1)
-    .union(Features::VIRGL);
+// The owned GPU queue uses two direct descriptors and polls completion. Do
+// not negotiate indirect/event-index features that it does not implement.
+const SUPPORTED_FEATURES: Features = Features::VERSION_1.union(Features::VIRGL);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
@@ -517,14 +465,6 @@ struct Command(u32);
 impl Command {
     const GET_DISPLAY_INFO: Command = Command(0x100);
     const OK_DISPLAY_INFO: Command = Command(0x1101);
-    const OK_NODATA: Command = Command(0x1100);
-    const RESOURCE_ATTACH_BACKING: Command = Command(0x106);
-    const RESOURCE_CREATE_2D: Command = Command(0x101);
-    const RESOURCE_DETACH_BACKING: Command = Command(0x107);
-    const RESOURCE_FLUSH: Command = Command(0x104);
-    const RESOURCE_UNREF: Command = Command(0x102);
-    const SET_SCANOUT: Command = Command(0x103);
-    const TRANSFER_TO_HOST_2D: Command = Command(0x105);
 }
 
 #[repr(C)]
@@ -576,77 +516,6 @@ struct RespDisplayInfo {
 }
 
 #[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct ResourceCreate2D {
-    header: CtrlHeader,
-    resource_id: u32,
-    format: Format,
-    width: u32,
-    height: u32,
-}
-
-#[repr(u32)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-enum Format {
-    B8G8R8A8UNORM = 1,
-}
-
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct ResourceAttachBacking {
-    header: CtrlHeader,
-    resource_id: u32,
-    nr_entries: u32,
-    addr: u64,
-    length: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct ResourceDetachBacking {
-    header: CtrlHeader,
-    resource_id: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct ResourceUnref {
-    header: CtrlHeader,
-    resource_id: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct SetScanout {
-    header: CtrlHeader,
-    rect: Rect,
-    scanout_id: u32,
-    resource_id: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct TransferToHost2D {
-    header: CtrlHeader,
-    rect: Rect,
-    offset: u64,
-    resource_id: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
-struct ResourceFlush {
-    header: CtrlHeader,
-    rect: Rect,
-    resource_id: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct CapsetQuery {
     header: CtrlHeader,
@@ -666,3 +535,6 @@ struct RespCapsetInfo {
 
 #[cfg(unittest)]
 mod tests;
+
+#[cfg(unittest)]
+pub use tests::GpuDmaTestDevice;

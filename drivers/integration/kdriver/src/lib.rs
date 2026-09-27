@@ -40,6 +40,8 @@ mod block_request_tests;
 mod bus;
 pub mod driver_registry;
 mod enumeration;
+#[cfg(feature = "virtio-gpu")]
+mod gpu_execution;
 mod manager;
 mod resource;
 

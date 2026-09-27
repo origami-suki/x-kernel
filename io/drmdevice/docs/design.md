@@ -88,8 +88,8 @@ primary ClassDevice<DisplayDeviceImpl> (display scanout backend, via kclass)
 ## Concurrency Model
 
 - Fine-grained state: separate `Mutex`es for modeset state, legacy CRTC
-  state, dumb buffers, framebuffers, user blobs, system blobs, retained
-  pages, and the event queue; id and offset allocation use fetch-add
+  state, dumb buffers, framebuffers, user blobs, system blobs,
+  and the per-file event queue; id and offset allocation use fetch-add
   atomics.
 - The IN-FORMATS system blob uses double-checked locking: an
   `AtomicU32` fast path (`Acquire`/`Release`) guards a `Mutex`-protected
@@ -117,7 +117,7 @@ primary ClassDevice<DisplayDeviceImpl> (display scanout backend, via kclass)
   `report_user_array`).
 - `mmap` maps dumb-buffer backing pages into the caller's address space
   through the VFS mmap mapper; backing pages are retained
-  (`retained_pages`) so a mapping outliving its framebuffer keeps valid
+  by VMA object ownership, so a mapping outliving its framebuffer keeps valid
   memory.
 - The display backend side is trusted kernel-internal: scanout handles
   come from the `kclass` registry, not from user space.
@@ -133,9 +133,9 @@ primary ClassDevice<DisplayDeviceImpl> (display scanout backend, via kclass)
 - Legacy plus atomic ioctls over one state model: compositors use
   atomic paths, simple clients use legacy CRTC calls; both mutate the
   same `ModesetState` so the two interfaces cannot diverge.
-- Dumb buffers with retained backing pages: user-space may keep a
-  mapping after removing the framebuffer; retention turns that from a
-  use-after-free hazard into a retained memory cost; repeated creation is unbounded until fenced reclamation exists.
+- Owned backing and mappings: user-space may keep a mapping after removing
+  its handle/framebuffer. The VMA and backend DMA owners keep it alive until
+  unmapping and fenced detach/unref complete; Drop queues without waiting.
 - Build-once system blobs behind double-checked atomics: the IN-FORMATS
   blob is read on every atomic check but must be allocated once; the
   atomic fast path keeps per-frame ioctls lock-free on the hot path.
@@ -173,16 +173,83 @@ of the file lock before entering the mapper. Event delivery targets only the
 requesting description and wakes that description's PollSet after unlocking.
 Final file release clears handles/events/caps and does no device I/O or wait.
 
-This is an intermediate safety boundary, **not resource reclamation**.
-All buffers submitted for creation now retain backing in the device-wide
-`retained_pages` table, including never-mapped buffers and failed backend commands whose partial host
-attachment cannot be disproved. Neither GEM_CLOSE nor
-DESTROY_DUMB sends host detach/unref. Host resource teardown is deliberately
-pending a fenced, explicit cleanup path that owns backing until completion;
-no synchronous GPU waits occur in Drop or under file/framebuffer/MmSpace
-locks. Physical mappings still depend on device-lifetime retention until the
-separate owned-mapping module is integrated. Repeated create/close consumes
-memory and host resources until device/kernel lifetime ends; there is no
-bounded reclamation claim. DRM master/access control, PRIME/DMA-BUF, 3D UAPI
-and context ownership are outside this change; existing PRIME behavior is not
-real DMA-BUF support.
+The original per-open prerequisite retained all backing device-wide as an
+intermediate boundary. This execution module removes that table only in
+combination with owned mappings and the driver's explicit fenced cleanup.
+Both 2D and 3D creation transfer an allocation-only owner before host DMA;
+final object Drop queues cleanup, while failure retains the backend owner.
+Mapping, framebuffer and active scanout references preserve the object. A
+framebuffer remains until RMFB, and the last attempted scanout remains until
+replacement; these live owners are distinct from leaked close-only backing.
+No synchronous GPU waits occur in Drop or under file/framebuffer/MmSpace locks.
+PRIME/DMA-BUF, render discovery and 3D KMS are subsequent execution modules;
+existing numeric PRIME behavior is not real DMA-BUF support.
+
+## Traditional virtgpu UAPI: first execution module
+
+`card0.rs::virtgpu` carries the fixed-width Linux virtgpu ABI and implements
+GETPARAM/CAPS, MAP, RESOURCE_CREATE/INFO, TRANSFER_TO/FROM_HOST, EXECBUFFER and
+WAIT. It is a separate execution module; PRIME/DMA-BUF, render discovery and
+3D KMS are subsequent modules. ADDFB2 rejects 3D objects in this intermediate
+state to prevent the legacy 2D upload path overwriting host-rendered pixels.
+No existing numeric PRIME placeholder is evidence of sharing support.
+
+Each file lazily creates one legacy context, protected by a dedicated sleepable
+context-admission gate. Host context/resource IDs are device-global, while GEM
+handles remain per description. Resource/context Drops only enqueue prebuilt
+backend cleanup, without GPU waits or user-memory access. GPU backing ownership
+uses only `Arc<GlobalPage>`; it does not retain the display device, preventing a
+registry/resource/device cycle. Object references retain their originating
+context and allocation. The backend independently pins the allocation before
+host submission and retains it on failure until fenced detach/unref succeeds;
+poisoned backends report I/O errors rather than successful waits.
+
+EXECBUFFER copies at most 1 MiB of aligned commands and 1024 handle entries
+before acquiring reservations. Header payload lengths must consume exactly the
+copied dwords. Handles are resolved to Arcs, sorted by device resource ID and
+deduplicated before locking per-object reservations, avoiding duplicate and
+multi-object lock inversions. Transfer/submit hold these dedicated sleepable
+reservations until fenced completion; general handle/context/FB/MmSpace state
+locks are never held during GPU waits. WAIT takes the requested object's same
+reservation; NOWAIT returns EBUSY when it is occupied. Thus a synchronous API
+still preserves exclusion between concurrent clients and truthful busy status.
+Commands remain an untrusted renderer protocol, interpreted by the host's
+per-context resource namespace; this is not a guest-side virgl shader validator.
+
+Creation dimensions/mip levels/samples/flags, 8 MiB backing limits, transfer
+regions and arithmetic are validated before dispatch. Resource creation copyout
+failure revokes the unpublished handle and queues cleanup. BLOB, HOST_VISIBLE,
+CROSS_DEVICE, CONTEXT_INIT, syncobj and fence/ring flags remain unsupported.
+3D_FEATURES and CAPSET_QUERY_FIX require an implemented, healthy command backend;
+SUPPORTED_CAPSET_IDS includes only advertised virgl/virgl2 sets. Opaque caps are
+copied from actual cached device bytes with the requested length bounded by the
+snapshot, never synthesized. Exact ioctl carrier sizes match local DRM headers.
+
+DRM mmap now supplies the actual physical allocation range, byte offset zero
+and an Arc object owner to `map_physical_owned`; lookup tokens never participate
+in physical address arithmetic. VMA split/fork and final TLB invalidation retain
+the owner through the separately validated mapping contract. Both 2D and 3D
+objects use allocation-only backend ownership and deferred fenced cleanup;
+there is no permanent DRM backing table. Dumb creation requires the owned
+scanout entry point and fails closed if a backend lacks that contract. This
+module depends on the exact final tested driver lifecycle implementation, and
+its provisional display contract alone does not establish guest execution.
+
+The dedicated sleepable KMS reservation serializes modeset/FB mutations while
+state locks are dropped before presentation. Presentation errors propagate to
+the ioctl; flip events and committed legacy/atomic state are updated only after
+success. The attempted scanout Arc is conservatively retained on failure until
+backend fenced cleanup can prove it no longer participates in host scanout.
+
+## Linux v6.12 ABI correction
+
+GETPARAM writes exactly a 32-bit value to its 64-bit pointer carrier, matching
+`virtgpu_ioctl.c::virtio_gpu_getparam_ioctl` (`sizeof(int)`, lines 123–124), so
+an adjacent user canary or a page boundary is not overwritten. Traditional
+non-blob TRANSFER_TO/FROM_HOST rejects nonzero stride/layer_stride, matching
+that file's lines 250–252 and 309–311. Protocol-default BGRA/XRGB transfer
+extents use checked mip row/layer arithmetic; the attached iov remains the
+backend boundary for other host-validated formats.
+
+Reference: https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+Actual source snapshots, line references and hashes are retained with module evidence.

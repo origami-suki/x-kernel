@@ -1,77 +1,51 @@
-# display — Security And Reliability
+# display — Security and reliability
 
-## Scope
+## Scope and trust boundaries
 
-This analysis covers the entire crate — `src/lib.rs` (the
-`DisplayDevice` trait and scanout value types) plus `src/tests.rs`,
-which is test-only. The crate holds no state and no unsafe code; the
-security-relevant content is the scanout resource contract and the
-obligations it places on callers and drivers.
+The crate defines display metadata, owned 2D backing, typed legacy virgl
+commands, and host execution/deferred-work contracts. It does not access user
+pointers, queues or hardware. Kernel callers translate validated userspace
+requests into these types; concrete drivers validate the remaining protocol
+bounds and device replies.
 
+## Unsafe boundary
 
-## Trust Model
+`GpuBacking::new` in `src/virgl.rs` is unsafe. Its owner must retain the entire
+stable, coherent physical allocation until the driver releases it; CPU access
+must obey GPU reservation/transfer synchronization. Private fields prevent
+constructing an unowned backing through safe struct syntax. The owner must not
+retain the display device, to avoid registry/device reference cycles.
 
-Pure contract layer: one trait plus value types, no state, no I/O. The
-security-relevant content is the scanout resource contract — guest
-physical addresses handed to a host — and the obligations placed on
-implementers, recorded below for driver audits.
+## Lifecycle invariants
 
-## External Boundaries
+- The driver pins owned backing before publishing host attachment.
+- Timeout or an ioctl error is not DMA cancellation. A driver may retain the
+  owner after returning an error; only fenced teardown or acknowledged reset
+  permits releasing its final DMA reference.
+- Mapping/framebuffer/in-flight ownership and resource reservations remain the
+  consumer's responsibility. A userspace handle is never a device resource ID.
+- Destructor cleanup enqueue must not wait or execute callbacks inline. A
+  failed scheduling attempt must preserve the marked object and allocation.
+  `flush_virgl_cleanup` permits a task-context retry.
+- `GpuExecution::run` validates sleepability and serializes the whole callback
+  with interrupts enabled. No callback recursively takes its own gate.
+- Cached capset snapshots are immutable. Hardware virgl support is distinct
+  from `has_virgl_commands`, and neither establishes userspace acceleration.
 
-- `create_scanout_resource(resource, paddr, length)` hands a guest
-  physical address and length to the display driver, which describes it
-  to the host (e.g. virtio-gpu). The kernel asserts the region is valid
-  at the call site; the host becomes a reader/writer of that memory for
-  the resource lifetime. This is the crate's one real trust boundary and
-  it is owned by callers and drivers, not by this crate.
-- No user-space input reaches this crate.
+## Threats and failure handling
 
-## Unsafe Code
+| Threat | Consequence | Required control |
+| --- | --- | --- |
+| Unowned/reused physical backing | Host DMA into unrelated memory | Unsafe owned-backing constructor; pin through fenced teardown/reset |
+| Long GPU wait under IRQ lock | Timer/scheduler starvation | Host sleepable gate; short queue critical sections; wait outside locks |
+| Failed teardown treated as release | DMA use after free | Retain and expose pending objects; explicit retry/status |
+| Cyclic device/allocation owner | Permanent normal-path retention | Allocation-only Arc owner and weak deferred callback |
+| Opaque/unbounded user command | Excess allocation or invalid host protocol | Copy at ABI boundary; driver length/ID/bounds checks |
 
-None. The crate contains no `unsafe`, no FFI, and no inline assembly.
+No blob, explicit sync-fd, context-init or syncobj support is implied. The raw
+physical-address-only scanout method remains a compatibility trait default;
+drivers requiring safe timeout ownership return Unsupported for it.
 
-## Invariants
-
-- `ScanoutRect` coordinates are plain data; drivers must clamp or reject
-  rectangles outside the resource before programming hardware.
-- A scanout resource id is driver-scoped; `destroy_scanout_resource` on
-  an unknown id returns an error rather than affecting other resources.
-- `flush` is repeatable and side-effect-free beyond presenting pixels.
-
-## Threat Analysis
-
-| ID | Threat | Impact | Trigger | Existing control |
-|----|--------|--------|---------|------------------|
-| T-01 | Guest memory described to the host while unmapped or reused | High — device writes into unrelated kernel memory | Caller frees/reuses the backing page while the resource lives | Contract: the caller keeps the backing alive for the resource lifetime (fbdevice holds its `GlobalPage` forever); enforcement by driver/caller review. Core residual risk of the scanout model. |
-| T-02 | Driver programming hardware with an out-of-bounds rect | Medium — scanout reads outside the resource | Malformed `ScanoutRect` | Trait-level obligation: drivers must validate rects; the contract type cannot enforce it. |
-| T-03 | Host reads stale kernel data from the shared buffer | Medium — kernel data disclosure through the display | Buffer not zeroed before binding | Callers zero the shadow before publishing (fbdevice does); recorded as a caller obligation. |
-
-## Failure Modes
-
-| ID | Failure mode | Local effect | System effect | Severity | Handling |
-|----|--------------|--------------|---------------|----------|----------|
-| F-01 | Scanout capability absent | `DriverError::Unsupported` from the default methods | Callers fall back to plain flush | 4 | Default trait implementations. |
-| F-02 | Flush hardware failure | `DriverError` returned | Frame not presented; retry by caller | 3 | Error propagation via `DriverResult`. |
-| F-03 | Unknown resource id on destroy/present | Driver-specific error | No effect on other resources | 4 | Driver returns an error; no implicit cleanup. |
-
-## Known Limitations
-
-- Single pixel format (`Bgra8888`); format negotiation does not exist.
-- The contract cannot express resource lifetime to the host — that is
-  caller discipline, documented here and in implementer crates.
-
-## Audit Checklist
-
-- Drivers validate `ScanoutRect` against resource bounds before hardware
-  programming.
-- New trait methods that hand memory to a host document the required
-  lifetime discipline.
-
-## Virgl Discovery Boundary
-
-Virgl metadata and bytes originate in the device, not in userspace. Implementers
-must bound device-controlled counts, sizes, and versions before caching data.
-Callers receive immutable Arc snapshots and cannot mutate the cache. Consumers
-must still validate the wire format before interpreting the opaque bytes.
-A true `has_virgl()` value reports protocol negotiation only; it grants no
-submission capability and must not be used alone to advertise DRM support.
+Scanout-disable success means device completion, not just a guest state update.
+An error must retain the old active state and resource ownership; callers may
+release their active framebuffer reference only after successful disable.

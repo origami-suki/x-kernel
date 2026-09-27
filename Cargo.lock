@@ -2216,6 +2216,7 @@ dependencies = [
 name = "kdriver"
 version = "0.2.0"
 dependencies = [
+ "aarch64-cpu 10.0.0",
  "block",
  "cfg-if",
  "char_driver",
@@ -2240,6 +2241,7 @@ dependencies = [
  "ksync",
  "ktask",
  "ktime_types",
+ "kwork",
  "lazyinit",
  "linked_list_r4l",
  "log",

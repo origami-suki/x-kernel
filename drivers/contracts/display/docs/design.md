@@ -5,7 +5,7 @@
 `display` defines the contract for graphics display device drivers: the
 `DisplayDevice` trait with basic mode information and framebuffer
 flushing, plus an optional host-resource scanout path
-(`create_scanout_resource` / `destroy_scanout_resource` /
+(`create_scanout_resource_owned` / `destroy_scanout_resource` /
 `present_scanout_resource`) modeled on virtio-gpu 2D resources for
 drivers that can scan out guest memory directly.
 
@@ -68,24 +68,23 @@ state.
 
 ## Scanout Resource Lifecycle
 
-`create_scanout_resource` / `destroy_scanout_resource` form a paired
+`create_scanout_resource_owned` / `destroy_scanout_resource` form a paired
 ownership protocol over host-visible 2D resources:
 
 - **Create**: the consumer (for example `fbdevice` at `fb_init`) passes a
-  `ScanoutResource` descriptor plus the physical address and length of
-  guest memory. The driver forwards the region to the host, which gains
-  read/write access to it for the resource lifetime.
-- **Use**: the caller must keep the backing memory alive and resident for
-  as long as the resource exists — the host reads it as scanout backing
-  at any time. `fbdevice` satisfies this by holding its `GlobalPage`
-  shadow for the kernel lifetime. The buffer should be zeroed before
-  `create_scanout_resource` so no stale kernel data is disclosed through
+  `ScanoutResource` and a `GpuBacking` carrying physical range and allocation
+  owner. The driver pins that owner before host attachment.
+- **Use**: the driver owns the DMA pin throughout the resource lifetime;
+  the consumer separately owns mapping/framebuffer references and synchronizes
+  CPU access. The buffer should be zeroed before
+  `create_scanout_resource_owned` so no stale kernel data is disclosed through
   the display.
 - **Present**: `present_scanout_resource` only makes a region of the
   resource the active scanout; it does not create or free anything.
-- **Destroy**: `destroy_scanout_resource(resource_id)` releases the host
-  resource; after it returns, the backing memory may be reused. Drivers
-  must reject unknown ids without affecting other resources.
+- **Destroy**: successful `destroy_scanout_resource(resource_id)` releases
+  the host resource after fenced completion. Error/timeout does not permit
+  reuse: retained owners remain visible in diagnostics until cleanup/reset.
+  Drivers reject unknown ids without affecting other resources.
 
 ## Execution Context
 
@@ -102,7 +101,7 @@ ownership protocol over host-visible 2D resources:
 All fallible operations return `driver_base::DriverResult`:
 
 - `flush` — hardware-level failure to push the frame.
-- `create_scanout_resource`, `destroy_scanout_resource`,
+- `create_scanout_resource_owned`, `destroy_scanout_resource`,
   `present_scanout_resource` — default
   `DriverError::Unsupported` for drivers without the capability;
   implementers return their own errors for invalid descriptors, resource
@@ -138,3 +137,28 @@ with a working DRM render node, Mesa renderer, or acceleration for an applicatio
 Capability bytes remain untrusted protocol data; consumers validate their
 format separately. Context/resource/fence ownership is deliberately outside
 this initial discovery contract.
+
+## Traditional virgl command lifecycle
+
+`virgl.rs` separates typed legacy virgl commands from DRM ABI carriers. A
+`GpuBacking` retains only its coherent allocation, never a device/GEM object
+with a device reference. `has_virgl_commands` distinguishes a functioning
+command backend from negotiated hardware capability. No blob, explicit fence,
+context-init or syncobj support is implied.
+
+`GpuExecution` is a per-device host-owned sleepable transaction gate;
+`GpuWait` supplies a monotonic deadline and yielding. `GpuDeferredWork` is a
+preallocated non-inline scheduling handle used by object destructors.
+Resource/context enqueue methods only mark existing bounded records; the host
+workqueue may allocate its scheduling bookkeeping. The
+runtime performs fenced teardown in task context; status reports retained
+objects and poison state. Callers must not free/repurpose DMA memory on timeout.
+
+The owned 2D creation method uses the same lifetime model. The old physical
+address-only method has an Unsupported default and cannot establish a timeout-
+safe ownership contract. Both display-class forwarding and fbdev use the owned
+method; DRM callers must migrate before integrating this backend.
+
+`disable_scanout` is a separate optional sleepable operation for KMS disable.
+It commits disabled state only after fenced device completion and does not
+free the resource/backing. Unsupported drivers return Unsupported explicitly.

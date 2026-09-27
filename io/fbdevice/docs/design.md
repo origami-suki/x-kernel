@@ -14,7 +14,7 @@ shadow reaches the screen only when explicitly presented.
 - `fb_init`: pick the primary display device from the `kclass` display
   registry, validate its resolution, allocate a packed BGRA8888 shadow
   (`GlobalPage::alloc_contiguous`, page-aligned, zeroed), and bind it via
-  `DisplayDevice::create_scanout_resource` (`FB_RESOURCE_ID`, physical
+  `DisplayDevice::create_scanout_resource_owned` (`FB_RESOURCE_ID`, physical
   address, length). Any failure leaves emulation unavailable with a
   warning — boot continues without `/dev/fb0`.
 - State holder `FbEmulation`: display info, cached primary device handle,
@@ -55,7 +55,7 @@ io/fbdevice/
 kclass display registry -> primary ClassDevice<DisplayDeviceImpl>
         | info()
         v
-GlobalPage shadow (BGRA8888, packed) --v2p--> create_scanout_resource
+GlobalPage shadow (BGRA8888, packed) --v2p--> create_scanout_resource_owned
         |                                            (host-visible resource)
         v
 FB: LazyInit<SpinNoIrq<Option<Arc<FbEmulation>>>>
@@ -86,7 +86,7 @@ FB: LazyInit<SpinNoIrq<Option<Arc<FbEmulation>>>>
 ## Error Model
 
 - Setup failures (no display, zero resolution, allocation failure,
-  `create_scanout_resource` error) downgrade to "emulation unavailable"
+  `create_scanout_resource_owned` error) downgrade to "emulation unavailable"
   with a logged warning; nothing panics during init.
 - `fb_info` is the one panicking accessor, explicitly documented, and
   must be gated on `fb_available`.
@@ -118,3 +118,13 @@ FB: LazyInit<SpinNoIrq<Option<Arc<FbEmulation>>>>
   equal to `width * 4` (packed rows).
 - Failure-soft init: a display driver that fails scanout setup cannot
   take down boot; the absence of `/dev/fb0` is the visible symptom.
+
+## Owned scanout backing
+
+The shadow is an `Arc<GlobalPage>` passed through `GpuBacking` to
+`create_scanout_resource_owned`. The display driver retains an allocation-only
+owner before host attachment, including timeout and partial-create failure.
+The Arc contains no device reference, avoiding a driver/resource ownership
+cycle. `fb_init` runs on kruntime's sleepable late-init thread after scheduler
+initialization; the driver may yield waiting for fenced replies. FB's short
+registry lock is not held across creation or presentation.

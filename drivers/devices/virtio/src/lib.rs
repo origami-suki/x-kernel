@@ -28,8 +28,10 @@ pub use self::blk::{PART_BITS as VIRTIO_BLK_PART_BITS, VIRTIO_BLK_MAJOR, VirtIoB
 
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(all(unittest, feature = "gpu"))]
+pub use self::gpu::GpuDmaTestDevice;
 #[cfg(feature = "gpu")]
-pub use self::gpu::VirtIoGpuDev;
+pub use self::gpu::{GpuHal as VirtIoGpuHal, VirtIoGpuDev};
 
 #[cfg(feature = "input")]
 mod input;
@@ -46,6 +48,8 @@ mod rng;
 #[cfg(feature = "rng")]
 pub use self::rng::VirtIoRngDev;
 
+mod mmio;
+pub use self::mmio::MmioTransport;
 mod pci;
 pub use self::pci::{PciTransport, probe_pci_device};
 
@@ -60,10 +64,7 @@ pub mod mock_virtio;
 mod socket;
 use driver_base::{DeviceKind, DriverError};
 use virtio_drivers::transport::DeviceType as VirtIoDevType;
-pub use virtio_drivers::{
-    BufferDirection, Hal as VirtIoHal, PhysAddr,
-    transport::{Transport, mmio::MmioTransport},
-};
+pub use virtio_drivers::{BufferDirection, Hal as VirtIoHal, PhysAddr, transport::Transport};
 
 #[cfg(feature = "socket")]
 pub use self::socket::VirtIoVsockDev;
@@ -87,7 +88,9 @@ pub use self::socket::VirtIoVsockDev;
 ///
 /// The caller must ensure `reg_base` points to a valid VirtIO MMIO register
 /// region of at least `reg_size` bytes, and that the memory remains valid
-/// for the lifetime of the returned `MmioTransport`.
+/// for the lifetime of the returned `MmioTransport`. The mapping must be
+/// exclusively owned device MMIO, transferable across CPUs, without external
+/// mutable aliases; it must not point to borrowed ordinary memory.
 ///
 /// # Panics
 ///
@@ -95,7 +98,7 @@ pub use self::socket::VirtIoVsockDev;
 pub unsafe fn probe_mmio_device(
     reg_base: *mut u8,
     reg_size: usize,
-) -> Option<(DeviceKind, MmioTransport<'static>)> {
+) -> Option<(DeviceKind, MmioTransport)> {
     use core::ptr::NonNull;
 
     use virtio_drivers::transport::mmio::VirtIOHeader;
@@ -104,9 +107,10 @@ pub unsafe fn probe_mmio_device(
     // SAFETY: The caller guarantees `reg_base` points to a valid MMIO region
     // of at least `reg_size` bytes. `MmioTransport::new` only reads the
     // header and validates the magic number and version.
-    let transport = unsafe { MmioTransport::new(header, reg_size) }.ok()?;
+    let transport =
+        unsafe { virtio_drivers::transport::mmio::MmioTransport::new(header, reg_size) }.ok()?;
     let dev_kind = as_device_kind(transport.device_type())?;
-    Some((dev_kind, transport))
+    Some((dev_kind, MmioTransport::from_owned(transport)))
 }
 
 const fn as_device_kind(t: VirtIoDevType) -> Option<DeviceKind> {

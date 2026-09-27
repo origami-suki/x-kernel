@@ -672,3 +672,30 @@ ixgbe ─────────► net (placeholder)
 `any_firmware_driver` is an umbrella feature: true whenever any DT/ACPI
 platform driver is enabled; `cfg(feature = "any_firmware_driver")`
 replaces the verbose `any(ahci, bcm2835-sdhci, sdmmc, fxmac)` condition.
+
+## GPU execution provider
+
+`gpu_execution.rs` supplies a per-device ksync Mutex transaction gate, validates
+sleepable context through PreparedTaskWait before locking, and yields while the
+portable driver polls bounded command completion. Scheduling cleanup uses a
+preallocated ScheduledWork on the normal task workqueue, never a BH queue or
+inline callback. The driver constructs this provider during late-init probing;
+GPU user calls and teardown workers run only after the scheduler is available.
+
+GPU probe and dispatch now require Send transports. The concrete static MMIO
+owner returned by the portable probe satisfies that boundary; arbitrary
+Transport implementations retain their own Send requirements. The GPU queue
+checks the existing HAL map-failure sentinel and owns cancellation, so the
+shared VirtIO HAL behavior for other devices is unchanged. Test-only DMA cases
+wrap the real HAL and global bounce pool, rather than identity mappings.
+
+## GPU device barriers
+
+`VirtIoHalImpl` implements the local `VirtIoGpuHal` extension using
+`gpu_execution::device_memory_barrier`, independent of scheduler/wait setup.
+On AArch64 the existing workspace aarch64-cpu 10.0 primitive emits `dmb sy`.
+System scope covers NormalNonCacheable ring memory and Device doorbell memory;
+the existing inner-shareable page-table helper and no-op DMA cache-coherence
+helper cannot supply this contract. Both write boundaries and completion reads
+use this full barrier. Other supported host branches use full MFENCE,
+`fence iorw, iorw`, or existing `dbar 0`; no architecture silently gets a no-op.

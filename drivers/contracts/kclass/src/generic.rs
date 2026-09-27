@@ -352,6 +352,55 @@ mod display_tests {
             self.caps.clone()
         }
 
+        fn disable_scanout(&self) -> DriverResult {
+            if self.caps.is_some() {
+                Ok(())
+            } else {
+                Err(DriverError::Unsupported)
+            }
+        }
+
+        fn has_virgl_commands(&self) -> bool {
+            self.caps.is_some()
+        }
+
+        fn virgl_command(&self, command: display::VirglCommand<'_>) -> DriverResult {
+            if !self.has_virgl_commands() {
+                return Err(DriverError::Unsupported);
+            }
+            match command {
+                display::VirglCommand::CreateContext {
+                    context_id: 7,
+                    name: "forward",
+                } => Ok(()),
+                _ => Err(DriverError::InvalidInput),
+            }
+        }
+
+        fn enqueue_virgl_cleanup(&self, id: u32) -> DriverResult {
+            if id == 17 {
+                Ok(())
+            } else {
+                Err(DriverError::InvalidInput)
+            }
+        }
+
+        fn enqueue_virgl_context_cleanup(&self, id: u32) -> DriverResult {
+            if id == 7 {
+                Ok(())
+            } else {
+                Err(DriverError::InvalidInput)
+            }
+        }
+
+        fn virgl_command_status(&self) -> display::GpuCommandStatus {
+            display::GpuCommandStatus {
+                resources: 17,
+                contexts: 7,
+                ..Default::default()
+            }
+        }
+
         fn virgl_capset(&self, id: u32, version: u32) -> DriverResult<Arc<[u8]>> {
             if self.caps.is_none() {
                 return Err(DriverError::Unsupported);
@@ -402,6 +451,34 @@ mod display_tests {
                 }),
             };
             assert_eq!(device.has_virgl(), enabled);
+            assert_eq!(
+                device.disable_scanout(),
+                if enabled {
+                    Ok(())
+                } else {
+                    Err(DriverError::Unsupported)
+                }
+            );
+            assert_eq!(device.has_virgl_commands(), enabled);
+            assert_eq!(
+                device.virgl_command(display::VirglCommand::CreateContext {
+                    context_id: 7,
+                    name: "forward"
+                }),
+                if enabled {
+                    Ok(())
+                } else {
+                    Err(DriverError::Unsupported)
+                }
+            );
+            assert_eq!(device.enqueue_virgl_cleanup(17), Ok(()));
+            assert_eq!(
+                device.enqueue_virgl_cleanup(18),
+                Err(DriverError::InvalidInput)
+            );
+            assert_eq!(device.enqueue_virgl_context_cleanup(7), Ok(()));
+            assert_eq!(device.virgl_command_status().resources, 17);
+
             if enabled {
                 let snapshot = device.virgl_capsets().unwrap();
                 let data = device.virgl_capset(2, 1).unwrap();

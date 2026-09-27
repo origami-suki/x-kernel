@@ -637,3 +637,26 @@ When modifying this module, verify:
 - New `DeviceDriver::probe_device` implementations return `DriverError` on failure
   rather than panicking.
 - New `VirtIoHal` methods preserve `share`/`unshare` and `dma_alloc`/`dma_dealloc` pairing.
+
+## GPU task-context boundary
+
+HostGpuExecution rejects IRQ-masked, interrupt-like, idle and early contexts
+before invoking portable GPU operations. The mutex gate may span waits but no
+spinlock does. HostGpuWork reports queueing failure; the driver retains marked
+objects for explicit retry. PreparedTaskWait is task-bound and never shared
+with another caller; no GPU IRQ handler enters the sleepable gate.
+
+The revised GPU publication path checks both HAL streaming maps before queue
+submission and rolls back a successful prefix on failure. Tests fill the real
+shared bounce pool and verify unchanged publication/notify counters, then
+release pressure and reuse capacity. Timeout/reset tests count real unshare
+calls over repeated cycles. No result copied back during reset cancellation is
+reported to the upper caller as successful execution.
+
+The GPU barrier primitive includes compiler memory effects and device-domain
+hardware ordering, not merely cache coherence. AArch64's aarch64-cpu macro uses
+`DMB SY` with only `nostack`, never `nomem`/`readonly`. It is safe before task
+initialization and in short IRQ-disabled queue sections. Other architectures
+have explicit full barriers; an unsupported GPU architecture fails compilation.
+This fixes a source-proven missing order; no observed lost kick/timeout is
+claimed for the current QEMU host.

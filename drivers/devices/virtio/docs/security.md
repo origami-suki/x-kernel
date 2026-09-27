@@ -129,14 +129,14 @@ let transport = unsafe { MmioTransport::new(header, reg_size) }.ok()?;
 ### 2. VirtIO GPU scanout resource backing
 
 当前 `DisplayDevice` trait 已移除 `fb()` 及 `FrameBuffer` 类型，不再从裸 framebuffer 指针构造切片。
-GPU 像素 backing 由 DRM dumb buffer（或 fbdev shadow buffer）分配，并以物理地址和长度传入
-`create_scanout_resource()`。virtio-gpu 驱动仅把这段 backing attach 到 2D resource，
+GPU 像素 backing 由 DRM dumb buffer（或 fbdev shadow buffer）分配，并以物理范围及 allocation Arc owner 传入
+`create_scanout_resource_owned()`。virtio-gpu 驱动先登记 owner，再把 backing attach 到 2D resource，
 随后在 page flip 时提交 `TRANSFER_TO_HOST_2D`、`SET_SCANOUT` 和 `RESOURCE_FLUSH`。
 
 **不变量**：
 
 - backing 物理地址和长度由 DRM 层从 `GlobalPage::alloc_contiguous` 得到；
-- backing 生命周期覆盖 resource attach 到 destroy 的整个区间；
+- driver owner 覆盖 attach 到 fenced teardown 成功的整个区间；超时不释放；
 - resource ID 由 DRM 层分配，destroy 时执行 detach/unref；
 - virtio-gpu control queue 访问由驱动内部锁串行化。
 
@@ -346,9 +346,10 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoBlkDev<H, T> {}
 ## GPU capability cache and protocol reuse
 
 `VirtIoGpuDev` uses local wire carriers over the locked dependency transport/virtqueue, with all
-mutable post-publication access serialized by its inner lock. Its manual
-Send/Sync implementations retain the pre-existing transport boundary; capability cache fields
-are immutable after initialization. The HAL remains a type-level provider.
+mutable post-publication queue access serialized by Engine state and a host
+sleepable transaction gate. GPU transport parameters now require Send;
+Engine's Send/Sync is derived from its fields. Capability cache fields are
+immutable after initialization. The HAL remains a type-level provider.
 
 Device-controlled capset counts, versions and byte sizes are bounded before
 query/allocation (16 sets, versions 0 through 32, 64 KiB per blob, 1 MiB total).
@@ -371,3 +372,52 @@ boundary exists. The local display response checks both the scanout enabled bit 
 dimensions. Fixed replies reject truncated used lengths; capset payloads reject
 short headers and overlong used lengths. Fake-device tests cover disabled
 nonzero scanouts, capability bounds, cache-only queries and attach rollback.
+
+## Owned GPU requests and failure retention
+
+`gpu/queue.rs::Transaction::prepare` owns both original buffers and every
+successful HAL streaming mapping. The zero sentinel is checked before any
+queue publication; a failed second mapping retires the first. Bulk share/unshare
+and bounce copying happen outside Engine's spinlock. The owned queue uses only
+two direct descriptors and does not negotiate indirect/event-index features.
+
+Queue publication transfers Transaction to device ownership. Only a matching
+used entry (full u32 token and exactly one index increment), or acknowledged
+reset, permits retirement. Timeout keeps both mappings alive. Unmap uses each
+original address, length and direction exactly once. Reset cancellation may
+copy back irrelevant response bytes into its private vector but discards them;
+it never fabricates successful completion or a used-ring entry.
+
+Final reset ACK precedes pending-map retirement, coherent-ring deallocation and
+allocation-owner release. Unacknowledged reset quarantines rings, mappings and
+backing. Normal failure retries are bounded by existing object/command limits.
+No indirect list storage exists to escape retirement.
+
+GPU types and glue require `T: Transport + Send`, so a safe Transport containing
+Rc<Cell<_>> cannot enter the deferred worker. No generic Engine Send/Sync
+assertions remain. `gpu/queue.rs::RingMemory` has a concrete unique-allocation
+Send argument inherited from the unsafe HAL allocation contract; it stores no
+transport. `mmio.rs` wraps only the unsafe probe's exclusive static MMIO mapping,
+with no generic user state or exposed inner aliases. Its concrete Send proof
+must not be generalized to arbitrary transports.
+
+Known limits: boot metadata discovery still polls synchronously, before
+publication; runtime progress uses yielding rather than interrupt-driven
+completion. CPU coherence/reservations for backing remain consumer obligations.
+No third-party source/dependency version or shared DMA allocator was changed.
+
+## Device memory ordering contract
+
+`GpuHal` implementations must provide compiler and hardware ordering for the
+actual DMA and MMIO domains, usable with IRQs masked and during bootstrap.
+There is no CPU-fence/no-op default. Descriptor-before-index and
+index-before-doorbell are distinct write boundaries; an observed used index
+also precedes a read barrier before entry/payload consumption. The fake hook
+regression snapshots descriptor/data fields and the indices at both barriers,
+notify, and the read barrier; it verifies call order, not weak-memory hardware
+failure reproduction. Production ordering belongs to the host HAL adapter.
+
+The explicit disable operation cannot acknowledge a KMS-off state on a failed
+or missing GPU fence. Its resource owners survive normal errors and timeouts;
+resource teardown reuses the same helper and releases owners only after the
+subsequent detach/unref succeeds.

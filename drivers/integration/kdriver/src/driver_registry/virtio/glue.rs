@@ -35,12 +35,13 @@ cfg_if! {
         pub struct VirtIoGpu;
 
         impl VirtIoGpu {
-            pub fn try_new<T: virtio::Transport + 'static>(
+            pub fn try_new<T: virtio::Transport + Send + 'static>(
                 transport: T,
                 _irq: Option<usize>,
             ) -> DriverResult<kclass::prelude::DisplayDeviceImpl> {
-                Ok(Box::new(virtio::VirtIoGpuDev::<VirtIoHalImpl, T>::try_new(
+                Ok(Box::new(virtio::VirtIoGpuDev::<VirtIoHalImpl, T>::try_new_with_execution(
                     transport,
+                    crate::gpu_execution::new_execution(),
                 )?))
             }
         }
@@ -142,6 +143,20 @@ const fn hal_direction(direction: BufferDirection) -> DmaDirection {
         BufferDirection::DriverToDevice => DmaDirection::DriverToDevice,
         BufferDirection::DeviceToDriver => DmaDirection::DeviceToDriver,
         BufferDirection::Both => DmaDirection::Bidirectional,
+    }
+}
+
+#[cfg(feature = "virtio-gpu")]
+// SAFETY: the host helper uses full device-domain hardware barriers with
+// compiler memory effects, not the legacy no-op cache-coherence helper. It
+// neither allocates nor sleeps and is valid for bootstrap and masked IRQs.
+unsafe impl virtio::VirtIoGpuHal for VirtIoHalImpl {
+    fn dma_write_barrier() {
+        crate::gpu_execution::device_memory_barrier();
+    }
+
+    fn dma_read_barrier() {
+        crate::gpu_execution::device_memory_barrier();
     }
 }
 

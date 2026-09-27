@@ -400,3 +400,11 @@ A private, registry-free unit fixture exercises the real ClassDevice forwarding
 implementation: capability presence, Arc snapshot identity/lifetime, unsupported
 non-virgl errors, and invalid set/version errors. It does not install global
 device event subscriptions or depend on test order.
+
+The display forwarding implementation includes typed virgl commands, command
+availability/status, nonblocking cleanup enqueue and owned 2D creation. It
+borrows the runtime without a registry lock; the concrete driver owns execution
+serialization. Capability snapshots remain immutable and nonblocking.
+
+`disable_scanout` forwards the same synchronous completion/error contract without
+holding a registry lock or manufacturing success for an unsupported device.

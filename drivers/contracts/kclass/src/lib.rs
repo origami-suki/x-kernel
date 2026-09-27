@@ -350,6 +350,30 @@ impl DisplayDevice for ClassDevice<DisplayDeviceImpl> {
         self.with(|device| device.virgl_capset(id, version))
     }
 
+    fn has_virgl_commands(&self) -> bool {
+        self.with(|d| d.has_virgl_commands())
+    }
+
+    fn virgl_command(&self, command: display::VirglCommand<'_>) -> DriverResult {
+        self.with(|d| d.virgl_command(command))
+    }
+
+    fn enqueue_virgl_cleanup(&self, id: u32) -> DriverResult {
+        self.with(|d| d.enqueue_virgl_cleanup(id))
+    }
+
+    fn enqueue_virgl_context_cleanup(&self, id: u32) -> DriverResult {
+        self.with(|d| d.enqueue_virgl_context_cleanup(id))
+    }
+
+    fn flush_virgl_cleanup(&self) -> DriverResult {
+        self.with(|d| d.flush_virgl_cleanup())
+    }
+
+    fn virgl_command_status(&self) -> display::GpuCommandStatus {
+        self.with(|d| d.virgl_command_status())
+    }
+
     fn create_scanout_resource(
         &self,
         resource: display::ScanoutResource,
@@ -359,8 +383,20 @@ impl DisplayDevice for ClassDevice<DisplayDeviceImpl> {
         self.with(|device| device.create_scanout_resource(resource, paddr, length))
     }
 
+    fn create_scanout_resource_owned(
+        &self,
+        resource: display::ScanoutResource,
+        backing: display::GpuBacking,
+    ) -> DriverResult {
+        self.with(|d| d.create_scanout_resource_owned(resource, backing))
+    }
+
     fn destroy_scanout_resource(&self, resource_id: u32) -> DriverResult {
         self.with(|device| device.destroy_scanout_resource(resource_id))
+    }
+
+    fn disable_scanout(&self) -> DriverResult {
+        self.with(|device| device.disable_scanout())
     }
 
     fn present_scanout_resource(

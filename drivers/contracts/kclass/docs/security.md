@@ -220,3 +220,6 @@ implementer. Metadata and opaque bytes are returned as reference-counted
 immutable snapshots, so their validity does not depend on the class access
 scope or subsequent device removal. Query forwarding performs no device I/O.
 Protocol negotiation is not proof of DRM/render-submission support.
+
+Owned backing and deferred cleanup are forwarded without converting IDs,
+dropping the backing owner, or wrapping runtime waits in a class registry lock.
