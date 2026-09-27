@@ -158,3 +158,19 @@
 - [ ] Unsupported Linux semantics 是否显式返回错误而不是静默降级。
 - [ ] 新增地址空间 observer 是否只持有 `MmPin` 或普通 `Arc`，不误用
   `MmUserHandle` 延长用户映射生命周期。
+
+### Owned physical mapping lifetime invariants
+
+Owned linear runtime construction rejects empty, unaligned or overflowing
+extents. Translation uses checked resource extents, not signed/wrapping offset
+arithmetic; map/fault/unmap remain within that extent. Extension outside the
+resource fails. Supplying an unrelated Arc is still a trusted-caller error,
+not something memspace can validate without a device dependency.
+
+Split/protect/trim/fork retain the same backing owner. Unmap/clear keep runtime
+snapshots alive through PTE teardown and explicit TLB finalization. Failed
+owned map rolls back only its newly installed PTE prefix and finalizes TLB
+invalidation before returning; existing collision mappings survive. Rollback
+failure is an invariant violation and panics rather than releasing backing
+with potentially live PTEs. The owner must not own its mm/runtime and must
+not block, wait for devices or re-enter the mm from Drop under the mm lock.

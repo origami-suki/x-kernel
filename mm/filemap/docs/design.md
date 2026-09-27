@@ -214,3 +214,21 @@ Not supported by the current filemap runtime:
 - readahead/fault-around;
 - hole-punch/collapse-range;
 - DAX, THP, reclaim, swap, memcg, NUMA.
+
+### Owned physical mapping bridge
+
+`FileMapper::map_physical_owned` validates a non-empty physical range, 4 KiB
+mapping granularity, aligned resource base and explicit resource byte offset,
+and checked offset + full request length. It rejects out-of-bounds requests
+instead of truncating them. It builds `VmRuntimeRef::new_linear_owned` from
+real virtual/physical starts; the request offset remains file/VMA metadata and
+may be a device lookup token. No fake adjusted physical address or wrapping
+subtraction is required. The original file reference is not the backing owner:
+the device supplies an independent Arc owning its allocation.
+
+The runtime survives descriptor closure, VMA split and fork. Errors before
+installation drop the candidate owner. Physical mapping failure rolls back its
+new PTE prefix and finishes TLB invalidation before releasing the runtime.
+The owner must avoid mm reference cycles and cannot perform blocking device
+cleanup from Drop under the address-space lock. Legacy MMIO mapping behavior
+is preserved in `map_physical`.

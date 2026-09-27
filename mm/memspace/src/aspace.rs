@@ -1679,6 +1679,196 @@ mod tests {
     use super::*;
     use crate::{PageFaultOutcome, vma::VmRuntimeRef};
 
+    struct PhysicalOwnerProbe(Arc<core::sync::atomic::AtomicUsize>);
+
+    impl Drop for PhysicalOwnerProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn owned_test_runtime(
+        start: VirtAddr,
+        length: usize,
+    ) -> (VmRuntimeRef, Arc<core::sync::atomic::AtomicUsize>) {
+        let drops = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let owner = Arc::new(PhysicalOwnerProbe(drops.clone()));
+        let runtime =
+            VmRuntimeRef::new_linear_owned(start, PhysAddr::from_usize(0x100000), length, owner)
+                .expect("construct owned physical runtime");
+        (runtime, drops)
+    }
+
+    #[def_test]
+    fn owned_physical_mapping_survives_vma_split_and_final_unmap() {
+        use core::sync::atomic::Ordering;
+        let mut aspace = new_test_aspace();
+        let start = VirtAddr::from_usize(0x4000);
+        let (runtime, drops) = owned_test_runtime(start, PAGE_SIZE_4K * 3);
+        aspace
+            .map(start, PAGE_SIZE_4K * 3, MappingFlags::READ, false, runtime)
+            .expect("map owned resource");
+        aspace
+            .unmap(start + PAGE_SIZE_4K, PAGE_SIZE_4K)
+            .expect("split mapping");
+        assert_eq!(aspace.vmas().count(), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            aspace.page_table().query(start + PAGE_SIZE_4K),
+            Err(PagingError::NotMapped)
+        ));
+        aspace
+            .unmap(start, PAGE_SIZE_4K)
+            .expect("unmap left fragment");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let last = start + PAGE_SIZE_4K * 2;
+        assert_eq!(
+            aspace
+                .page_table()
+                .query(last)
+                .expect("remaining fragment")
+                .0,
+            PhysAddr::from_usize(0x100000 + PAGE_SIZE_4K * 2)
+        );
+        aspace
+            .unmap(last, PAGE_SIZE_4K)
+            .expect("unmap final fragment");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            aspace.page_table().query(last),
+            Err(PagingError::NotMapped)
+        ));
+    }
+
+    #[def_test]
+    fn owned_physical_mapping_survives_fork_and_parent_destruction() {
+        use core::sync::atomic::Ordering;
+        let mut parent = new_test_aspace();
+        let start = VirtAddr::from_usize(0x4000);
+        let (runtime, drops) = owned_test_runtime(start, PAGE_SIZE_4K);
+        parent
+            .map(
+                start,
+                PAGE_SIZE_4K,
+                MappingFlags::READ | MappingFlags::USER,
+                false,
+                runtime,
+            )
+            .expect("map parent physical resource");
+        let child = parent.try_clone().expect("fork physical resource");
+        drop(parent);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            child
+                .lock()
+                .page_table()
+                .query(start)
+                .expect("child mapping")
+                .0,
+            PhysAddr::from_usize(0x100000)
+        );
+        drop(child);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[def_test]
+    fn owned_physical_mapping_survives_mprotect_splits() {
+        use core::sync::atomic::Ordering;
+        let mut aspace = new_test_aspace();
+        let start = VirtAddr::from_usize(0x4000);
+        let (runtime, drops) = owned_test_runtime(start, PAGE_SIZE_4K * 3);
+        aspace
+            .map(
+                start,
+                PAGE_SIZE_4K * 3,
+                MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                runtime,
+            )
+            .expect("map owned resource");
+        aspace
+            .protect(start + PAGE_SIZE_4K, PAGE_SIZE_4K, MappingFlags::READ)
+            .expect("protect middle page");
+        assert_eq!(aspace.vmas().count(), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        aspace.clear();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        for offset in [0, PAGE_SIZE_4K, PAGE_SIZE_4K * 2] {
+            assert!(matches!(
+                aspace.page_table().query(start + offset),
+                Err(PagingError::NotMapped)
+            ));
+        }
+    }
+
+    #[def_test]
+    fn owned_physical_map_failure_rolls_back_prefix_before_owner_release() {
+        use core::sync::atomic::Ordering;
+        let mut aspace = new_test_aspace();
+        let start = VirtAddr::from_usize(0x4000);
+        let collision = start + PAGE_SIZE_4K;
+        // A pre-existing raw PTE forces failure after the first successful page.
+        // No VMA owns it; remove it explicitly after testing rollback preservation.
+        aspace
+            .pgtbl
+            .modify()
+            .map(
+                collision,
+                PhysAddr::from_usize(0x200000),
+                PageSize::Size4K,
+                MappingFlags::READ,
+            )
+            .expect("install collision PTE");
+        let (runtime, drops) = owned_test_runtime(start, PAGE_SIZE_4K * 3);
+        assert!(
+            aspace
+                .map(start, PAGE_SIZE_4K * 3, MappingFlags::READ, false, runtime)
+                .is_err()
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(aspace.vmas().count(), 0);
+        assert!(matches!(
+            aspace.page_table().query(start),
+            Err(PagingError::NotMapped)
+        ));
+        assert!(matches!(
+            aspace.page_table().query(start + PAGE_SIZE_4K * 2),
+            Err(PagingError::NotMapped)
+        ));
+        assert_eq!(
+            aspace
+                .page_table()
+                .query(collision)
+                .expect("preserve collision")
+                .0,
+            PhysAddr::from_usize(0x200000)
+        );
+        aspace
+            .pgtbl
+            .modify()
+            .unmap(collision)
+            .expect("remove raw test PTE");
+    }
+
+    #[def_test]
+    fn owned_physical_map_rejects_extent_growth_without_releasing_live_owner() {
+        use core::sync::atomic::Ordering;
+        let mut aspace = new_test_aspace();
+        let start = VirtAddr::from_usize(0x4000);
+        let (runtime, drops) = owned_test_runtime(start, PAGE_SIZE_4K);
+        aspace
+            .map(start, PAGE_SIZE_4K, MappingFlags::READ, false, runtime)
+            .expect("map resource");
+        assert!(aspace.extend_area(start, PAGE_SIZE_4K).is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            aspace.page_table().query(start + PAGE_SIZE_4K),
+            Err(PagingError::NotMapped)
+        ));
+        aspace.clear();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     fn new_test_aspace() -> AddrSpace {
         AddrSpace::new_empty_kernel(VirtAddr::from(0x1000usize), PAGE_SIZE_4K * 64)
             .expect("test address space should be constructible")

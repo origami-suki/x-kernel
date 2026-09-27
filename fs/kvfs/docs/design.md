@@ -761,3 +761,21 @@ serialize inode policy changes with generic buffered writes and truncate.
 Memfs uses it when adding seals; write checks execute under the existing generic
 write data lock. Callers run in task context and must not reenter write/truncate
 while holding the guard. Policy storage remains in the filesystem, not KVFS.
+
+### Owned physical mmap contract
+
+`MmapMapper::map_physical_owned(range, buffer_offset, owner)` is an explicit
+ownership boundary for allocated device backing. `range` is the real physical
+resource extent; `buffer_offset` is a byte offset within it. The user mmap
+offset returned by `offset()` can remain an opaque lookup token and is never
+implicitly added by this API. Implementations retain `Arc<dyn Send + Sync>`
+until the final VMA and all of its split/fork clones are unmapped and TLB
+invalidation finishes. The default returns `OperationNotSupported`; it cannot
+fall back to `map_physical` and discard the owner. Legacy stable MMIO mappings
+continue to use `map_physical`.
+
+The backing owner must not retain the mm/runtime or form a resource cycle.
+Its final destructor can run under the mm lock and must not block, wait for a
+GPU/device, or re-enter the mm. Device cleanup requiring waits must be deferred
+outside this boundary. Holding an arbitrary Arc is not proof that it owns the
+physical allocation: device callbacks are trusted to supply the correct owner.

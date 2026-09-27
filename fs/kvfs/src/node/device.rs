@@ -431,6 +431,30 @@ pub trait MmapMapper {
     /// Map a physical address range (device memory, framebuffer, etc.)
     fn map_physical(&mut self, range: PhysAddrRange) -> VfsResult<()>;
 
+    /// Map an owned, contiguous physical resource without interpreting the mmap token.
+    ///
+    /// `range` is the actual resource's physical extent, not an offset-adjusted
+    /// synthetic address. `buffer_offset` is a page-aligned byte offset within
+    /// that resource; it is independent of [`Self::offset()`], which may be a
+    /// device lookup token. The complete requested mapping must fit in `range`.
+    /// The implementation must retain `owner` through VMA split/fork and until
+    /// the final mapping's PTE removal and TLB invalidation have completed.
+    /// Owner destruction may run under the address-space lock and must not
+    /// block, wait for devices, or re-enter that address space. Deferred device
+    /// cleanup must be queued elsewhere. The owner must keep the backing
+    /// allocated and must not own the mapping
+    /// or address space itself (which would create a reference cycle).
+    ///
+    /// Unsupported mappers fail closed rather than silently discard the owner.
+    fn map_physical_owned(
+        &mut self,
+        _range: PhysAddrRange,
+        _buffer_offset: usize,
+        _owner: Arc<dyn Send + Sync>,
+    ) -> VfsResult<()> {
+        Err(VfsError::OperationNotSupported)
+    }
+
     /// Request a file-backed mapping (regular file or cached file).
     fn map_file_backed(&mut self) -> VfsResult<()>;
 
@@ -533,6 +557,32 @@ mod tests {
         GetattrQueryFlags, GetattrRequestMask, InodeOperations, Metadata, MetadataUpdate,
         MountIdmap, NodeFlags, NodePermission, NodeType, Umode, VfsInodeInit,
     };
+
+    #[def_test]
+    fn physical_owned_mapping_default_fails_closed() {
+        struct LegacyMapper;
+        impl MmapMapper for LegacyMapper {
+            fn map_physical(&mut self, _range: PhysAddrRange) -> VfsResult<()> {
+                panic!("owned default must not fall back to an unowned mapping");
+            }
+
+            fn map_file_backed(&mut self) -> VfsResult<()> {
+                Ok(())
+            }
+
+            fn map_anonymous_shared(&mut self) -> VfsResult<()> {
+                Ok(())
+            }
+        }
+        let owner: Arc<dyn Send + Sync> = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let range = PhysAddrRange::from_start_size(memaddr::PhysAddr::from(0x1000usize), 0x1000);
+        assert_eq!(
+            LegacyMapper.map_physical_owned(range, 0, owner),
+            Err(VfsError::OperationNotSupported)
+        );
+        assert!(weak.upgrade().is_none());
+    }
 
     struct TestDeviceOps;
 

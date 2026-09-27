@@ -171,6 +171,27 @@ impl VmRuntimeRef {
         Self::Linear(LinearBackend::new(offset))
     }
 
+    /// Creates a physical mapping runtime retaining backing through split/fork.
+    ///
+    /// `start`, `physical_start` and `length` describe real page-aligned extents.
+    /// Returns `InvalidInput` for empty, unaligned or overflowing extents. The
+    /// owner must keep backing alive and must not retain this runtime or its mm.
+    /// Its destructor may run under the mm lock and must not block, wait for a
+    /// device, or re-enter that mm; defer device cleanup elsewhere.
+    pub fn new_linear_owned(
+        start: VirtAddr,
+        physical_start: memaddr::PhysAddr,
+        length: usize,
+        owner: Arc<dyn Send + Sync>,
+    ) -> KResult<Self> {
+        Ok(Self::Linear(LinearBackend::new_owned(
+            start,
+            physical_start,
+            length,
+            owner,
+        )?))
+    }
+
     pub fn new_anon_shared(start: VirtAddr, size: usize, pgsize: PageSize) -> KResult<Self> {
         Ok(Self::AnonShared(SharedBackend::new_anonymous(
             start, size, pgsize,

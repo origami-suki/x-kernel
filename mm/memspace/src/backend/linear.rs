@@ -19,16 +19,72 @@ use crate::{
 /// Linear mapping backend.
 ///
 /// The offset between the virtual address and the physical address is
-/// constant, which is specified by `pa_va_offset`. For example, the virtual
-/// address `vaddr` is mapped to the physical address `vaddr - pa_va_offset`.
+/// constant. Legacy mappings use a signed offset; owned mappings use checked
+/// virtual/physical extents and retain the physical backing owner.
 #[derive(Clone)]
 pub struct LinearBackend {
-    offset: isize,
+    translation: LinearTranslation,
+}
+
+#[derive(Clone)]
+enum LinearTranslation {
+    Legacy(isize),
+    Owned {
+        virtual_range: VirtAddrRange,
+        physical_start: PhysAddr,
+        // Never release backing before the last VMA runtime is torn down.
+        _owner: Arc<dyn Send + Sync>,
+    },
 }
 
 impl LinearBackend {
     pub fn new(offset: isize) -> Self {
-        Self { offset }
+        Self {
+            translation: LinearTranslation::Legacy(offset),
+        }
+    }
+
+    /// Retains a physical resource for a checked, page-aligned virtual extent.
+    ///
+    /// The owner must keep the physical range allocated, without owning this
+    /// runtime or its address space. Split and fork clones share this owner.
+    /// Destruction can run under the mm lock: it must not block, wait for a
+    /// device, or re-enter that mm; enqueue deferred device cleanup elsewhere.
+    /// Returns `InvalidInput` for empty, unaligned or overflowing extents.
+    pub fn new_owned(
+        start: VirtAddr,
+        physical_start: PhysAddr,
+        length: usize,
+        owner: Arc<dyn Send + Sync>,
+    ) -> KResult<Self> {
+        let virtual_range =
+            VirtAddrRange::try_from_start_size(start, length).ok_or(KError::InvalidInput)?;
+        if length == 0
+            || !start.is_aligned_4k()
+            || !physical_start.is_aligned_4k()
+            || !length.is_multiple_of(PageSize::Size4K as usize)
+            || physical_start.as_usize().checked_add(length).is_none()
+        {
+            return Err(KError::InvalidInput);
+        }
+        Ok(Self {
+            translation: LinearTranslation::Owned {
+                virtual_range,
+                physical_start,
+                _owner: owner,
+            },
+        })
+    }
+
+    fn validate_range(&self, range: VirtAddrRange) -> KResult {
+        if let LinearTranslation::Owned { virtual_range, .. } = &self.translation
+            && (range.is_empty()
+                || range.start < virtual_range.start
+                || range.end > virtual_range.end)
+        {
+            return Err(KError::InvalidInput);
+        }
+        Ok(())
     }
 
     pub fn clone_for_fork_runtime(
@@ -44,11 +100,23 @@ impl LinearBackend {
     }
 
     fn pa(&self, va: VirtAddr) -> PhysAddr {
-        let pa = (va.as_usize() as isize)
-            .checked_sub(self.offset)
-            .expect("linear address translation overflow");
-        assert!(pa >= 0, "linear address translation produced negative PA");
-        PhysAddr::from(pa as usize)
+        match &self.translation {
+            LinearTranslation::Legacy(offset) => {
+                let pa = (va.as_usize() as isize)
+                    .checked_sub(*offset)
+                    .expect("linear address translation overflow");
+                assert!(pa >= 0, "linear address translation produced negative PA");
+                PhysAddr::from(pa as usize)
+            }
+            LinearTranslation::Owned {
+                virtual_range,
+                physical_start,
+                ..
+            } => {
+                // Constructor and operation boundary checks ensure this is in range.
+                *physical_start + (va - virtual_range.start)
+            }
+        }
     }
 }
 
@@ -62,8 +130,28 @@ impl BackendOps for LinearBackend {
     }
 
     fn map(&self, range: VirtAddrRange, flags: MappingFlags, pgtbl: &mut PageTableMut) -> KResult {
+        self.validate_range(range)?;
         let pa_range = PhysAddrRange::from_start_size(self.pa(range.start), range.size());
         debug!("Linear::map: {range:?} -> {pa_range:?} {flags:?}");
+        if matches!(&self.translation, LinearTranslation::Owned { .. }) {
+            // map_region leaves a partial prefix on failure. Roll back only
+            // pages installed by this call, keeping pre-existing PTEs intact.
+            for vaddr in pages_in(range, PageSize::Size4K)? {
+                if let Err(err) = pgtbl.map(vaddr, self.pa(vaddr), PageSize::Size4K, flags) {
+                    for mapped in
+                        pages_in(VirtAddrRange::new(range.start, vaddr), PageSize::Size4K)?
+                    {
+                        pgtbl
+                            .unmap(mapped)
+                            .expect("owned map rollback must unmap its installed PTE");
+                    }
+                    // The caller may release the final owner as soon as we return.
+                    pgtbl.finish();
+                    return Err(map_paging_err(err));
+                }
+            }
+            return Ok(());
+        }
         pgtbl
             .map_region(range.start, |va| self.pa(va), range.size(), flags, false)
             .map_err(map_paging_err)?;
@@ -71,6 +159,7 @@ impl BackendOps for LinearBackend {
     }
 
     fn unmap(&self, range: VirtAddrRange, pgtbl: &mut PageTableMut) -> KResult {
+        self.validate_range(range)?;
         let pa_range = PhysAddrRange::from_start_size(self.pa(range.start), range.size());
         debug!("Linear::unmap: {range:?} -> {pa_range:?}");
         for vaddr in pages_in(range, PageSize::Size4K)? {
@@ -89,6 +178,10 @@ impl BackendOps for LinearBackend {
         pgtbl: &mut PageTableMut,
     ) -> FaultCompletionResult {
         let addr = ctx.address().align_down(self.page_size());
+        self.validate_range(
+            VirtAddrRange::try_from_start_size(addr, PageSize::Size4K as usize)
+                .ok_or(KError::InvalidInput)?,
+        )?;
         let expected = self.pa(addr);
         match pgtbl.query(addr) {
             Ok((paddr, page_flags, _)) => {
@@ -160,5 +253,38 @@ impl VmRuntimeOps for LinearBackend {
         _target: ForkCloneTarget<'_>,
     ) -> KResult<Arc<dyn VmRuntimeOps>> {
         Ok(Arc::new(self.clone()))
+    }
+}
+
+#[cfg(unittest)]
+mod tests {
+    use unittest::def_test;
+
+    use super::*;
+
+    #[def_test]
+    fn owned_linear_constructor_rejects_invalid_and_overflowing_extents() {
+        let top_page = usize::MAX & !(PageSize::Size4K as usize - 1);
+        for (virtual_start, physical_start, length) in [
+            (0x4000, 0x100000, 0),
+            (0x4001, 0x100000, 0x1000),
+            (0x4000, 0x100001, 0x1000),
+            (0x4000, 0x100000, 1),
+            (top_page, 0x100000, 0x1000),
+            (0x4000, top_page, 0x1000),
+        ] {
+            let owner: Arc<dyn Send + Sync> = Arc::new(());
+            let weak = Arc::downgrade(&owner);
+            assert!(matches!(
+                LinearBackend::new_owned(
+                    VirtAddr::from_usize(virtual_start),
+                    PhysAddr::from_usize(physical_start),
+                    length,
+                    owner
+                ),
+                Err(KError::InvalidInput)
+            ));
+            assert!(weak.upgrade().is_none());
+        }
     }
 }

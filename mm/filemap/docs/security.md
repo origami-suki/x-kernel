@@ -87,3 +87,17 @@ to `posix/mm`.
   accounting and filemap runtime registration.
 - Advanced Linux behavior such as DAX, THP, readahead, reclaim, swap, memcg,
   and NUMA is out of scope.
+
+### Owned physical mapping input boundary
+
+The callback receives a userspace-derived mmap length/token plus a trusted
+device physical extent and explicit resource offset. Owned mapping checks
+resource ordering, aligned physical base/byte offset, 4 KiB granularity,
+nonzero aligned length, checked offset + length and checked virtual/physical
+extents. It rejects rather than truncates out-of-bounds mappings. The token
+is never used in physical address arithmetic.
+
+The backing Arc must really own the allocation and avoid a cycle to its mm.
+Error paths release only candidate ownership; installed runtimes retain it
+through VMA teardown. Device cleanup from final Drop must not block or
+re-enter the address-space lock.

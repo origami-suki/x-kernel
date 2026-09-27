@@ -276,3 +276,28 @@ dirty tracking.
 - `PageTableMut::finish()` 是释放 detached frames 前的 TLB finalization boundary。
 - `VmAreaSet` 清空后，VMA metadata 和 runtime references 一起释放。
 - File/anon object view guards 随 runtime/object 引用释放并注销 view。
+
+### Owned linear physical backing
+
+`VmRuntimeRef::new_linear_owned` stores checked real virtual/physical extents
+and an opaque `Arc<dyn Send + Sync>` in `LinearBackend`. It has no KVFS or
+device dependency. Translation adds the checked byte displacement within the
+virtual extent to the physical base, avoiding signed or wrapping offset
+arithmetic. Map/fault/unmap reject ranges beyond that extent; in-place growth
+cannot expose backing outside the original allocation. Linear relocation
+remains unsupported.
+
+VMA split/protect/trim clone the runtime and its owner; fork uses the same
+Arc through the actual linear runtime clone path. Ordinary unmap and clear
+retain VMA snapshots and operation runtimes through PTE removal and
+`PageTableMut::finish()`, then retire VMA metadata. Thus the final owner Drop
+runs after TLB invalidation. Owned map installs 4 KiB PTEs transactionally:
+failure rolls back only the prefix installed by this call, preserves a
+pre-existing collision PTE, and explicitly finishes TLB invalidation before
+returning an error. Rollback failure is a kernel invariant violation.
+
+Callers must supply an owner that truly keeps the physical extent allocated,
+without retaining the mm/runtime. Final Drop may run under the mm lock: it
+must not block, wait for device completion, or re-enter that mm. Deferred
+device destruction belongs outside memspace. Legacy linear MMIO mapping uses
+its existing signed-offset translation and remains available.
